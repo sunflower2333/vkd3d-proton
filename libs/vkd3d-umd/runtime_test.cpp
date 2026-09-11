@@ -36,7 +36,7 @@ static int32_t test_create(PFN_vkGetInstanceProcAddr loader, const uint8_t luid[
 static void test_destroy(vkdu_device *device) {
     if (device) { ++destroys; delete reinterpret_cast<unsigned *>(device); }
 }
-static HRESULT APIENTRY test_query(HANDLE runtime, D3DDDICB_QUERYADAPTERINFO *args) {
+static HRESULT APIENTRY test_query(HANDLE runtime, const D3DDDICB_QUERYADAPTERINFO *args) {
     if (runtime != expected_adapter || args->PrivateDriverDataSize != 160) std::abort();
     auto *bytes = static_cast<uint8_t *>(args->pPrivateDriverData);
     for (unsigned i = 0; i < 160; ++i) if (bytes[i]) std::abort();
