@@ -47,8 +47,8 @@ struct NativeHeapOperation {
     Context *ctx;
     bool retained;
     explicit NativeHeapOperation(Context *value) : ctx(value) {
-        retained = ctx && !ctx->finalizing;
-        if (ctx) { if (retained) ++ctx->references; ctx->error_mutex.lock(); }
+        retained = retain_live(ctx);
+        if (ctx) ctx->error_mutex.lock();
     }
     ~NativeHeapOperation() {
         if (ctx) { ctx->error_mutex.unlock(); if (retained) release(ctx); }

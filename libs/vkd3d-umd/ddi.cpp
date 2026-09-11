@@ -5,6 +5,7 @@
 #include <new>
 #include <memory>
 #include <mutex>
+#include <limits>
 #include "mesa_wddm_runtime.h"
 
 namespace {
@@ -60,7 +61,7 @@ struct Context {
     D3DDDI_ALLOCATIONLIST *native_allocation_list = nullptr;
     D3DDDI_PATCHLOCATIONLIST *native_patch_list = nullptr;
     uint32_t native_command_capacity = 0, native_allocation_capacity = 0, native_patch_capacity = 0;
-    bool native_submitting = false, finalizing = false;
+    bool native_submitting = false;
     bool native_retiring = false;
     bool native_context_pending = false;
 };
@@ -95,9 +96,19 @@ vkdu_object *backend(void *memory, vkdu_kind kind) {
     auto *value = object(memory);
     return value && value->kind == kind ? value->backend : nullptr;
 }
+// The backend may enter callbacks while its final destructor drains workers.
+// Such callbacks borrow the still-owned metadata but must not resurrect a zero
+// reference count. A separate finalizing flag has a check/increment race.
+bool retain_live(Context *value) {
+    if (!value) return false;
+    unsigned count = value->references.load();
+    while (count && count != (std::numeric_limits<unsigned>::max)()) {
+        if (value->references.compare_exchange_weak(count, count + 1)) return true;
+    }
+    return false;
+}
 void release(Context *value) {
     if (value && --value->references == 0) {
-        value->finalizing = true;
         vkdu_device_destroy(value->backend);
         native_heap_forget(value);
         value->magic = 0;
@@ -110,7 +121,7 @@ void error(Context *value, HRESULT result) {
     if (!value || SUCCEEDED(result)) return;
     // A runtime error callback can synchronously retire the native device.
     // Retain Context until its recursive callback lock has been released.
-    ++value->references;
+    if (!retain_live(value)) return;
     {
         std::lock_guard<NativeCallbackMutex> lock(value->error_mutex);
         value->last_error = result;

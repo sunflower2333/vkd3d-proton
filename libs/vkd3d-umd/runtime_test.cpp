@@ -567,7 +567,28 @@ static int test_native_heaps() {
     return 0;
 }
 
+static int test_finalization_borrow() {
+    // Model the interval immediately after final release wins the 1 -> 0
+    // transition. No separate flag or retired runtime slot may be required.
+    Context terminal;
+    terminal.references = 0;
+    {
+        NativeHeapOperation op(&terminal);
+        REQUIRE(!op.retained && terminal.references == 0);
+        {
+            NativeBackendCall backend_call(&terminal);
+            wait_backend_worker(&native_runtime_callbacks, &terminal);
+        }
+        error(&terminal, E_FAIL);
+        REQUIRE(terminal.references == 0 && terminal.last_error == S_OK);
+    }
+    REQUIRE(terminal.references == 0);
+    std::puts("PASS terminal Context callback borrowing without reference resurrection");
+    return 0;
+}
+
 int main() {
+    REQUIRE(test_finalization_borrow() == 0);
     REQUIRE(OpenAdapter12(nullptr) == E_INVALIDARG);
     D3DDDI_ADAPTERCALLBACKS callbacks{};
     callbacks.pfnQueryAdapterInfoCb = test_query;
