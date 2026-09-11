@@ -4,7 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <vulkan/vulkan.h>
-#include "mesa_wddm_runtime.h"
+struct mwd_callbacks;
 #ifdef __cplusplus
 extern "C" {
 #endif

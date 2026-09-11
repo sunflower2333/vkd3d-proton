@@ -19,6 +19,22 @@ void native_heap_tables(D3D12DDI_DEVICE_FUNCS_CORE_0003 *);
 // Runtime owns this slot; child objects hold references to the separate Context.
 struct NativeDevice { uint32_t magic; Context *context; };
 struct Object;
+// Track recursion only while the underlying mutex is owned. A call back into
+// Vulkan must release every nesting level: the runtime may synchronously
+// re-enter resource destruction from an outer error/kernel callback.
+class NativeCallbackMutex {
+    std::recursive_mutex mutex;
+    unsigned depth = 0;
+public:
+    void lock() { mutex.lock(); ++depth; }
+    void unlock() { --depth; mutex.unlock(); }
+    unsigned suspend() {
+        const unsigned held = depth;
+        for (unsigned i = 0; i < held; ++i) unlock();
+        return held;
+    }
+    void resume(unsigned held) { for (unsigned i = 0; i < held; ++i) lock(); }
+};
 struct Context {
     uint32_t magic = context_magic;
     std::atomic_uint references{1};
@@ -34,7 +50,7 @@ struct Context {
     D3DDDI_DEVICECALLBACKS kernel_callbacks{};
     D3D12DDI_CORELAYER_DEVICECALLBACKS_0003 runtime_callbacks{};
     HMODULE vulkan_module = nullptr;
-    std::recursive_mutex error_mutex;
+    NativeCallbackMutex error_mutex;
     NativeHeap *native_heaps = nullptr;
     HANDLE native_heap_context = nullptr;
     uint64_t native_va_start = 0, native_va_size = 0;
@@ -96,7 +112,7 @@ void error(Context *value, HRESULT result) {
     // Retain Context until its recursive callback lock has been released.
     ++value->references;
     {
-        std::lock_guard<std::recursive_mutex> lock(value->error_mutex);
+        std::lock_guard<NativeCallbackMutex> lock(value->error_mutex);
         value->last_error = result;
         if (value->report) value->report(value->report_context, result);
     }

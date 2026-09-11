@@ -2,6 +2,7 @@
 /* WDK lifecycle fixture with controlled Vulkan/backend peers, NOT system
  * D3D12CreateDevice or VIOGPU GPU acceptance. Uses actual production entry. */
 #include "ddi.h"
+#include "mesa_wddm_runtime.h"
 #include <array>
 #include <cstdio>
 #include <cstdlib>
@@ -12,6 +13,7 @@
 #include <set>
 #include <memory>
 #include <thread>
+#include <functional>
 
 static HRESULT backend_result = S_OK, query_result = S_OK;
 static unsigned loads, unloads, creates, destroys, query_calls, error_calls;
@@ -19,6 +21,7 @@ static bool bad_loader = false, old_reply = false;
 static bool reset_during_create = false;
 static PFND3D12DDI_DESTROYDEVICE retire_in_error = nullptr;
 static D3D12DDI_HDEVICE error_device{};
+static std::function<void()> nested_error_callback;
 static uint64_t generation = 7;
 static D3D12DDI_HRTDEVICE last_runtime{};
 static const HANDLE expected_adapter = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(0x13570));
@@ -84,6 +87,7 @@ static void APIENTRY test_error(D3D10DDI_HRTDEVICE runtime, HRESULT result) {
     if (SUCCEEDED(result)) std::abort();
     ++error_calls; last_runtime = runtime;
     if (retire_in_error) retire_in_error(error_device);
+    if (nested_error_callback) nested_error_callback();
 }
 
 static int32_t test_import_heap(vkdu_device *, void *, void *, uint64_t, int, vkdu_object **);
@@ -121,7 +125,7 @@ struct ImportPeer {
     vkdu_kind kind;
     uint64_t address, bytes;
 };
-static bool import_failure, placement_failure;
+static bool import_failure, placement_failure, retire_during_import;
 static unsigned imports, placements;
 static int32_t test_import_heap(vkdu_device *device, void *owner, void *token, uint64_t size, int, vkdu_object **out) {
     *out = nullptr; ++imports;
@@ -134,12 +138,14 @@ static int32_t test_import_heap(vkdu_device *device, void *owner, void *token, u
     auto backing = std::make_shared<ImportOwner>();
     backing->context = static_cast<Context *>(owner); backing->allocation = allocation;
     *out = reinterpret_cast<vkdu_object *>(new ImportPeer{backing, device, VKDU_MEMORY_HEAP, allocation.address, size});
+    if (retire_during_import) native_destroy_device(error_device);
     return S_OK;
 }
 static int32_t test_place_buffer(vkdu_device *device, vkdu_object *memory, uint64_t offset, uint64_t size, uint32_t, vkdu_object **out) {
     *out = nullptr; ++placements;
     if (placement_failure) return E_INVALIDARG;
     auto *peer = reinterpret_cast<ImportPeer *>(memory);
+    if (FAILED(native_runtime_status(peer->owner->context))) return DXGI_ERROR_DEVICE_REMOVED;
     if (peer->device != device || peer->kind != VKDU_MEMORY_HEAP || offset || size > peer->bytes) std::abort();
     *out = reinterpret_cast<vkdu_object *>(new ImportPeer{peer->owner, device, VKDU_BUFFER, peer->address, size});
     return S_OK;
@@ -171,7 +177,7 @@ static bool heap_callbacks_retired;
 static std::array<unsigned char, 65536> mapped_heap{};
 static const HANDLE expected_device = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(0x456a0));
 static const HANDLE expected_context = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(0xabc50));
-static std::array<unsigned char, 65536> commands[2];
+static std::array<unsigned char, 65536> dma_commands[2];
 static std::array<D3DDDI_ALLOCATIONLIST, 1024> allocation_lists[2];
 static std::array<D3DDDI_PATCHLOCATIONLIST, 1024> patch_lists[2];
 static unsigned renders;
@@ -187,7 +193,7 @@ static HRESULT APIENTRY heap_context_create(HANDLE runtime, D3DDDICB_CREATECONTE
             data->generation != generation || data->flags || data->reserved || args->NodeOrdinal || args->EngineAffinity != 1)
         std::abort();
     ++heap_context_creates; args->hContext = expected_context;
-    args->pCommandBuffer = commands[0].data(); args->CommandBufferSize = 65536;
+    args->pCommandBuffer = dma_commands[0].data(); args->CommandBufferSize = 65536;
     args->pAllocationList = allocation_lists[0].data(); args->AllocationListSize = 1024;
     args->pPatchLocationList = patch_lists[0].data(); args->PatchLocationListSize = 1024;
     return fail_context_create ? E_OUTOFMEMORY : S_OK;
@@ -310,7 +316,7 @@ static HRESULT APIENTRY heap_render(HANDLE runtime, D3DDDICB_RENDER *args) {
             !kernel_heaps.count(args->pNewAllocationList[0].hAllocation) ||
             args->pNewPatchLocationList[0].PatchOffset != 96) std::abort();
     ++renders;
-    args->pNewCommandBuffer = commands[1].data(); args->NewCommandBufferSize = 65536;
+    args->pNewCommandBuffer = dma_commands[1].data(); args->NewCommandBufferSize = 65536;
     args->pNewAllocationList = allocation_lists[1].data(); args->NewAllocationListSize = 1024;
     args->pNewPatchLocationList = patch_lists[1].data(); args->NewPatchLocationListSize = 1024;
     if (retire_render) { native_destroy_device(error_device); heap_callbacks_retired = true; }
@@ -486,6 +492,12 @@ static int test_native_heaps() {
     REQUIRE(paired() == S_OK);
     table.pfnDestroyHeapAndResource(create.hDrvDevice, ha, resource_handle);
     REQUIRE(kernel_heaps.empty() && !ctx->native_heaps);
+    REQUIRE(paired() == S_OK);
+    // Error callback retains an outer recursive lock while entering this DDI.
+    nested_error_callback = [&]() { table.pfnDestroyHeapAndResource(create.hDrvDevice, ha, resource_handle); };
+    error(ctx, E_FAIL);
+    nested_error_callback = {};
+    REQUIRE(kernel_heaps.empty() && !ctx->native_heaps);
     // Both import failure and placement failure unwind their actual owners.
     resource_storage.fill(0xa5); a.fill(0xa5); import_failure = true;
     REQUIRE(paired() == E_OUTOFMEMORY && kernel_heaps.empty() && !ctx->native_heaps);
@@ -526,13 +538,13 @@ static int test_native_heaps() {
     std::array<unsigned char, 16> stream{};
     mwd_reference reference{token, 0, 4096, 3, 0};
     REQUIRE(native_runtime_submit(ctx, stream.data(), stream.size(), &reference, 1) == S_OK && renders == 1);
-    REQUIRE(ctx->native_commands == commands[1].data() && ctx->native_allocation_list == allocation_lists[1].data());
+    REQUIRE(ctx->native_commands == dma_commands[1].data() && ctx->native_allocation_list == allocation_lists[1].data());
     reference.offset = imported.size;
     REQUIRE(native_runtime_submit(ctx, stream.data(), stream.size(), &reference, 1) == E_INVALIDARG && renders == 1);
     reference.offset = 0; render_result = E_OUTOFMEMORY;
-    ctx->native_commands = commands[0].data();
+    ctx->native_commands = dma_commands[0].data();
     REQUIRE(native_runtime_submit(ctx, stream.data(), stream.size(), &reference, 1) == E_OUTOFMEMORY);
-    REQUIRE(ctx->native_commands == commands[1].data()); render_result = S_OK;
+    REQUIRE(ctx->native_commands == dma_commands[1].data()); render_result = S_OK;
     uint32_t completed = 0;
     REQUIRE(native_runtime_completed(ctx, &completed) == S_OK && completed == 9);
     fail_deallocate = 1;
@@ -543,6 +555,13 @@ static int test_native_heaps() {
     REQUIRE(native_runtime_submit(ctx, stream.data(), stream.size(), &reference, 1) == DXGI_ERROR_DEVICE_REMOVED);
     REQUIRE(!context(create.hDrvDevice) && kernel_heaps.size() == 1);
     kernel_heaps.clear(); heap_callbacks_retired = retire_render = false;
+    REQUIRE(adapter.pfnCloseAdapter(open.hAdapter) == S_OK);
+    REQUIRE(OpenAdapter12(&open) == S_OK);
+    REQUIRE(adapter.pfnCreateDevice(open.hAdapter, &create) == S_OK);
+    error_device = create.hDrvDevice; retire_during_import = true;
+    REQUIRE(paired() == DXGI_ERROR_DEVICE_REMOVED && !context(create.hDrvDevice));
+    REQUIRE(kernel_heaps.empty());
+    retire_during_import = false;
     REQUIRE(adapter.pfnCloseAdapter(open.hAdapter) == S_OK);
     std::printf("PASS native buffer heaps/shared runtime allocation tokens/RenderCb replacements/reset/reentrant teardown (%zu-bit); DDI versions remain unsupported\n", sizeof(void *) * 8);
     return 0;

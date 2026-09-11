@@ -187,7 +187,7 @@ void APIENTRY native_destroy_device(D3D12DDI_HDEVICE handle) {
     // Runtime releases this storage immediately after return. Child objects may
     // keep Context alive, but must never call a retired runtime handle/callback.
     {
-        std::lock_guard<std::recursive_mutex> lock(ctx->error_mutex);
+        std::lock_guard<NativeCallbackMutex> lock(ctx->error_mutex);
         if (ctx->native_retiring) return;
         ctx->native_retiring = true;
         native_heap_retire(ctx);

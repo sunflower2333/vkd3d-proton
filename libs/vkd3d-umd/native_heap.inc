@@ -61,8 +61,9 @@ struct NativeHeapOperation {
 // into Vulkan or a backend destructor.
 struct NativeBackendCall {
     Context *ctx;
-    explicit NativeBackendCall(Context *value) : ctx(value) { ctx->error_mutex.unlock(); }
-    ~NativeBackendCall() { ctx->error_mutex.lock(); }
+    unsigned depth;
+    explicit NativeBackendCall(Context *value) : ctx(value), depth(ctx->error_mutex.suspend()) {}
+    ~NativeBackendCall() { ctx->error_mutex.resume(depth); }
 };
 
 NativeAbiHeader native_header(uint32_t size) { return {0x504d5644, 0, size, 0}; }
