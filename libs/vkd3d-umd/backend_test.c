@@ -52,6 +52,7 @@ static void check_constant_buffers(vkdu_device *device, vkdu_device *other)
 {
     vkdu_object *constants = NULL, *foreign = NULL, *upload = NULL, *buffer = NULL, *readback = NULL;
     vkdu_object *cpu = NULL, *gpu = NULL, *queue = NULL, *allocator = NULL, *command = NULL, *fence = NULL;
+    vkdu_object *cpu_second = NULL, *foreign_heap = NULL;
     vkdu_object *root = NULL, *table = NULL, *pipeline = NULL, *table_pipeline = NULL;
     struct vkdu_descriptor_range range = {D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 0, 0, 1};
     struct vkdu_root_parameter params[2] = {{D3D12_ROOT_PARAMETER_TYPE_CBV, 0, 0, 0, 0},
@@ -72,6 +73,8 @@ static void check_constant_buffers(vkdu_device *device, vkdu_device *other)
     CHECK(vkdu_buffer_unmap(upload, 0, 4096));
     CHECK(vkdu_heap_create(device, 0, 8, 0, &cpu));
     CHECK(vkdu_heap_create(device, 0, 8, 1, &gpu));
+    CHECK(vkdu_heap_create(device, 0, 8, 0, &cpu_second));
+    CHECK(vkdu_heap_create(other, 0, 8, 0, &foreign_heap));
     REJECT(vkdu_buffer_cbv(cpu, 8, constants, 0, 256));
     REJECT(vkdu_buffer_cbv(cpu, 1, constants, 1, 256));
     REJECT(vkdu_buffer_cbv(cpu, 1, constants, 0, 255));
@@ -92,11 +95,12 @@ static void check_constant_buffers(vkdu_device *device, vkdu_device *other)
     params[0].ranges = &range; params[0].range_count = 1;
     CHECK(vkdu_root_create(device, params, 2, 0, &table));
     CHECK(vkdu_pipeline_create(device, table, update_root_descriptors_code_dxbc, sizeof(update_root_descriptors_code_dxbc), &table_pipeline));
-    for (round = 0; round < 4; ++round) {
+    for (round = 0; round < 5; ++round) {
         uint32_t expected_index = round == 0 ? 37 : round == 2 ? 0 : 941;
         uint32_t expected_value = round == 0 ? 0x13579bdf : round == 2 ? 0 : 0x2468ace0;
-        int use_table = round == 1 || round == 2;
-        fprintf(stderr, "CBV round %u: %s\n", round, use_table ? (round == 2 ? "null table" : "copied table") : "root buffer");
+        int use_table = round == 1 || round == 2 || round == 4;
+        fprintf(stderr, "CBV round %u: %s\n", round, round == 4 ? "multiheap ranged copy and rejected late range" :
+                use_table ? (round == 2 ? "null table" : "copied table") : "root buffer");
         if (round) {
             CHECK(vkdu_allocator_reset(allocator));
             CHECK(vkdu_command_reset(command, allocator));
@@ -112,8 +116,40 @@ static void check_constant_buffers(vkdu_device *device, vkdu_device *other)
         CHECK(vkdu_command_uav(command, 1, buffer, 0));
         REJECT(vkdu_command_cbv(command, 1, constants, 256));
         if (use_table) {
-            CHECK(vkdu_buffer_cbv(cpu, 1, round == 1 ? constants : NULL, round == 1 ? 512 : 0, 256));
-            CHECK(vkdu_descriptor_copy(gpu, 6, cpu, 1, 1));
+            if (round == 4) {
+                struct vkdu_descriptor_span gather_dst[] = {{gpu, 3, 3}},
+                    gather_src[] = {{cpu, 1, 1}, {cpu_second, 4, 2}},
+                    scatter_dst[] = {{gpu, 6, 1}, {gpu, 0, 2}},
+                    scatter_src[] = {{cpu_second, 4, 2}, {cpu, 1, 1}},
+                    late_src[] = {{cpu, 1, 1}, {cpu_second, 7, 2}},
+                    zero = {NULL, UINT32_MAX, 0}, repeat_dst = {gpu, 0, 2},
+                    repeat_src[] = {{cpu, 1, 1}, {cpu, 1, 1}},
+                    overlap_dst[] = {{cpu, 3, 1}, {cpu, 1, 1}},
+                    overlap_src[] = {{cpu, 1, 1}, {cpu, 5, 1}};
+                CHECK(vkdu_buffer_cbv(cpu, 1, constants, 256, 256));
+                CHECK(vkdu_buffer_cbv(cpu_second, 4, constants, 512, 256));
+                CHECK(vkdu_buffer_cbv(cpu_second, 5, constants, 256, 256));
+                CHECK(vkdu_descriptor_copy_ranges(device, 0, 1, gather_dst, 2, gather_src));
+                CHECK(vkdu_descriptor_copy_ranges(device, 0, 2, scatter_dst, 2, scatter_src));
+                CHECK(vkdu_descriptor_copy_ranges(device, 0, 1, &repeat_dst, 2, repeat_src));
+                CHECK(vkdu_descriptor_copy_ranges(device, 0, 1, &zero, 0, NULL));
+                REJECT(vkdu_descriptor_copy_ranges(device, 0, 2, scatter_dst, 2, late_src));
+                late_src[1] = (struct vkdu_descriptor_span){foreign_heap, 0, 2};
+                REJECT(vkdu_descriptor_copy_ranges(device, 0, 2, scatter_dst, 2, late_src));
+                late_src[1] = (struct vkdu_descriptor_span){gpu, 0, 2};
+                REJECT(vkdu_descriptor_copy_ranges(device, 0, 2, scatter_dst, 2, late_src));
+                REJECT(vkdu_descriptor_copy_ranges(device, 0, 2, overlap_dst, 2, overlap_src));
+                REJECT(vkdu_descriptor_copy_ranges(device, 0, 1, scatter_dst, 2, scatter_src));
+                REJECT(vkdu_descriptor_copy_ranges(device, 1, 2, scatter_dst, 2, scatter_src));
+                REJECT(vkdu_descriptor_copy_ranges(device, 0, 2, NULL, 2, scatter_src));
+                REJECT(vkdu_descriptor_copy_ranges(other, 0, 2, scatter_dst, 2, scatter_src));
+                // The invalid late-source operations would overwrite slot6
+                // with the wrong CBV if an early range escaped validation. The shader
+                // below must still read index941/value2468ace0 from that slot.
+            } else {
+                CHECK(vkdu_buffer_cbv(cpu, 1, round == 1 ? constants : NULL, round == 1 ? 512 : 0, 256));
+                CHECK(vkdu_descriptor_copy(gpu, 6, cpu, 1, 1));
+            }
             CHECK(vkdu_command_heaps(command, 1, &gpu));
             CHECK(vkdu_command_table(command, 0, gpu, 5));
         } else {
@@ -147,8 +183,9 @@ static void check_constant_buffers(vkdu_device *device, vkdu_device *other)
     vkdu_object_destroy(command); vkdu_object_destroy(allocator); vkdu_object_destroy(queue); vkdu_object_destroy(fence);
     vkdu_object_destroy(pipeline); vkdu_object_destroy(table_pipeline); vkdu_object_destroy(root); vkdu_object_destroy(table);
     vkdu_object_destroy(cpu); vkdu_object_destroy(gpu); vkdu_object_destroy(constants); vkdu_object_destroy(foreign);
+    vkdu_object_destroy(cpu_second); vkdu_object_destroy(foreign_heap);
     vkdu_object_destroy(upload); vkdu_object_destroy(buffer); vkdu_object_destroy(readback);
-    puts("PASS CBV root/table offsets, copied/null descriptors, invalid root address and alignment/range/device rejection: 4x1024 readbacks");
+    puts("PASS CBV root/table offsets, copied/null/ranged descriptors, atomic range validation, root address and alignment/device rejection: 5x1024 readbacks");
 }
 
 static void check_shader_resources(vkdu_device *device, vkdu_device *other)

@@ -200,6 +200,41 @@ void APIENTRY copy_descriptors_simple(D3D12DDI_HDEVICE h, UINT count, D3D12DDI_C
     ReleaseSRWLockShared(&ctx->resources_lock);
     error(ctx, hr);
 }
+// The shared resources lock keeps every resolved heap alive through the copy.
+bool resolve_descriptor_spans(Context *ctx, UINT count, const D3D12DDI_CPU_DESCRIPTOR_HANDLE *starts,
+        const UINT *sizes, D3D12DDI_DESCRIPTOR_HEAP_TYPE type, vkdu_descriptor_span *spans) {
+    for (UINT i = 0; i < count; ++i) {
+        spans[i] = {nullptr, 0, sizes ? sizes[i] : 1};
+        if (!spans[i].count) continue;
+        auto *heap = find_heap(ctx, starts[i].ptr, false, &spans[i].first);
+        if (!heap || heap->descriptor_type != static_cast<uint32_t>(type)) return false;
+        spans[i].heap = heap->backend;
+    }
+    return true;
+}
+void APIENTRY copy_descriptors(D3D12DDI_HDEVICE h, UINT dst_count, const D3D12DDI_CPU_DESCRIPTOR_HANDLE *dst_starts,
+        const UINT *dst_sizes, UINT src_count, const D3D12DDI_CPU_DESCRIPTOR_HANDLE *src_starts,
+        const UINT *src_sizes, D3D12DDI_DESCRIPTOR_HEAP_TYPE type) {
+    auto *ctx = context(h);
+    if (!ctx) return;
+    if ((dst_count && !dst_starts) || (src_count && !src_starts) || static_cast<UINT>(type) > 3) {
+        error(ctx, E_INVALIDARG); return;
+    }
+    if (static_cast<uint64_t>(dst_count) > SIZE_MAX / sizeof(vkdu_descriptor_span) ||
+            static_cast<uint64_t>(src_count) > SIZE_MAX / sizeof(vkdu_descriptor_span)) {
+        error(ctx, E_OUTOFMEMORY); return;
+    }
+    std::unique_ptr<vkdu_descriptor_span[]> dst(dst_count ? new (std::nothrow) vkdu_descriptor_span[dst_count] : nullptr);
+    std::unique_ptr<vkdu_descriptor_span[]> src(src_count ? new (std::nothrow) vkdu_descriptor_span[src_count] : nullptr);
+    if ((dst_count && !dst) || (src_count && !src)) { error(ctx, E_OUTOFMEMORY); return; }
+    HRESULT hr = E_INVALIDARG;
+    AcquireSRWLockShared(&ctx->resources_lock);
+    if (resolve_descriptor_spans(ctx, dst_count, dst_starts, dst_sizes, type, dst.get()) &&
+            resolve_descriptor_spans(ctx, src_count, src_starts, src_sizes, type, src.get()))
+        hr = vkdu_descriptor_copy_ranges(ctx->backend, type, dst_count, dst.get(), src_count, src.get());
+    ReleaseSRWLockShared(&ctx->resources_lock);
+    error(ctx, hr);
+}
 void APIENTRY set_heaps(D3D12DDI_HCOMMANDLIST c, UINT count, D3D12DDI_HDESCRIPTORHEAP *heaps) {
     auto *cmd = object(c.pDrvPrivate); vkdu_object *native[2] = {};
     if (!cmd) return;
@@ -468,6 +503,7 @@ extern "C" HRESULT APIENTRY VioGpuD3D12BridgeGetTables(D3D12DDI_DEVICE_FUNCS_COR
     device->pfnCreateConstantBufferView = create_cbv;
     device->pfnCreateShaderResourceView = create_srv;
     device->pfnCopyDescriptorsSimple = copy_descriptors_simple;
+    device->pfnCopyDescriptors = copy_descriptors;
     commands->pfnCloseCommandList = command_close; commands->pfnResetCommandList = command_reset;
     commands->pfnCopyBufferRegion = copy; commands->pfnResourceBarrier = barriers; commands->pfnDispatch = dispatch;
     commands->pfnSetComputeRootSignature = root_set; commands->pfnSetPipelineState = pipeline_set;

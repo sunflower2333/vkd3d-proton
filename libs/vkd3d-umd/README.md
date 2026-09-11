@@ -31,8 +31,16 @@ the device; shader table handles must resolve into the currently bound heap.
 Root-table ranges preserve register spaces, explicit offsets and APPEND, with
 overflow-safe heap bounds. Command reset clears table and heap binding state.
 Buffer UAVs support raw, structured (including counters) and R32 typed views;
-other typed formats, textures, samplers and ranged descriptor copies
-still require their native view/copy adapters.
+other typed formats, textures and samplers still require their native view adapters.
+
+Native CopyDescriptors now resolves independently sized source/destination
+ranges across live owned heaps, including omitted size arrays (one descriptor
+per range), empty ranges and repeated source ranges. The backend validates all
+ranges, matching total counts, heap type, source visibility, device ownership
+and cross-range source/destination overlap before copying. It walks the two
+flattened streams in contiguous chunks without requiring their boundaries to
+match. A rejected late range cannot partially replace an earlier destination.
+This follows the Microsoft [copying descriptor contract](https://learn.microsoft.com/windows/win32/direct3d12/copying-descriptors).
 
 Constant buffers support native CreateConstantBufferView and compute root
 CBV callbacks, including 256-byte alignment, a 64-KiB descriptor-size bound,
@@ -60,7 +68,7 @@ view, rather than testing only initially zeroed descriptor heaps.
 
 Still required for a native system driver: OpenAdapter12 and version/caps
 negotiation; full device/core and graphics DDIs; runtime allocation, heap,
-residency and GPUVA mapping; remaining descriptor views and ranged copies;
+residency and GPUVA mapping; remaining descriptor views;
 monitored fences referring to the runtime's actual GPU backing; shared surfaces,
 presentation, device-removal/TDR recovery and WDDM KMD integration. The backend
 fences used by the test are not the runtime's monitored-fence contract.
@@ -101,7 +109,19 @@ typed tables and null replacement, preservation after rejected swizzle,
 raw tables/root offsets with two independent bindings, and structured
 tables/root/null views. All fourteen workloads (14336 words) pass local CPU
 Vulkan. This includes the null-range repair; its first negative run returned
-the old size64 instead of0. Actual WDK and target SRV validation are pending.
+the old size64 instead of0. The b2c510d checkpoint passed all four standalone
+WDK/CPU jobs and all seven paired743acf9 jobs, then all fourteen target GPU
+workloads in1015ms with14336 correct readbacks. Parent's matched host trace
+reported no lost events/faults and retired18/18 submissions for that context;
+original DWM/Explorer retained and postcheck3/3 passed. These are backend,
+callback and backing results, not native Microsoft runtime acceptance.
+
+The ranged-copy continuation adds a fifth CBV workload, gathering from two
+storage heaps and scattering across different destination boundaries. It then
+tries invalid late ranges, foreign heaps, visible sources, overlap and count
+mismatches before executing the retained valid descriptor. All1024 words must
+still match that valid CBV. Local CPU Vulkan passes fifteen workloads/15360
+words; Windows WDK and target ranged-copy validation are pending.
 
 `vkd3d-umd-gpu-probe --adapter LUID_LOW_HEX LUID_HIGH_HEX VENDOR_HEX DEVICE_HEX`
 executes the same compute/readback workloads through the production backend.

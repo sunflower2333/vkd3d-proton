@@ -14,6 +14,7 @@ typedef struct vkdu_object vkdu_object;
 enum vkdu_kind { VKDU_BUFFER, VKDU_QUEUE, VKDU_ALLOCATOR, VKDU_COMMAND_LIST, VKDU_ROOT, VKDU_PIPELINE, VKDU_FENCE, VKDU_DESCRIPTOR_HEAP };
 struct vkdu_adapter { uint8_t luid[8]; uint32_t vendor_id, device_id; };
 struct vkdu_descriptor_range { uint32_t type, count, shader_register, register_space, offset; };
+struct vkdu_descriptor_span { vkdu_object *heap; uint32_t first, count; };
 struct vkdu_root_parameter {
     uint32_t type, visibility, shader_register, register_space, constant_count;
     const struct vkdu_descriptor_range *ranges;
@@ -47,6 +48,9 @@ int32_t vkdu_buffer_cbv(vkdu_object *heap, uint32_t index, vkdu_object *buffer, 
 int32_t vkdu_buffer_srv(vkdu_object *heap, uint32_t index, vkdu_object *buffer,
         uint32_t format, uint64_t first, uint32_t count, uint32_t stride, uint32_t flags, uint32_t mapping);
 int32_t vkdu_descriptor_copy(vkdu_object *dst, uint32_t dst_index, vkdu_object *src, uint32_t src_index, uint32_t count);
+int32_t vkdu_descriptor_copy_ranges(vkdu_device *device, uint32_t type,
+        uint32_t dst_count, const struct vkdu_descriptor_span *dst,
+        uint32_t src_count, const struct vkdu_descriptor_span *src);
 int32_t vkdu_command_heaps(vkdu_object *command, uint32_t count, vkdu_object *const *heaps);
 int32_t vkdu_command_table(vkdu_object *command, uint32_t index, vkdu_object *heap, uint32_t first);
 int32_t vkdu_queue_create(vkdu_device *device, uint32_t type, vkdu_object **out);

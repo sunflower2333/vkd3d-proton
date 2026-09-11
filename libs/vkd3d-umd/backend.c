@@ -303,6 +303,59 @@ int32_t vkdu_descriptor_copy(vkdu_object *dst, uint32_t dst_index, vkdu_object *
     ID3D12Device_CopyDescriptorsSimple(dst->owner, count, destination, source, dst->heap_type);
     return ID3D12Device_GetDeviceRemovedReason(dst->owner);
 }
+
+static int valid_descriptor_span(vkdu_device *device, uint32_t type,
+        const struct vkdu_descriptor_span *span, int source)
+{
+    vkdu_object *heap = span->heap;
+    if (!span->count) return 1;
+    return VALID(heap, VKDU_DESCRIPTOR_HEAP) && heap->owner == device->object &&
+            heap->heap_type == type && (!source || !heap->shader_visible) &&
+            span->first < heap->descriptor_count && span->count <= heap->descriptor_count - span->first;
+}
+
+int32_t vkdu_descriptor_copy_ranges(vkdu_device *device, uint32_t type,
+        uint32_t dst_count, const struct vkdu_descriptor_span *dst,
+        uint32_t src_count, const struct vkdu_descriptor_span *src)
+{
+    uint64_t dst_total = 0, src_total = 0;
+    uint32_t d, s, di = 0, si = 0;
+    if (!device || type > D3D12_DESCRIPTOR_HEAP_TYPE_DSV ||
+            (dst_count && !dst) || (src_count && !src)) return E_INVALIDARG;
+    /* Validate the entire operation before writing the first descriptor. A
+     * malformed late range must not partially overwrite the destination. */
+    for (d = 0; d < dst_count; ++d) {
+        if (!valid_descriptor_span(device, type, &dst[d], 0)) return E_INVALIDARG;
+        dst_total += dst[d].count;
+    }
+    for (s = 0; s < src_count; ++s) {
+        if (!valid_descriptor_span(device, type, &src[s], 1)) return E_INVALIDARG;
+        src_total += src[s].count;
+    }
+    if (dst_total != src_total) return E_INVALIDARG;
+    for (d = 0; d < dst_count; ++d)
+        for (s = 0; s < src_count; ++s)
+            if (dst[d].count && src[s].count && dst[d].heap == src[s].heap &&
+                    dst[d].first < (uint64_t)src[s].first + src[s].count &&
+                    src[s].first < (uint64_t)dst[d].first + dst[d].count) return E_INVALIDARG;
+    /* Walk both flattened descriptor streams while retaining their independent
+     * heap/range boundaries. Repeated source ranges are legal. */
+    for (d = 0, s = 0; d < dst_count && s < src_count;) {
+        D3D12_CPU_DESCRIPTOR_HANDLE destination, source;
+        uint32_t count;
+        if (di == dst[d].count) { ++d; di = 0; continue; }
+        if (si == src[s].count) { ++s; si = 0; continue; }
+        count = dst[d].count - di;
+        if (count > src[s].count - si) count = src[s].count - si;
+        destination.ptr = (SIZE_T)(vkdu_heap_start(dst[d].heap, 0) +
+                ((uint64_t)dst[d].first + di) * dst[d].heap->descriptor_stride);
+        source.ptr = (SIZE_T)(vkdu_heap_start(src[s].heap, 0) +
+                ((uint64_t)src[s].first + si) * src[s].heap->descriptor_stride);
+        ID3D12Device_CopyDescriptorsSimple(device->object, count, destination, source, type);
+        di += count; si += count;
+    }
+    return dst_total ? ID3D12Device_GetDeviceRemovedReason(device->object) : S_OK;
+}
 int32_t vkdu_command_heaps(vkdu_object *command, uint32_t count, vkdu_object *const *heaps)
 {
     ID3D12DescriptorHeap *native[2]; uint64_t addresses[2] = {0}; uint32_t i;

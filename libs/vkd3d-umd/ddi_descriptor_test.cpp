@@ -24,6 +24,9 @@ static vkdu_object *cbv_buffer;
 static uint32_t srv_index, srv_format, srv_count, srv_stride, srv_flags, srv_mapping, root_srv_index;
 static uint64_t srv_first, srv_offset;
 static vkdu_object *srv_buffer;
+static unsigned range_copies;
+static uint32_t copied_dst_count, copied_src_count, copied_type;
+static vkdu_descriptor_span copied_dst[8], copied_src[8];
 static vkdu_object *make_peer(vkdu_device *owner, vkdu_kind kind, uint32_t type = 0, uint32_t count = 8, bool visible = false) {
     next_base += 0x10000;
     return reinterpret_cast<vkdu_object *>(new Peer{kind, owner, type, count, visible, next_base, next_base + 0x10000000});
@@ -53,6 +56,14 @@ static int32_t test_uav(vkdu_object *, uint32_t index, vkdu_object *, uint32_t, 
     ++calls; uav_index = index; return next_result;
 }
 static int32_t test_copy(vkdu_object *, uint32_t, vkdu_object *, uint32_t, uint32_t) { ++copies; return next_result; }
+static int32_t test_copy_ranges(vkdu_device *, uint32_t type,
+        uint32_t dst_count, const vkdu_descriptor_span *dst, uint32_t src_count, const vkdu_descriptor_span *src) {
+    ++range_copies; copied_type = type; copied_dst_count = dst_count; copied_src_count = src_count;
+    if (dst_count > 8 || src_count > 8) return E_INVALIDARG;
+    for (uint32_t i = 0; i < dst_count; ++i) copied_dst[i] = dst[i];
+    for (uint32_t i = 0; i < src_count; ++i) copied_src[i] = src[i];
+    return next_result;
+}
 static int32_t test_cbv(vkdu_object *, uint32_t index, vkdu_object *buffer, uint64_t offset, uint32_t bytes) {
     ++calls; cbv_index = index; cbv_buffer = buffer; cbv_offset = offset; cbv_bytes = bytes; return next_result;
 }
@@ -93,6 +104,7 @@ static int32_t test_root(vkdu_device *d, const vkdu_root_parameter *p, uint32_t 
 #define vkdu_buffer_srv test_srv
 #define vkdu_command_srv test_root_srv
 #define vkdu_descriptor_copy test_copy
+#define vkdu_descriptor_copy_ranges test_copy_ranges
 #define vkdu_command_heaps test_heaps
 #define vkdu_command_table test_table
 #define vkdu_root_create test_root
@@ -217,6 +229,30 @@ int main() {
     REQUIRE(copies == 1);
     device.pfnCopyDescriptorsSimple(h, 1, target, destination, D3D12DDI_DESCRIPTOR_HEAP_TYPE_SAMPLER);
     REQUIRE(copies == 1 && reported == E_INVALIDARG);
+    D3D12DDI_CPU_DESCRIPTOR_HANDLE dst_ranges[] = {target, {static_cast<SIZE_T>(test_start(gpu.backend, 0))}};
+    D3D12DDI_CPU_DESCRIPTOR_HANDLE src_ranges[] = {destination, {static_cast<SIZE_T>(test_start(cpu.backend, 0))}, {1}};
+    UINT dst_sizes[] = {1, 2}, src_sizes[] = {2, 1, 0};
+    reported = S_OK;
+    device.pfnCopyDescriptors(h, 2, dst_ranges, dst_sizes, 3, src_ranges, src_sizes, D3D12DDI_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    REQUIRE(range_copies == 1 && reported == S_OK && copied_type == 0 && copied_dst_count == 2 && copied_src_count == 3);
+    REQUIRE(copied_dst[0].heap == gpu.backend && copied_dst[0].first == 4 && copied_dst[0].count == 1);
+    REQUIRE(copied_dst[1].first == 0 && copied_dst[1].count == 2 && copied_src[0].first == 3 && copied_src[0].count == 2);
+    REQUIRE(copied_src[1].heap == cpu.backend && copied_src[1].count == 1 && !copied_src[2].heap && !copied_src[2].count);
+    device.pfnCopyDescriptors(h, 2, dst_ranges, nullptr, 2, src_ranges, nullptr, D3D12DDI_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    REQUIRE(range_copies == 2 && copied_dst[0].count == 1 && copied_dst[1].count == 1 && copied_src[0].count == 1);
+    src_sizes[2] = 1; // Invalid late handle must reject the entire native call.
+    device.pfnCopyDescriptors(h, 2, dst_ranges, dst_sizes, 3, src_ranges, src_sizes, D3D12DDI_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    REQUIRE(range_copies == 2 && reported == E_INVALIDARG);
+    device.pfnCopyDescriptors(h, 1, nullptr, nullptr, 2, src_ranges, nullptr, D3D12DDI_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    REQUIRE(range_copies == 2 && reported == E_INVALIDARG);
+    device.pfnCopyDescriptors(h, 2, dst_ranges, nullptr, 2, src_ranges, nullptr, D3D12DDI_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+    REQUIRE(range_copies == 2 && reported == E_INVALIDARG);
+    next_result = DXGI_ERROR_DEVICE_REMOVED;
+    device.pfnCopyDescriptors(h, 2, dst_ranges, nullptr, 2, src_ranges, nullptr, D3D12DDI_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    REQUIRE(range_copies == 3 && reported == DXGI_ERROR_DEVICE_REMOVED);
+    next_result = S_OK; reported = S_OK;
+    device.pfnCopyDescriptors(h, 0, nullptr, nullptr, 0, nullptr, nullptr, D3D12DDI_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    REQUIRE(range_copies == 4 && !copied_dst_count && !copied_src_count);
     commands.pfnSetDescriptorHeaps({&command}, 1, &hg);
     commands.pfnSetComputeRootDescriptorTable({&command}, 5, {test_start(gpu.backend, 1) + 2 * 32});
     REQUIRE(tables_seen == 1 && table_index == 5 && table_first == 2);

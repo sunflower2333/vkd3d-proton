@@ -49,6 +49,7 @@ int main(int argc, char **argv) {
     REQUIRE(device.value.pfnGetCPUDescriptorHandleForHeapStart(h, heap).ptr == 0);
     REQUIRE(device.value.pfnGetGPUDescriptorHandleForHeapStart(h, heap).ptr == 0);
     device.value.pfnCopyDescriptorsSimple(h, 1, {}, {}, D3D12DDI_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    device.value.pfnCopyDescriptors(h, 0, nullptr, nullptr, 0, nullptr, nullptr, D3D12DDI_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     device.value.pfnCreateUnorderedAccessView(h, nullptr, {});
     device.value.pfnCreateShaderResourceView(h, nullptr, {});
     commands.value.pfnSetComputeRootShaderResourceView({}, 0, 0);
