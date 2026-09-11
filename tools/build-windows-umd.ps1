@@ -24,7 +24,7 @@ $crossArgs = @()
 if ($Architecture -eq 'arm64') { $crossArgs = @('--cross-file', 'tools/umd-arm64-msvc.ini') }
 meson setup $buildDir @crossArgs --buildtype release -Ddebug=true -Denable_umd_bridge=true -Denable_umd_bridge_tests=true
 if ($LASTEXITCODE) { exit $LASTEXITCODE }
-meson compile -C $buildDir -j 3 viogpud3d12 vkd3d-umd-ddi-abi-test vkd3d-umd-ddi-descriptor-test
+meson compile -C $buildDir -j 3 viogpud3d12 vkd3d-umd-ddi-abi-test vkd3d-umd-ddi-descriptor-test vkd3d-umd-gpu-probe
 if ($LASTEXITCODE) { exit $LASTEXITCODE }
 $dll = Join-Path $buildDir 'libs\vkd3d-umd\viogpud3d12.dll'
 $test = Join-Path $buildDir 'libs\vkd3d-umd\vkd3d-umd-ddi-abi-test.exe'
@@ -33,11 +33,14 @@ if ($Architecture -ne 'arm64') {
     if ($LASTEXITCODE) { exit $LASTEXITCODE }
     & (Join-Path $buildDir 'libs\vkd3d-umd\vkd3d-umd-ddi-descriptor-test.exe')
     if ($LASTEXITCODE) { exit $LASTEXITCODE }
+    & (Join-Path $buildDir 'libs\vkd3d-umd\vkd3d-umd-gpu-probe.exe')
+    if ($LASTEXITCODE -ne 2) { throw 'GPU probe must require explicit adapter identity before loading Vulkan' }
 }
 $output = Join-Path $buildDir 'package'
 New-Item -ItemType Directory -Force $output | Out-Null
 Copy-Item $dll,$test,(Join-Path $buildDir 'libs\vkd3d-umd\viogpud3d12.pdb') $output
 Copy-Item (Join-Path $buildDir 'libs\vkd3d-umd\vkd3d-umd-ddi-descriptor-test.exe') $output
+Copy-Item (Join-Path $buildDir 'libs\vkd3d-umd\vkd3d-umd-gpu-probe.exe') $output
 Copy-Item libs/vkd3d-umd/README.md $output
 dumpbin /headers $dll | Out-File (Join-Path $output 'pe-headers.txt')
 dumpbin /exports $dll | Out-File (Join-Path $output 'exports.txt')

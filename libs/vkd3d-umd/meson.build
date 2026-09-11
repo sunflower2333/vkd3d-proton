@@ -11,6 +11,10 @@ if vkd3d_platform == 'windows'
     include_directories : vkd3d_private_includes,
     cpp_args : ['-DNOMINMAX'])
   if get_option('enable_umd_bridge_tests')
+    # Uses the production backend; the CPU test-device entrypoint is absent.
+    umd_gpu_probe = executable('vkd3d-umd-gpu-probe', 'backend_test.c',
+      c_args : ['-DVKDU_GPU_PROBE'], dependencies : umd_backend_dep,
+      include_directories : vkd3d_private_includes)
     umd_ddi_abi_test = executable('vkd3d-umd-ddi-abi-test', 'ddi_abi_test.cpp',
       include_directories : vkd3d_public_includes, cpp_args : ['-DNOMINMAX'])
     umd_ddi_descriptor_test = executable('vkd3d-umd-ddi-descriptor-test', 'ddi_descriptor_test.cpp',

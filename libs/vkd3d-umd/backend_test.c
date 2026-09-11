@@ -13,7 +13,38 @@
 #define CHECK(expr) do { int32_t r = (expr); if (r < 0) { fprintf(stderr, "%s:%d: %s returned %08x\n", __FILE__, __LINE__, #expr, (unsigned)r); exit(1); } } while (0)
 #define REJECT(expr) do { if ((expr) >= 0) { fprintf(stderr, "unexpected success: %s\n", #expr); exit(1); } } while (0)
 
-int main(void)
+#ifdef VKDU_GPU_PROBE
+static struct vkdu_adapter requested_adapter;
+
+static int parse_hex32(const char *text, uint32_t *out)
+{
+    size_t length = strlen(text), i;
+    uint32_t value = 0;
+    if (!length || length > 8) return 0;
+    for (i = 0; i < length; ++i) {
+        unsigned digit;
+        if (text[i] >= '0' && text[i] <= '9') digit = text[i] - '0';
+        else if (text[i] >= 'a' && text[i] <= 'f') digit = text[i] - 'a' + 10;
+        else if (text[i] >= 'A' && text[i] <= 'F') digit = text[i] - 'A' + 10;
+        else return 0;
+        value = (value << 4) | digit;
+    }
+    *out = value;
+    return 1;
+}
+
+static int32_t validation_device_create(PFN_vkGetInstanceProcAddr loader, vkdu_device **out)
+{
+    return vkdu_device_create(loader, &requested_adapter, out);
+}
+#else
+static int32_t validation_device_create(PFN_vkGetInstanceProcAddr loader, vkdu_device **out)
+{
+    return vkdu_test_device_create(loader, out);
+}
+#endif
+
+int main(int argc, char **argv)
 {
     PFN_vkGetInstanceProcAddr loader;
     vkdu_device *device = NULL, *wrong = NULL;
@@ -25,17 +56,45 @@ int main(void)
     uint32_t *mapped, i;
     uint64_t completed;
 #ifdef _WIN32
-    HMODULE module = LoadLibraryW(L"vulkan-1.dll");
+    HMODULE module;
+#else
+    void *module;
+#endif
+#ifdef VKDU_GPU_PROBE
+    uint32_t luid[2];
+    /* The caller supplies the OS adapter LUID and the matching Vulkan IDs.
+     * Production selection independently verifies all fields and Turnip's
+     * driver ID. Never pick the first device or fall back to CPU Vulkan. */
+    if (argc != 6 || strcmp(argv[1], "--adapter") ||
+            !parse_hex32(argv[2], &luid[0]) || !parse_hex32(argv[3], &luid[1]) ||
+            !parse_hex32(argv[4], &requested_adapter.vendor_id) ||
+            !parse_hex32(argv[5], &requested_adapter.device_id)) {
+        fprintf(stderr, "Usage: %s --adapter LUID_LOW_HEX LUID_HIGH_HEX VENDOR_HEX DEVICE_HEX\n", argv[0]);
+        return 2;
+    }
+    memcpy(requested_adapter.luid, luid, sizeof(luid));
+    printf("Production Turnip backend probe: LUID=%08x:%08x vendor=%08x device=%08x\n",
+            luid[1], luid[0], requested_adapter.vendor_id, requested_adapter.device_id);
+#else
+    (void)argc;
+    (void)argv;
+#endif
+#ifdef _WIN32
+    module = LoadLibraryW(L"vulkan-1.dll");
     loader = module ? (PFN_vkGetInstanceProcAddr)GetProcAddress(module, "vkGetInstanceProcAddr") : NULL;
 #else
-    void *module = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+    module = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
     loader = module ? (PFN_vkGetInstanceProcAddr)dlsym(module, "vkGetInstanceProcAddr") : NULL;
 #endif
     if (!loader) { fprintf(stderr, "Vulkan loader is required\n"); return 1; }
     REJECT(vkdu_device_create(loader, &absent, &wrong));
     if (wrong) return 1;
-    CHECK(vkdu_test_device_create(loader, &device));
+    CHECK(validation_device_create(loader, &device));
+#ifdef VKDU_GPU_PROBE
+    puts("Embedded backend GPU validation; Windows runtime DDI/Present acceptance remains separate");
+#else
     puts("TEST ONLY: CPU Vulkan backend semantics, not VIOGPU or native Windows runtime proof");
+#endif
     CHECK(vkdu_queue_create(device, 0, &queue));
     CHECK(vkdu_allocator_create(device, 0, &allocator));
     CHECK(vkdu_command_create(device, allocator, 0, &command));
@@ -87,7 +146,7 @@ int main(void)
      * root-UAV dispatch cannot make this independent second readback pass. */
     CHECK(vkdu_heap_create(device, 0, 8, 0, &cpu_heap));
     CHECK(vkdu_heap_create(device, 0, 8, 1, &gpu_heap));
-    CHECK(vkdu_test_device_create(loader, &wrong));
+    CHECK(validation_device_create(loader, &wrong));
     CHECK(vkdu_heap_create(wrong, 0, 8, 0, &foreign_heap));
     {
         struct vkdu_descriptor_range range = {1, 1, 0, 0, 1};

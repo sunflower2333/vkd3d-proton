@@ -58,7 +58,17 @@ nonzero descriptor-table and range offsets, staging-to-visible descriptor copy,
 and rejects wrong-device heaps, invisible heaps, misaligned/out-of-range handles,
 invalid root indices and stale post-reset bindings. Local CPU Vulkan passes
 both the original root UAV and new descriptor-table readbacks (2048 words total).
-Windows three-architecture compile/ABI CI for this continuation is pending.
+Windows three-architecture compile/ABI CI34593634076 passed at7e50d05;
+the complete paired parent CI34594763298 also passed at9e42361.
+
+`vkd3d-umd-gpu-probe --adapter LUID_LOW_HEX LUID_HIGH_HEX VENDOR_HEX DEVICE_HEX`
+executes the same two compute/readback workloads through the production backend.
+Its build excludes the CPU test-device entrypoint. Supply the actual OS adapter
+LUID and matching Vulkan IDs; device selection independently requires all of
+them and Mesa Turnip's driver ID. Missing/malformed identity fails before Vulkan
+loading. This test diagnoses real hardware backend integration without changing
+system registration. It is not a Windows runtime DDI/Present acceptance test;
+target execution remains pending.
 
 Driver-parent packaging must build from `external/vkd3d-proton`, retain Mesa4ace
 and KMD7648b72f or explicit validated successors, copy this candidate before PE
