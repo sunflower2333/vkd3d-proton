@@ -10,7 +10,11 @@ namespace {
 constexpr uint32_t context_magic = 0x564b4455, object_magic = 0x564b4f42;
 constexpr uint32_t native_device_magic = 0x564b4e44;
 struct NativeAdapter;
+struct NativeHeap;
 struct Context;
+void native_heap_forget(Context *);
+void native_heap_retire(Context *);
+void native_heap_tables(D3D12DDI_DEVICE_FUNCS_CORE_0003 *);
 // Runtime owns this slot; child objects hold references to the separate Context.
 struct NativeDevice { uint32_t magic; Context *context; };
 struct Object;
@@ -30,6 +34,12 @@ struct Context {
     D3D12DDI_CORELAYER_DEVICECALLBACKS_0003 runtime_callbacks{};
     HMODULE vulkan_module = nullptr;
     std::recursive_mutex error_mutex;
+    NativeHeap *native_heaps = nullptr;
+    HANDLE native_heap_context = nullptr;
+    uint64_t native_va_start = 0, native_va_size = 0;
+    uint32_t native_context_id = 0;
+    bool native_retiring = false;
+    bool native_context_pending = false;
 };
 struct Object {
     uint32_t magic;
@@ -63,6 +73,7 @@ vkdu_object *backend(void *memory, vkdu_kind kind) {
 }
 void release(Context *value) {
     if (value && --value->references == 0) {
+        native_heap_forget(value);
         value->magic = 0; vkdu_device_destroy(value->backend);
         // Backend destruction can call Vulkan; unload only after that finishes.
         if (value->vulkan_module) FreeLibrary(value->vulkan_module);
@@ -534,6 +545,7 @@ extern "C" HRESULT APIENTRY VioGpuD3D12BridgeGetTables(D3D12DDI_DEVICE_FUNCS_COR
         D3D12DDI_COMMAND_LIST_FUNCS_3D_0003 *commands, D3D12DDI_COMMAND_QUEUE_FUNCS_CORE_0001 *queue) {
     if (!device || !commands || !queue) return E_INVALIDARG;
     *device = {}; *commands = {}; *queue = {};
+    native_heap_tables(device);
     // Assignment to actual WDK fields compile-checks ABI, including x86 stdcall.
     device->pfnCalcPrivateCommandQueueSize = queue_size; device->pfnCreateCommandQueue = queue_create; device->pfnDestroyCommandQueue = queue_destroy;
     device->pfnCalcPrivateCommandAllocatorSize = allocator_size; device->pfnCreateCommandAllocator = allocator_create;
@@ -559,8 +571,8 @@ extern "C" HRESULT APIENTRY VioGpuD3D12BridgeGetTables(D3D12DDI_DEVICE_FUNCS_COR
     commands->pfnSetComputeRoot32BitConstants = root_constants;
     commands->pfnSetDescriptorHeaps = set_heaps; commands->pfnSetComputeRootDescriptorTable = set_table;
     queue->pfnExecuteCommandLists = execute;
-    // Native monitored-fence, allocation/residency, runtime GPUVA, graphics and
-    // presentation contracts remain absent; do not advertise these tables.
+    // Native heaps are buffer-only. Vulkan resource import, monitored fences,
+    // residency, WDDM2 GPUVA, graphics and Present remain absent; no admission.
     return S_OK;
 }
 

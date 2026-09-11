@@ -58,7 +58,7 @@ try {
 } finally { $stream.Dispose() }
 [PSCustomObject]@{Source=(& git rev-parse HEAD); Submodules=(& git submodule status --recursive);
     Architecture=$Architecture; WindowsKit=$sdkVersion; NativeRuntimeValidated=$false;
-    Contract='OpenAdapter12 and native lifecycle; zero advertised feature levels; no native runtime acceptance'} |
+    Contract='OpenAdapter12, native lifecycle and buffer-only KMD heaps; no resource import; zero advertised feature levels; no native runtime acceptance'} |
     ConvertTo-Json -Depth 4 | Set-Content (Join-Path $output 'source.json')
 $hashes = Get-ChildItem $output -File | Get-FileHash -Algorithm SHA256
 $hashes | ForEach-Object { $_.Hash + '  ' + [IO.Path]::GetFileName($_.Path) } |

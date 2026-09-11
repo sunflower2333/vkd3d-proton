@@ -105,9 +105,32 @@ contracts, and FillDDITable refuses partial tables. This is real adapter/device
 lifecycle code with a WDK fixture, not successful Microsoft D3D12CreateDevice
 activation. The fixture does not enable an alternate production admission path.
 
+The next native slice implements R0 buffer-only heaps through the runtime's real
+CreateContext/Escape/Allocate/Lock/Unlock/Deallocate callbacks. It preserves the
+original adapter/device/resource handles, validates the v0 KMD context's reset
+generation and GPUVA range, and reserves non-overlapping 64-KiB heap ranges.
+Only L0 buffers with CPU access unavailable or WRITE_BACK are accepted; current
+KMD native allocations must fit its 32-bit allocation-size field. WRITE_COMBINE,
+L1, textures, primary/coherent-systemwide heaps and all resource creation remain
+unsupported. Runtime-owned heap storage need not be pre-zeroed. Failed cleanup
+keeps the allocation and VA reservation until device teardown; no AssumeNotInUse
+flag or synthetic KMT handle is used. Nested CPU mappings share one kernel lock,
+including ownership of handles renamed by LockCb. Synchronous device destruction
+detaches callbacks safely and delegates residual kernel handles to runtime device
+teardown, without stale callbacks or touching expired private slots.
+
+This is a KMD heap owner, not a Vulkan resource-import or WDDM2 GPUVA mapping
+implementation. Turnip currently owns a separate KMT device/context and disables
+external-memory import on WDDM. A resource cannot use these heaps until that
+ownership bridge is implemented. Therefore the R0 resource argument is rejected,
+all native DDI versions stay unadvertised, and no system D3D12 acceptance is
+claimed. The WDK fixture checks heap address alignment/exhaustion, runtime handle
+identity, foreign-device rejection, nested/renamed/null-pointer maps, failed
+context and allocation cleanup, mid-allocation reset and callback reentrancy.
+
 Still required for a native system driver: complete negotiated feature levels;
-full device/core and graphics DDIs; runtime allocation, heap,
-residency and GPUVA mapping; remaining descriptor views;
+full device/core and graphics DDIs; resource/heap import and placement,
+residency and WDDM2 GPUVA mapping; remaining descriptor views;
 monitored fences referring to the runtime's actual GPU backing; shared surfaces,
 presentation, device-removal/TDR recovery and WDDM KMD integration. The backend
 fences used by the test are not the runtime's monitored-fence contract.

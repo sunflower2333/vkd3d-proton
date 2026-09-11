@@ -177,6 +177,9 @@ void APIENTRY native_destroy_device(D3D12DDI_HDEVICE handle) {
     // keep Context alive, but must never call a retired runtime handle/callback.
     {
         std::lock_guard<std::recursive_mutex> lock(ctx->error_mutex);
+        if (ctx->native_retiring) return;
+        ctx->native_retiring = true;
+        native_heap_retire(ctx);
         ctx->runtime_device = {};
         ctx->runtime_callbacks = {};
         ctx->kernel_callbacks = {};
@@ -185,6 +188,8 @@ void APIENTRY native_destroy_device(D3D12DDI_HDEVICE handle) {
     slot->context = nullptr; slot->magic = 0;
     release(ctx);
 }
+
+#include "native_heap.inc"
 
 HRESULT APIENTRY native_close_adapter(D3D12DDI_HADAPTER handle) {
     std::lock_guard<std::mutex> lock(native_adapters_lock);

@@ -35,7 +35,9 @@ int main(int argc, char **argv) {
     REQUIRE(commands.value.pfnSetComputeRootConstantBufferView && commands.value.pfnSetComputeRootShaderResourceView);
     REQUIRE(commands.value.pfnSetComputeRoot32BitConstant && commands.value.pfnSetComputeRoot32BitConstants);
     REQUIRE(commands.value.pfnSetDescriptorHeaps && commands.value.pfnSetComputeRootDescriptorTable);
-    REQUIRE(!device.value.pfnCreateHeapAndResource && !device.value.pfnCreateFence && !device.value.pfnMakeResident);
+    REQUIRE(device.value.pfnCalcPrivateHeapAndResourceSizes && device.value.pfnCreateHeapAndResource &&
+            device.value.pfnDestroyHeapAndResource && device.value.pfnMapHeap && device.value.pfnUnmapHeap);
+    REQUIRE(!device.value.pfnCreateFence && !device.value.pfnMakeResident);
     REQUIRE(!queue.value.pfnSignalFence && !queue.value.pfnWaitForFence);
     D3D12DDI_HDEVICE h{};
     D3D12DDIARG_CREATECOMMANDQUEUE_0001 q{};
