@@ -4,6 +4,7 @@
 #include <cstring>
 #include <new>
 #include <memory>
+#include <mutex>
 
 namespace {
 constexpr uint32_t context_magic = 0x564b4455, object_magic = 0x564b4f42;
@@ -28,6 +29,7 @@ struct Context {
     D3DDDI_DEVICECALLBACKS kernel_callbacks{};
     D3D12DDI_CORELAYER_DEVICECALLBACKS_0003 runtime_callbacks{};
     HMODULE vulkan_module = nullptr;
+    std::recursive_mutex error_mutex;
 };
 struct Object {
     uint32_t magic;
@@ -69,8 +71,15 @@ void release(Context *value) {
 }
 void error(Context *value, HRESULT result) {
     if (!value || SUCCEEDED(result)) return;
-    value->last_error = result;
-    if (value->report) value->report(value->report_context, result);
+    // A runtime error callback can synchronously retire the native device.
+    // Retain Context until its recursive callback lock has been released.
+    ++value->references;
+    {
+        std::lock_guard<std::recursive_mutex> lock(value->error_mutex);
+        value->last_error = result;
+        if (value->report) value->report(value->report_context, result);
+    }
+    release(value);
 }
 void error(Object *value, HRESULT result) { if (value) error(value->context, result); }
 HRESULT bind(Context *ctx, void *memory, vkdu_object *value, vkdu_kind kind) {

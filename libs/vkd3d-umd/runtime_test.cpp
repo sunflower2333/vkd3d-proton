@@ -12,6 +12,9 @@
 static HRESULT backend_result = S_OK, query_result = S_OK;
 static unsigned loads, unloads, creates, destroys, query_calls, error_calls;
 static bool bad_loader = false, old_reply = false;
+static bool reset_during_create = false;
+static PFND3D12DDI_DESTROYDEVICE retire_in_error = nullptr;
+static D3D12DDI_HDEVICE error_device{};
 static uint64_t generation = 7;
 static D3D12DDI_HRTDEVICE last_runtime{};
 static const HANDLE expected_adapter = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(0x13570));
@@ -31,6 +34,7 @@ static int32_t test_create(PFN_vkGetInstanceProcAddr loader, const uint8_t luid[
     if (!loader || std::memcmp(luid, expected_luid.data(), 8)) std::abort();
     ++creates; *out = nullptr;
     if (SUCCEEDED(backend_result)) *out = reinterpret_cast<vkdu_device *>(new unsigned(99));
+    if (reset_during_create) ++generation;
     return backend_result;
 }
 static void test_destroy(vkdu_device *device) {
@@ -54,6 +58,7 @@ static HRESULT APIENTRY test_query(HANDLE runtime, const D3DDDICB_QUERYADAPTERIN
 static void APIENTRY test_error(D3D10DDI_HRTDEVICE runtime, HRESULT result) {
     if (result != E_INVALIDARG) std::abort();
     ++error_calls; last_runtime = runtime;
+    if (retire_in_error) retire_in_error(error_device);
 }
 
 #define LoadLibraryExW test_load
@@ -139,6 +144,32 @@ int main() {
     REQUIRE(destroys == 1 && unloads == 2 && retained.expired());
     funcs.pfnDestroyDevice(create.hDrvDevice); // Runtime memory is never deleted.
     for (size_t i = sizeof(NativeDevice); i < storage.size(); ++i) REQUIRE(storage[i] == 0xa5);
+
+    // A reset during backend creation must clean up without publishing a slot.
+    loads = unloads = creates = destroys = 0;
+    callbacks.pfnQueryAdapterInfoCb = test_query;
+    um.pfnSetErrorCb = test_error;
+    storage.fill(0xa5);
+    REQUIRE(OpenAdapter12(&open) == S_OK);
+    reset_during_create = true;
+    REQUIRE(funcs.pfnCreateDevice(open.hAdapter, &create) == DXGI_ERROR_DEVICE_REMOVED);
+    REQUIRE(creates == 1 && destroys == 1 && unloads == 1);
+    for (auto byte : storage) REQUIRE(byte == 0xa5);
+    reset_during_create = false;
+    REQUIRE(funcs.pfnCloseAdapter(open.hAdapter) == S_OK);
+    REQUIRE(OpenAdapter12(&open) == S_OK);
+    REQUIRE(funcs.pfnCreateDevice(open.hAdapter, &create) == S_OK);
+    ctx = context(create.hDrvDevice);
+    retained = ctx->native_adapter;
+    REQUIRE(funcs.pfnCloseAdapter(open.hAdapter) == S_OK);
+    // The runtime can tear down synchronously from SetErrorCb. This must not
+    // deadlock, unlock freed mutex storage, or unload before callback return.
+    retire_in_error = funcs.pfnDestroyDevice;
+    error_device = create.hDrvDevice;
+    error(ctx, E_INVALIDARG);
+    REQUIRE(!context(create.hDrvDevice) && retained.expired());
+    REQUIRE(destroys == 2 && unloads == 2);
+    retire_in_error = nullptr;
     std::printf("PASS native OpenAdapter12 WDK identity/negotiation/private memory/callback/lifetime/error cleanup (%zu-bit); no system-runtime or GPU acceptance\n", sizeof(void *) * 8);
     return 0;
 }

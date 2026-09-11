@@ -153,6 +153,10 @@ HRESULT APIENTRY native_create_device(D3D12DDI_HADAPTER handle, const D3D12DDIAR
     PFN_vkGetInstanceProcAddr loader = nullptr;
     hr = native_load_vulkan(&ctx->vulkan_module, &loader);
     if (SUCCEEDED(hr)) hr = vkdu_device_create_runtime(loader, adapter->luid.data(), &ctx->backend);
+    // Backend creation may race a KMD reset; revalidate before publishing state.
+    if (SUCCEEDED(hr)) hr = native_query_identity(*adapter, current_luid, current_generation);
+    if (SUCCEEDED(hr) && (current_luid != adapter->luid || current_generation != adapter->generation))
+        hr = DXGI_ERROR_DEVICE_REMOVED;
     if (FAILED(hr)) { release(ctx); return hr; }
     ctx->native_adapter = std::move(adapter);
     ctx->runtime_device = args->hRTDevice;
@@ -171,10 +175,13 @@ void APIENTRY native_destroy_device(D3D12DDI_HDEVICE handle) {
     auto *ctx = slot->context;
     // Runtime releases this storage immediately after return. Child objects may
     // keep Context alive, but must never call a retired runtime handle/callback.
-    ctx->runtime_device = {};
-    ctx->runtime_callbacks = {};
-    ctx->kernel_callbacks = {};
-    ctx->report = nullptr; ctx->report_context = nullptr;
+    {
+        std::lock_guard<std::recursive_mutex> lock(ctx->error_mutex);
+        ctx->runtime_device = {};
+        ctx->runtime_callbacks = {};
+        ctx->kernel_callbacks = {};
+        ctx->report = nullptr; ctx->report_context = nullptr;
+    }
     slot->context = nullptr; slot->magic = 0;
     release(ctx);
 }
