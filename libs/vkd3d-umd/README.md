@@ -50,6 +50,15 @@ address: root descriptors have no descriptor bounds/null-read guarantee.
 Unknown or zero root addresses reach the error callback before backend state
 changes. See the Microsoft [root descriptor contract](https://microsoft.github.io/DirectX-Specs/d3d/ResourceBinding.html#root-descriptors).
 
+Native SetComputeRoot32BitConstant and SetComputeRoot32BitConstants now map
+to the embedded command list. The bound root layout retains each constants
+slot's DWORD count; updates validate the slot type, range, recording state
+and source pointer before changing any value. Partial updates preserve all
+other constants, and caller storage is copied during command recording.
+Root creation enforces the total64-DWORD budget, including table/root-descriptor
+costs. Command reset clears the bound layout so stale constants cannot be set
+without rebinding. This follows Microsoft's [root constants contract](https://learn.microsoft.com/windows/win32/direct3d12/using-constants-directly-in-the-root-signature).
+
 Buffer SRVs support the native CreateShaderResourceView and compute root SRV
 callbacks, raw/structured/R32 typed views, same-device ownership, bounded
 element ranges and valid null table descriptors. The DDI resolves resource
@@ -121,7 +130,19 @@ storage heaps and scattering across different destination boundaries. It then
 tries invalid late ranges, foreign heaps, visible sources, overlap and count
 mismatches before executing the retained valid descriptor. All1024 words must
 still match that valid CBV. Local CPU Vulkan passes fifteen workloads/15360
-words; Windows WDK and target ranged-copy validation are pending.
+words. Standalone0447a76 CI34606533835 and paired72cef21 CI34607682895 both
+passed all jobs. Parent targetseven-vkd3d044-ranges-03 passed in1039ms with
+all15360words correct, retained DWM2088/Explorer5820 and correlated host trace
+coverage. Native runtime and Present remain unproven.
+
+The root-constants continuation adds two independent1024-word readbacks with
+a single HLSL uint4 cbuffer. Disjoint bit lanes verify bulk updates, partial
+offset updates and preservation when rebinding the same root signature. The
+caller arrays are overwritten immediately after recording, proving commands
+do not retain their addresses. Rejected late ranges and null sources must
+preserve the valid result; each round resets and initializes the full output.
+Local CPU Vulkan passes all17workloads/17408words. Native Windows callback
+validation and target root-constant execution are pending.
 
 `vkd3d-umd-gpu-probe --adapter LUID_LOW_HEX LUID_HIGH_HEX VENDOR_HEX DEVICE_HEX`
 executes the same compute/readback workloads through the production backend.

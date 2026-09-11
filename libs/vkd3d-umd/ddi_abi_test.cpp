@@ -32,6 +32,7 @@ int main(int argc, char **argv) {
     REQUIRE(device.value.pfnCreateUnorderedAccessView && device.value.pfnCopyDescriptorsSimple);
     REQUIRE(device.value.pfnCreateConstantBufferView && device.value.pfnCreateShaderResourceView);
     REQUIRE(commands.value.pfnSetComputeRootConstantBufferView && commands.value.pfnSetComputeRootShaderResourceView);
+    REQUIRE(commands.value.pfnSetComputeRoot32BitConstant && commands.value.pfnSetComputeRoot32BitConstants);
     REQUIRE(commands.value.pfnSetDescriptorHeaps && commands.value.pfnSetComputeRootDescriptorTable);
     REQUIRE(!device.value.pfnCreateHeapAndResource && !device.value.pfnCreateFence && !device.value.pfnMakeResident);
     REQUIRE(!queue.value.pfnSignalFence && !queue.value.pfnWaitForFence);
@@ -53,6 +54,8 @@ int main(int argc, char **argv) {
     device.value.pfnCreateUnorderedAccessView(h, nullptr, {});
     device.value.pfnCreateShaderResourceView(h, nullptr, {});
     commands.value.pfnSetComputeRootShaderResourceView({}, 0, 0);
+    commands.value.pfnSetComputeRoot32BitConstant({}, 0, 0, 0);
+    commands.value.pfnSetComputeRoot32BitConstants({}, 0, 0, nullptr, 0);
     commands.value.pfnSetDescriptorHeaps({}, 0, nullptr);
     commands.value.pfnSetComputeRootDescriptorTable({}, 0, {});
     REQUIRE(create(nullptr, nullptr, report, nullptr, &h) == E_INVALIDARG);

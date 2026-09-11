@@ -27,6 +27,7 @@ static vkdu_object *srv_buffer;
 static unsigned range_copies;
 static uint32_t copied_dst_count, copied_src_count, copied_type;
 static vkdu_descriptor_span copied_dst[8], copied_src[8];
+static uint32_t constant_index, constant_offset, constant_count, constant_values[8];
 static vkdu_object *make_peer(vkdu_device *owner, vkdu_kind kind, uint32_t type = 0, uint32_t count = 8, bool visible = false) {
     next_base += 0x10000;
     return reinterpret_cast<vkdu_object *>(new Peer{kind, owner, type, count, visible, next_base, next_base + 0x10000000});
@@ -80,6 +81,12 @@ static int32_t test_srv(vkdu_object *, uint32_t index, vkdu_object *buffer, uint
 static int32_t test_root_srv(vkdu_object *, uint32_t index, vkdu_object *buffer, uint64_t offset) {
     ++calls; root_srv_index = index; srv_buffer = buffer; srv_offset = offset; return next_result;
 }
+static int32_t test_constants(vkdu_object *, uint32_t index, uint32_t offset, uint32_t count, const uint32_t *values) {
+    ++calls; constant_index = index; constant_offset = offset; constant_count = count;
+    if (count > 8 || (count && !values)) return E_INVALIDARG;
+    for (uint32_t i = 0; i < count; ++i) constant_values[i] = values[i];
+    return next_result;
+}
 static int32_t test_table(vkdu_object *, uint32_t index, vkdu_object *, uint32_t first) {
     ++tables_seen; table_index = index; table_first = first; return next_result;
 }
@@ -103,6 +110,7 @@ static int32_t test_root(vkdu_device *d, const vkdu_root_parameter *p, uint32_t 
 #define vkdu_command_cbv test_root_cbv
 #define vkdu_buffer_srv test_srv
 #define vkdu_command_srv test_root_srv
+#define vkdu_command_constants test_constants
 #define vkdu_descriptor_copy test_copy
 #define vkdu_descriptor_copy_ranges test_copy_ranges
 #define vkdu_command_heaps test_heaps
@@ -138,6 +146,18 @@ int main() {
     auto *c = make_peer(ctx.backend, VKDU_COMMAND_LIST);
     REQUIRE(VioGpuD3D12BridgeBindObject(h, &buffer, b, VKDU_BUFFER) == S_OK);
     REQUIRE(VioGpuD3D12BridgeBindObject(h, &command, c, VKDU_COMMAND_LIST) == S_OK);
+    commands.pfnSetComputeRoot32BitConstant({&command}, 3, 0x81234567, 5);
+    REQUIRE(constant_index == 3 && constant_offset == 5 && constant_count == 1 && constant_values[0] == 0x81234567);
+    UINT values[3] = {0x7fc01234, 0x80000000, 0xffffffff};
+    commands.pfnSetComputeRoot32BitConstants({&command}, 6, 3, values, 2);
+    REQUIRE(constant_index == 6 && constant_offset == 2 && constant_count == 3
+            && constant_values[0] == values[0] && constant_values[1] == values[1] && constant_values[2] == values[2]);
+    commands.pfnSetComputeRoot32BitConstants({&command}, 6, 0, nullptr, 5);
+    REQUIRE(constant_count == 0 && constant_offset == 5);
+    next_result = E_INVALIDARG;
+    commands.pfnSetComputeRoot32BitConstant({&command}, 3, 7, 5);
+    REQUIRE(reported == E_INVALIDARG);
+    next_result = reported = S_OK;
     D3D12DDIARG_CREATE_UNORDERED_ACCESS_VIEW_0002 view{};
     view.hDrvResource = {&buffer}; view.ResourceDimension = D3D12DDI_RD_BUFFER;
     view.Format = DXGI_FORMAT_R32_TYPELESS; view.Buffer.NumElements = 1024; view.Buffer.Flags = D3D12DDI_BUFFER_UAV_FLAG_RAW;

@@ -13,6 +13,7 @@
 #include "../../tests/shaders/resource/headers/cs_large_tbo_load.h"
 #include "../../tests/shaders/descriptors/headers/overlapping_bindings.h"
 #include "../../tests/shaders/sparse/headers/update_tile_mappings_smem.h"
+#include "../../tests/shaders/command/headers/execute_indirect_multi_dispatch_root_constants.h"
 
 #define CHECK(expr) do { int32_t r = (expr); if (r < 0) { fprintf(stderr, "%s:%d: %s returned %08x\n", __FILE__, __LINE__, #expr, (unsigned)r); exit(1); } } while (0)
 #define REJECT(expr) do { if ((expr) >= 0) { fprintf(stderr, "unexpected success: %s\n", #expr); exit(1); } } while (0)
@@ -186,6 +187,89 @@ static void check_constant_buffers(vkdu_device *device, vkdu_device *other)
     vkdu_object_destroy(cpu_second); vkdu_object_destroy(foreign_heap);
     vkdu_object_destroy(upload); vkdu_object_destroy(buffer); vkdu_object_destroy(readback);
     puts("PASS CBV root/table offsets, copied/null/ranged descriptors, atomic range validation, root address and alignment/device rejection: 5x1024 readbacks");
+}
+
+static void check_root_constants(vkdu_device *device)
+{
+    vkdu_object *upload = NULL, *buffer = NULL, *readback = NULL, *root = NULL, *bad = NULL;
+    vkdu_object *queue = NULL, *allocator = NULL, *command = NULL, *fence = NULL, *pipeline = NULL;
+    struct vkdu_root_parameter params[2] = {{D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS, 0, 0, 0, 4},
+        {D3D12_ROOT_PARAMETER_TYPE_UAV, 0, 0, 0, 0}};
+    uint32_t *mapped, values[4], expected[4], patch[2], round, i;
+    params[0].constant_count = 0; REJECT(vkdu_root_create(device, params, 2, 0, &bad));
+    params[0].constant_count = 65; REJECT(vkdu_root_create(device, params, 2, 0, &bad));
+    params[0].constant_count = 63; REJECT(vkdu_root_create(device, params, 2, 0, &bad));
+    params[0].constant_count = 4;
+    CHECK(vkdu_root_create(device, params, 2, 0, &root));
+    /* This HLSL cbuffer is one uint4, with no forbidden root-cbuffer array.
+     * Four disjoint byte lanes make every retained/updated component visible. */
+    CHECK(vkdu_pipeline_create(device, root, execute_indirect_multi_dispatch_root_constants_code_dxbc,
+            sizeof(execute_indirect_multi_dispatch_root_constants_code_dxbc), &pipeline));
+    CHECK(vkdu_buffer_create(device, 4096, 2, 0, D3D12_RESOURCE_STATE_GENERIC_READ, &upload));
+    CHECK(vkdu_buffer_create(device, 4096, 1, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST, &buffer));
+    CHECK(vkdu_buffer_create(device, 4096, 3, 0, D3D12_RESOURCE_STATE_COPY_DEST, &readback));
+    CHECK(vkdu_buffer_map(upload, 0, 0, (void **)&mapped));
+    for (i = 0; i < 1024; ++i) mapped[i] = 0xdeadbeef;
+    CHECK(vkdu_buffer_unmap(upload, 0, 4096));
+    CHECK(vkdu_queue_create(device, 0, &queue));
+    CHECK(vkdu_allocator_create(device, 0, &allocator));
+    CHECK(vkdu_command_create(device, allocator, 0, &command));
+    CHECK(vkdu_fence_create(device, 0, &fence));
+    for (round = 0; round < 2; ++round) {
+        fprintf(stderr, "Root constants round %u: %s\n", round, round ? "partial offsets and same-root preservation after reset" : "bulk values and copied source lifetime");
+        if (round) {
+            CHECK(vkdu_allocator_reset(allocator));
+            CHECK(vkdu_command_reset(command, allocator));
+            CHECK(vkdu_command_transition(command, buffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST));
+        }
+        CHECK(vkdu_command_copy(command, buffer, 0, upload, 0, 4096));
+        CHECK(vkdu_command_transition(command, buffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+        REJECT(vkdu_command_constants(command, 0, 0, 1, values));
+        CHECK(vkdu_command_root(command, root));
+        CHECK(vkdu_command_pipeline(command, pipeline));
+        CHECK(vkdu_command_uav(command, 1, buffer, 0));
+        for (i = 0; i < 4; ++i) values[i] = expected[i] = (i + round + 1) << (i * 8);
+        CHECK(vkdu_command_constants(command, 0, 0, 4, values));
+        /* The recorded constants must no longer reference this caller array. */
+        memset(values, 0xff, sizeof(values));
+        if (round) {
+            CHECK(vkdu_command_root(command, root));
+            for (i = 0; i < 2; ++i) patch[i] = expected[1 + i] = (i + 6) << ((i + 1) * 8);
+            CHECK(vkdu_command_constants(command, 0, 1, 2, patch));
+            values[0] = expected[3] = 0x80000000;
+            CHECK(vkdu_command_constants(command, 0, 3, 1, values));
+            memset(patch, 0xee, sizeof(patch)); values[0] = 0;
+        }
+        CHECK(vkdu_command_constants(command, 0, 4, 0, NULL));
+        REJECT(vkdu_command_constants(command, 1, 0, 1, values));
+        REJECT(vkdu_command_constants(command, UINT32_MAX, 0, 1, values));
+        REJECT(vkdu_command_constants(command, 0, 3, 2, values));
+        REJECT(vkdu_command_constants(command, 0, UINT32_MAX, 1, values));
+        REJECT(vkdu_command_constants(command, 0, 0, 1, NULL));
+        CHECK(vkdu_command_dispatch(command, 1, 1, 1));
+        CHECK(vkdu_command_transition(command, buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE));
+        CHECK(vkdu_command_copy(command, readback, 0, buffer, 0, 4096));
+        CHECK(vkdu_command_close(command));
+        REJECT(vkdu_command_constants(command, 0, 0, 1, values));
+        CHECK(vkdu_queue_execute(queue, 1, &command));
+        CHECK(vkdu_queue_signal(queue, fence, round + 1));
+        CHECK(vkdu_fence_wait(fence, round + 1, 30000));
+        CHECK(vkdu_buffer_map(readback, 0, 4096, (void **)&mapped));
+        for (i = 0; i < 1024; ++i) {
+            uint32_t wanted = 0xdeadbeef;
+            if (!i) wanted += expected[0] | expected[1] | expected[2] | expected[3];
+            if (mapped[i] != wanted) {
+                fprintf(stderr, "Root constants round %u word %u: %08x expected %08x\n", round, i, mapped[i], wanted);
+                exit(1);
+            }
+        }
+        CHECK(vkdu_buffer_unmap(readback, 0, 0));
+    }
+    CHECK(vkdu_device_status(device));
+    vkdu_object_destroy(command); vkdu_object_destroy(allocator); vkdu_object_destroy(queue); vkdu_object_destroy(fence);
+    vkdu_object_destroy(root); vkdu_object_destroy(pipeline); vkdu_object_destroy(upload);
+    vkdu_object_destroy(buffer); vkdu_object_destroy(readback);
+    puts("PASS root32 constants bulk/partial offsets, source lifetime, same-root preservation, reset and rejected updates: 2x1024 readbacks");
 }
 
 static void check_shader_resources(vkdu_device *device, vkdu_device *other)
@@ -467,6 +551,7 @@ int main(int argc, char **argv)
     CHECK(vkdu_buffer_unmap(readback, 0, 0));
     CHECK(vkdu_device_status(device));
     check_constant_buffers(device, wrong);
+    check_root_constants(device);
     check_shader_resources(device, wrong);
     /* Caller follows D3D12 lifetime rules: reset/destroy only after completion. */
     vkdu_object_destroy(command); vkdu_object_destroy(allocator);

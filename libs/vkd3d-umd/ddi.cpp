@@ -376,6 +376,17 @@ void APIENTRY execute(D3D12DDI_HCOMMANDQUEUE q, UINT count, const D3D12DDI_HCOMM
     for (UINT i = 0; i < count; ++i) native[i] = backend(commands[i].pDrvPrivate, VKDU_COMMAND_LIST);
     error(queue, vkdu_queue_execute(queue->backend, count, native));
 }
+void APIENTRY root_constant(D3D12DDI_HCOMMANDLIST c, UINT index, UINT value, UINT offset) {
+    auto *cmd = object(c.pDrvPrivate);
+    if (!cmd) return;
+    error(cmd, vkdu_command_constants(backend(c.pDrvPrivate, VKDU_COMMAND_LIST), index, offset, 1, &value));
+}
+void APIENTRY root_constants(D3D12DDI_HCOMMANDLIST c, UINT index, UINT count, const VOID *values, UINT offset) {
+    auto *cmd = object(c.pDrvPrivate);
+    if (!cmd) return;
+    error(cmd, vkdu_command_constants(backend(c.pDrvPrivate, VKDU_COMMAND_LIST), index, offset, count,
+            static_cast<const uint32_t *>(values)));
+}
 SIZE_T APIENTRY root_size(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATE_ROOT_SIGNATURE_0001 *) { return sizeof(Object); }
 HRESULT APIENTRY root_create(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATE_ROOT_SIGNATURE_0001 *args, D3D12DDI_HROOTSIGNATURE root) {
     auto *ctx = context(h); vkdu_object *value = nullptr; vkdu_root_parameter parameters[64]{};
@@ -510,6 +521,8 @@ extern "C" HRESULT APIENTRY VioGpuD3D12BridgeGetTables(D3D12DDI_DEVICE_FUNCS_COR
     commands->pfnSetComputeRootUnorderedAccessView = root_uav;
     commands->pfnSetComputeRootConstantBufferView = root_cbv;
     commands->pfnSetComputeRootShaderResourceView = root_srv;
+    commands->pfnSetComputeRoot32BitConstant = root_constant;
+    commands->pfnSetComputeRoot32BitConstants = root_constants;
     commands->pfnSetDescriptorHeaps = set_heaps; commands->pfnSetComputeRootDescriptorTable = set_table;
     queue->pfnExecuteCommandLists = execute;
     // Native monitored-fence, allocation/residency, runtime GPUVA, graphics and

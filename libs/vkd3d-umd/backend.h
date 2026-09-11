@@ -69,6 +69,8 @@ int32_t vkdu_command_pipeline(vkdu_object *command, vkdu_object *pipeline);
 int32_t vkdu_command_uav(vkdu_object *command, uint32_t index, vkdu_object *buffer, uint64_t offset);
 int32_t vkdu_command_cbv(vkdu_object *command, uint32_t index, vkdu_object *buffer, uint64_t offset);
 int32_t vkdu_command_srv(vkdu_object *command, uint32_t index, vkdu_object *buffer, uint64_t offset);
+int32_t vkdu_command_constants(vkdu_object *command, uint32_t index, uint32_t offset,
+        uint32_t count, const uint32_t *values);
 int32_t vkdu_command_dispatch(vkdu_object *command, uint32_t x, uint32_t y, uint32_t z);
 int32_t vkdu_queue_execute(vkdu_object *queue, uint32_t count, vkdu_object *const *commands);
 int32_t vkdu_fence_create(vkdu_device *device, uint64_t initial, vkdu_object **out);

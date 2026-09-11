@@ -464,14 +464,19 @@ int32_t vkdu_command_transition(vkdu_object *command, vkdu_object *resource, uin
 int32_t vkdu_root_create(vkdu_device *device, const struct vkdu_root_parameter *parameters, uint32_t count, uint32_t flags, vkdu_object **out)
 {
     D3D12_ROOT_PARAMETER native[64] = {{0}}; D3D12_ROOT_SIGNATURE_DESC desc = {0};
-    ID3DBlob *blob = NULL, *error = NULL; ID3D12RootSignature *root = NULL; HRESULT hr; uint32_t i, j, total = 0, used = 0;
+    ID3DBlob *blob = NULL, *error = NULL; ID3D12RootSignature *root = NULL; HRESULT hr; uint32_t i, j, total = 0, used = 0, cost = 0;
     D3D12_DESCRIPTOR_RANGE *ranges = NULL;
     struct vkdu_root_slot slots[64] = {{0}};
     if (!out) return E_POINTER;
     *out = NULL;
     if (!device || count > 64 || (count && !parameters)) return E_INVALIDARG;
     for (i = 0; i < count; ++i) {
+        uint32_t words;
         if (parameters[i].type > 4) return E_INVALIDARG;
+        words = parameters[i].type == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE ? 1 :
+                parameters[i].type == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS ? parameters[i].constant_count : 2;
+        if (!words || words > 64 - cost) return E_INVALIDARG;
+        cost += words;
         if (parameters[i].type != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) continue;
         if (!parameters[i].range_count || !parameters[i].ranges || parameters[i].range_count > 4096 - total) return E_INVALIDARG;
         total += parameters[i].range_count;
@@ -501,6 +506,7 @@ int32_t vkdu_root_create(vkdu_device *device, const struct vkdu_root_parameter *
             }
             slots[i].extent = (uint32_t)extent;
         } else if (parameters[i].type == 1) {
+            slots[i].extent = parameters[i].constant_count;
             native[i].Constants.ShaderRegister = parameters[i].shader_register;
             native[i].Constants.RegisterSpace = parameters[i].register_space;
             native[i].Constants.Num32BitValues = parameters[i].constant_count;
@@ -596,6 +602,19 @@ int32_t vkdu_command_dispatch(vkdu_object *command, uint32_t x, uint32_t y, uint
 {
     if (!RECORDING(command) || command->command_type == 3 || x > 65535 || y > 65535 || z > 65535) return E_INVALIDARG;
     ID3D12GraphicsCommandList_Dispatch(OBJ(ID3D12GraphicsCommandList, command), x, y, z); return S_OK;
+}
+int32_t vkdu_command_constants(vkdu_object *command, uint32_t index, uint32_t offset,
+        uint32_t count, const uint32_t *values)
+{
+    if (!RECORDING(command) || command->command_type == 3 || index >= command->slot_count ||
+        command->slots[index].type != D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS ||
+        offset > command->slots[index].extent || count > command->slots[index].extent - offset ||
+        (count && !values)) return E_INVALIDARG;
+    /* The backend records an immediate copy. No caller pointer survives this
+     * call, and validation completes before any root constants can change. */
+    if (count) ID3D12GraphicsCommandList_SetComputeRoot32BitConstants(
+            OBJ(ID3D12GraphicsCommandList, command), index, count, values, offset);
+    return S_OK;
 }
 int32_t vkdu_queue_execute(vkdu_object *queue, uint32_t count, vkdu_object *const *commands)
 {
