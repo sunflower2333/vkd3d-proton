@@ -147,6 +147,25 @@ void APIENTRY create_uav(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATE_UNORDERED_
     ReleaseSRWLockShared(&ctx->resources_lock);
     error(ctx, hr);
 }
+void APIENTRY create_cbv(D3D12DDI_HDEVICE h, const D3D12DDI_CONSTANT_BUFFER_VIEW_DESC *args, D3D12DDI_CPU_DESCRIPTOR_HANDLE destination) {
+    auto *ctx = context(h);
+    if (!ctx) return;
+    if (!args) { error(ctx, E_INVALIDARG); return; }
+    uint32_t index = 0; HRESULT hr = E_INVALIDARG;
+    AcquireSRWLockShared(&ctx->resources_lock);
+    auto *heap = find_heap(ctx, destination.ptr, false, &index);
+    if (heap) {
+        if (!args->BufferLocation) hr = vkdu_buffer_cbv(heap->backend, index, nullptr, 0, args->SizeInBytes);
+        else for (auto *p = ctx->resources; p; p = p->next) {
+            if (args->BufferLocation >= p->address && args->BufferLocation - p->address < p->bytes) {
+                hr = vkdu_buffer_cbv(heap->backend, index, p->backend, args->BufferLocation - p->address, args->SizeInBytes);
+                break;
+            }
+        }
+    }
+    ReleaseSRWLockShared(&ctx->resources_lock);
+    error(ctx, hr);
+}
 void APIENTRY copy_descriptors_simple(D3D12DDI_HDEVICE h, UINT count, D3D12DDI_CPU_DESCRIPTOR_HANDLE destination,
         D3D12DDI_CPU_DESCRIPTOR_HANDLE source, D3D12DDI_DESCRIPTOR_HEAP_TYPE type) {
     auto *ctx = context(h);
@@ -262,6 +281,20 @@ void APIENTRY root_uav(D3D12DDI_HCOMMANDLIST c, UINT index, D3D12DDI_GPU_VIRTUAL
     for (auto *p = ctx->resources; p; p = p->next) {
         if (address >= p->address && address - p->address < p->bytes) {
             hr = vkdu_command_uav(cmd->backend, index, p->backend, address - p->address); break;
+        }
+    }
+    ReleaseSRWLockShared(&ctx->resources_lock);
+    error(cmd, hr);
+}
+void APIENTRY root_cbv(D3D12DDI_HCOMMANDLIST c, UINT index, D3D12DDI_GPU_VIRTUAL_ADDRESS address) {
+    auto *cmd = object(c.pDrvPrivate);
+    if (!cmd) return;
+    if (!address) { error(cmd, E_INVALIDARG); return; }
+    auto *ctx = cmd->context; HRESULT hr = E_INVALIDARG;
+    AcquireSRWLockShared(&ctx->resources_lock);
+    for (auto *p = ctx->resources; p; p = p->next) {
+        if (address >= p->address && address - p->address < p->bytes) {
+            hr = vkdu_command_cbv(cmd->backend, index, p->backend, address - p->address); break;
         }
     }
     ReleaseSRWLockShared(&ctx->resources_lock);
@@ -398,11 +431,13 @@ extern "C" HRESULT APIENTRY VioGpuD3D12BridgeGetTables(D3D12DDI_DEVICE_FUNCS_COR
     device->pfnCalcPrivateDescriptorHeapSize = heap_size; device->pfnCreateDescriptorHeap = heap_create; device->pfnDestroyDescriptorHeap = heap_destroy;
     device->pfnGetDescriptorSizeInBytes = descriptor_size; device->pfnGetCPUDescriptorHandleForHeapStart = heap_cpu;
     device->pfnGetGPUDescriptorHandleForHeapStart = heap_gpu; device->pfnCreateUnorderedAccessView = create_uav;
+    device->pfnCreateConstantBufferView = create_cbv;
     device->pfnCopyDescriptorsSimple = copy_descriptors_simple;
     commands->pfnCloseCommandList = command_close; commands->pfnResetCommandList = command_reset;
     commands->pfnCopyBufferRegion = copy; commands->pfnResourceBarrier = barriers; commands->pfnDispatch = dispatch;
     commands->pfnSetComputeRootSignature = root_set; commands->pfnSetPipelineState = pipeline_set;
     commands->pfnSetComputeRootUnorderedAccessView = root_uav;
+    commands->pfnSetComputeRootConstantBufferView = root_cbv;
     commands->pfnSetDescriptorHeaps = set_heaps; commands->pfnSetComputeRootDescriptorTable = set_table;
     queue->pfnExecuteCommandLists = execute;
     // Native monitored-fence, allocation/residency, runtime GPUVA, graphics and

@@ -9,6 +9,7 @@
 #include <dlfcn.h>
 #endif
 #include "../../tests/shaders/command/headers/execute_indirect_cs.h"
+#include "../../tests/shaders/descriptors/headers/update_root_descriptors.h"
 
 #define CHECK(expr) do { int32_t r = (expr); if (r < 0) { fprintf(stderr, "%s:%d: %s returned %08x\n", __FILE__, __LINE__, #expr, (unsigned)r); exit(1); } } while (0)
 #define REJECT(expr) do { if ((expr) >= 0) { fprintf(stderr, "unexpected success: %s\n", #expr); exit(1); } } while (0)
@@ -43,6 +44,109 @@ static int32_t validation_device_create(PFN_vkGetInstanceProcAddr loader, vkdu_d
     return vkdu_test_device_create(loader, out);
 }
 #endif
+
+static void check_constant_buffers(vkdu_device *device, vkdu_device *other)
+{
+    vkdu_object *constants = NULL, *foreign = NULL, *upload = NULL, *buffer = NULL, *readback = NULL;
+    vkdu_object *cpu = NULL, *gpu = NULL, *queue = NULL, *allocator = NULL, *command = NULL, *fence = NULL;
+    vkdu_object *root = NULL, *table = NULL, *pipeline = NULL, *table_pipeline = NULL;
+    struct vkdu_descriptor_range range = {D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 0, 0, 1};
+    struct vkdu_root_parameter params[2] = {{D3D12_ROOT_PARAMETER_TYPE_CBV, 0, 0, 0, 0},
+        {D3D12_ROOT_PARAMETER_TYPE_UAV, 0, 0, 0, 0}};
+    uint32_t *mapped, round, i;
+    CHECK(vkdu_buffer_create(device, 131072, 2, 0, D3D12_RESOURCE_STATE_GENERIC_READ, &constants));
+    CHECK(vkdu_buffer_create(other, 256, 2, 0, D3D12_RESOURCE_STATE_GENERIC_READ, &foreign));
+    CHECK(vkdu_buffer_create(device, 4096, 2, 0, D3D12_RESOURCE_STATE_GENERIC_READ, &upload));
+    CHECK(vkdu_buffer_create(device, 4096, 1, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST, &buffer));
+    CHECK(vkdu_buffer_create(device, 4096, 3, 0, D3D12_RESOURCE_STATE_COPY_DEST, &readback));
+    CHECK(vkdu_buffer_map(constants, 0, 0, (void **)&mapped));
+    memset(mapped, 0, 131072);
+    mapped[64] = 37; mapped[65] = 0x13579bdf;
+    mapped[128] = 941; mapped[129] = 0x2468ace0;
+    CHECK(vkdu_buffer_unmap(constants, 0, 131072));
+    CHECK(vkdu_buffer_map(upload, 0, 0, (void **)&mapped));
+    for (i = 0; i < 1024; ++i) mapped[i] = 0xdeadbeef;
+    CHECK(vkdu_buffer_unmap(upload, 0, 4096));
+    CHECK(vkdu_heap_create(device, 0, 8, 0, &cpu));
+    CHECK(vkdu_heap_create(device, 0, 8, 1, &gpu));
+    REJECT(vkdu_buffer_cbv(cpu, 8, constants, 0, 256));
+    REJECT(vkdu_buffer_cbv(cpu, 1, constants, 1, 256));
+    REJECT(vkdu_buffer_cbv(cpu, 1, constants, 0, 255));
+    REJECT(vkdu_buffer_cbv(cpu, 1, constants, 0, 0));
+    REJECT(vkdu_buffer_cbv(cpu, 1, constants, 0, 65792));
+    REJECT(vkdu_buffer_cbv(cpu, 1, constants, 131072, 256));
+    REJECT(vkdu_buffer_cbv(cpu, 1, constants, UINT64_MAX - 255, 256));
+    REJECT(vkdu_buffer_cbv(cpu, 1, foreign, 0, 256));
+    REJECT(vkdu_buffer_cbv(cpu, 1, NULL, 256, 256));
+    CHECK(vkdu_buffer_cbv(cpu, 1, constants, 256, 65536));
+    CHECK(vkdu_queue_create(device, 0, &queue));
+    CHECK(vkdu_allocator_create(device, 0, &allocator));
+    CHECK(vkdu_command_create(device, allocator, 0, &command));
+    CHECK(vkdu_fence_create(device, 0, &fence));
+    CHECK(vkdu_root_create(device, params, 2, 0, &root));
+    CHECK(vkdu_pipeline_create(device, root, update_root_descriptors_code_dxbc, sizeof(update_root_descriptors_code_dxbc), &pipeline));
+    params[0].type = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[0].ranges = &range; params[0].range_count = 1;
+    CHECK(vkdu_root_create(device, params, 2, 0, &table));
+    CHECK(vkdu_pipeline_create(device, table, update_root_descriptors_code_dxbc, sizeof(update_root_descriptors_code_dxbc), &table_pipeline));
+    for (round = 0; round < 4; ++round) {
+        uint32_t expected_index = round == 0 ? 37 : round == 2 ? 0 : 941;
+        uint32_t expected_value = round == 0 ? 0x13579bdf : round == 2 ? 0 : 0x2468ace0;
+        int use_table = round == 1 || round == 2;
+        fprintf(stderr, "CBV round %u: %s\n", round, use_table ? (round == 2 ? "null table" : "copied table") : "root buffer");
+        if (round) {
+            CHECK(vkdu_allocator_reset(allocator));
+            CHECK(vkdu_command_reset(command, allocator));
+            CHECK(vkdu_command_transition(command, buffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST));
+        }
+        /* Reset the entire output so previous writes cannot satisfy a later
+         * readback, and check all untouched words as well as the shader write. */
+        CHECK(vkdu_command_copy(command, buffer, 0, upload, 0, 4096));
+        CHECK(vkdu_command_transition(command, buffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+        REJECT(vkdu_command_cbv(command, 0, constants, 256)); /* No root bound after reset. */
+        CHECK(vkdu_command_root(command, use_table ? table : root));
+        CHECK(vkdu_command_pipeline(command, use_table ? table_pipeline : pipeline));
+        CHECK(vkdu_command_uav(command, 1, buffer, 0));
+        REJECT(vkdu_command_cbv(command, 1, constants, 256));
+        if (use_table) {
+            CHECK(vkdu_buffer_cbv(cpu, 1, round == 1 ? constants : NULL, round == 1 ? 512 : 0, 256));
+            CHECK(vkdu_descriptor_copy(gpu, 6, cpu, 1, 1));
+            CHECK(vkdu_command_heaps(command, 1, &gpu));
+            CHECK(vkdu_command_table(command, 0, gpu, 5));
+        } else {
+            REJECT(vkdu_command_cbv(command, 0, constants, 1));
+            REJECT(vkdu_command_cbv(command, 0, constants, 131072));
+            REJECT(vkdu_command_cbv(command, 0, foreign, 0));
+            CHECK(vkdu_command_cbv(command, 0, constants, round == 0 ? 256 : 512));
+            /* Rejected zero-address bindings must not replace the valid CBV.
+             * Reading a raw root address zero has no null-descriptor guarantee. */
+            REJECT(vkdu_command_cbv(command, 0, NULL, 0));
+            REJECT(vkdu_command_cbv(command, 0, NULL, 256));
+        }
+        CHECK(vkdu_command_dispatch(command, 1, 1, 1));
+        CHECK(vkdu_command_transition(command, buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE));
+        CHECK(vkdu_command_copy(command, readback, 0, buffer, 0, 4096));
+        CHECK(vkdu_command_close(command));
+        CHECK(vkdu_queue_execute(queue, 1, &command));
+        CHECK(vkdu_queue_signal(queue, fence, round + 1));
+        CHECK(vkdu_fence_wait(fence, round + 1, 30000));
+        CHECK(vkdu_buffer_map(readback, 0, 4096, (void **)&mapped));
+        for (i = 0; i < 1024; ++i) {
+            uint32_t expected = i == expected_index ? expected_value : 0xdeadbeef;
+            if (mapped[i] != expected) {
+                fprintf(stderr, "CBV round %u word %u: %08x expected %08x\n", round, i, mapped[i], expected);
+                exit(1);
+            }
+        }
+        CHECK(vkdu_buffer_unmap(readback, 0, 0));
+    }
+    CHECK(vkdu_device_status(device));
+    vkdu_object_destroy(command); vkdu_object_destroy(allocator); vkdu_object_destroy(queue); vkdu_object_destroy(fence);
+    vkdu_object_destroy(pipeline); vkdu_object_destroy(table_pipeline); vkdu_object_destroy(root); vkdu_object_destroy(table);
+    vkdu_object_destroy(cpu); vkdu_object_destroy(gpu); vkdu_object_destroy(constants); vkdu_object_destroy(foreign);
+    vkdu_object_destroy(upload); vkdu_object_destroy(buffer); vkdu_object_destroy(readback);
+    puts("PASS CBV root/table offsets, copied/null descriptors, invalid root address and alignment/range/device rejection: 4x1024 readbacks");
+}
 
 int main(int argc, char **argv)
 {
@@ -191,6 +295,7 @@ int main(int argc, char **argv)
     for (i = 0; i < 1024; ++i) if (mapped[i] != i) { fprintf(stderr, "descriptor readback[%u]=%u\n", i, mapped[i]); return 1; }
     CHECK(vkdu_buffer_unmap(readback, 0, 0));
     CHECK(vkdu_device_status(device));
+    check_constant_buffers(device, wrong);
     /* Caller follows D3D12 lifetime rules: reset/destroy only after completion. */
     vkdu_object_destroy(command); vkdu_object_destroy(allocator);
     vkdu_object_destroy(table_pipeline); vkdu_object_destroy(table_root);

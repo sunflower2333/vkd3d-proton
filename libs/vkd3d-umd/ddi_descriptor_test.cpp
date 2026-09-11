@@ -18,6 +18,9 @@ static unsigned calls, copies, tables_seen, destroys;
 static int passed_visibility = -1;
 static HRESULT next_result = S_OK, reported = S_OK;
 static uint32_t uav_index, table_index, table_first, root_offset, root_space;
+static uint32_t cbv_index, cbv_bytes, root_cbv_index;
+static uint64_t cbv_offset;
+static vkdu_object *cbv_buffer;
 static vkdu_object *make_peer(vkdu_device *owner, vkdu_kind kind, uint32_t type = 0, uint32_t count = 8, bool visible = false) {
     next_base += 0x10000;
     return reinterpret_cast<vkdu_object *>(new Peer{kind, owner, type, count, visible, next_base, next_base + 0x10000000});
@@ -47,6 +50,12 @@ static int32_t test_uav(vkdu_object *, uint32_t index, vkdu_object *, uint32_t, 
     ++calls; uav_index = index; return next_result;
 }
 static int32_t test_copy(vkdu_object *, uint32_t, vkdu_object *, uint32_t, uint32_t) { ++copies; return next_result; }
+static int32_t test_cbv(vkdu_object *, uint32_t index, vkdu_object *buffer, uint64_t offset, uint32_t bytes) {
+    ++calls; cbv_index = index; cbv_buffer = buffer; cbv_offset = offset; cbv_bytes = bytes; return next_result;
+}
+static int32_t test_root_cbv(vkdu_object *, uint32_t index, vkdu_object *buffer, uint64_t offset) {
+    ++calls; root_cbv_index = index; cbv_buffer = buffer; cbv_offset = offset; return next_result;
+}
 static int32_t test_heaps(vkdu_object *, uint32_t, vkdu_object *const *) { ++calls; return next_result; }
 static int32_t test_table(vkdu_object *, uint32_t index, vkdu_object *, uint32_t first) {
     ++tables_seen; table_index = index; table_first = first; return next_result;
@@ -67,6 +76,8 @@ static int32_t test_root(vkdu_device *d, const vkdu_root_parameter *p, uint32_t 
 #define vkdu_heap_start test_start
 #define vkdu_heap_resolve test_resolve
 #define vkdu_buffer_uav test_uav
+#define vkdu_buffer_cbv test_cbv
+#define vkdu_command_cbv test_root_cbv
 #define vkdu_descriptor_copy test_copy
 #define vkdu_command_heaps test_heaps
 #define vkdu_command_table test_table
@@ -112,6 +123,34 @@ int main() {
     device.pfnCreateUnorderedAccessView(h, &view, destination);
     REQUIRE(calls == before && reported == E_INVALIDARG);
     --destination.ptr;
+    reported = S_OK;
+    D3D12DDI_CONSTANT_BUFFER_VIEW_DESC cbv{buffer.address + 256, 512, 0};
+    device.pfnCreateConstantBufferView(h, &cbv, destination);
+    REQUIRE(reported == S_OK && cbv_index == 3 && cbv_buffer == b && cbv_offset == 256 && cbv_bytes == 512);
+    cbv.BufferLocation = 0;
+    device.pfnCreateConstantBufferView(h, &cbv, destination);
+    REQUIRE(!cbv_buffer && cbv_offset == 0 && cbv_bytes == 512);
+    before = calls; cbv.BufferLocation = buffer.address + buffer.bytes;
+    device.pfnCreateConstantBufferView(h, &cbv, destination);
+    REQUIRE(calls == before && reported == E_INVALIDARG);
+    device.pfnCreateConstantBufferView(h, nullptr, destination);
+    REQUIRE(calls == before && reported == E_INVALIDARG);
+    cbv.BufferLocation = buffer.address;
+    ++destination.ptr;
+    device.pfnCreateConstantBufferView(h, &cbv, destination);
+    REQUIRE(calls == before && reported == E_INVALIDARG);
+    --destination.ptr;
+    commands.pfnSetComputeRootConstantBufferView({&command}, 7, buffer.address + 512);
+    REQUIRE(root_cbv_index == 7 && cbv_buffer == b && cbv_offset == 512);
+    before = calls;
+    commands.pfnSetComputeRootConstantBufferView({&command}, 7, 0);
+    REQUIRE(calls == before && reported == E_INVALIDARG);
+    commands.pfnSetComputeRootConstantBufferView({&command}, 7, buffer.address + buffer.bytes);
+    REQUIRE(calls == before && reported == E_INVALIDARG);
+    next_result = DXGI_ERROR_DEVICE_REMOVED;
+    device.pfnCreateConstantBufferView(h, &cbv, destination);
+    REQUIRE(reported == DXGI_ERROR_DEVICE_REMOVED);
+    next_result = S_OK;
     D3D12DDI_CPU_DESCRIPTOR_HANDLE target{static_cast<SIZE_T>(test_start(gpu.backend, 0) + 4 * 32)};
     device.pfnCopyDescriptorsSimple(h, 1, target, destination, D3D12DDI_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     REQUIRE(copies == 1);
@@ -137,6 +176,6 @@ int main() {
     device.pfnDestroyDescriptorHeap(h, hc); device.pfnDestroyDescriptorHeap(h, hg);
     REQUIRE(!ctx.descriptor_heaps && !ctx.resources && ctx.references == 1 && destroys == 5);
     REQUIRE(!cpu.magic && !gpu.magic && !root.magic);
-    std::puts("PASS actual WDK descriptor DDIs: flag mapping, handles, UAV/copy/table/root translation, failed create, device loss and balanced ownership; backend peers only");
+    std::puts("PASS actual WDK descriptor DDIs: flags, handles, UAV/CBV/copy/table/root translation, null CBV, failed create, device loss and balanced ownership; backend peers only");
     return 0;
 }

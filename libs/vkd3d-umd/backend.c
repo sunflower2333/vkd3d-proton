@@ -228,6 +228,25 @@ int32_t vkdu_buffer_uav(vkdu_object *heap, uint32_t index, vkdu_object *buffer,
             counter ? OBJ(ID3D12Resource, counter) : NULL, &desc, destination);
     return ID3D12Device_GetDeviceRemovedReason(heap->owner);
 }
+int32_t vkdu_buffer_cbv(vkdu_object *heap, uint32_t index, vkdu_object *buffer, uint64_t offset, uint32_t bytes)
+{
+    D3D12_CONSTANT_BUFFER_VIEW_DESC desc = {0};
+    D3D12_CPU_DESCRIPTOR_HANDLE destination;
+    if (!VALID(heap, VKDU_DESCRIPTOR_HEAP) || heap->heap_type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV ||
+        index >= heap->descriptor_count || (offset & 255) || (bytes & 255) || bytes > 65536) return E_INVALIDARG;
+    if (buffer) {
+        if (!VALID(buffer, VKDU_BUFFER) || !vkdu_same_device(heap, buffer) || !bytes ||
+            offset > buffer->bytes || bytes > buffer->bytes - offset) return E_INVALIDARG;
+        desc.BufferLocation = vkdu_buffer_address(buffer) + offset;
+        if (!desc.BufferLocation || (desc.BufferLocation & 255)) return E_INVALIDARG;
+    } else if (offset) return E_INVALIDARG;
+    /* A zero BufferLocation creates a real null descriptor. Never resolve it
+     * to an arbitrary allocation or pass an absent description to vkd3d. */
+    desc.SizeInBytes = bytes;
+    destination.ptr = (SIZE_T)(vkdu_heap_start(heap, 0) + (uint64_t)index * heap->descriptor_stride);
+    ID3D12Device_CreateConstantBufferView(heap->owner, &desc, destination);
+    return ID3D12Device_GetDeviceRemovedReason(heap->owner);
+}
 int32_t vkdu_descriptor_copy(vkdu_object *dst, uint32_t dst_index, vkdu_object *src, uint32_t src_index, uint32_t count)
 {
     D3D12_CPU_DESCRIPTOR_HANDLE destination, source;
@@ -452,6 +471,19 @@ int32_t vkdu_command_uav(vkdu_object *command, uint32_t index, vkdu_object *buff
     if (!RECORDING(command) || index >= command->slot_count || command->slots[index].type != D3D12_ROOT_PARAMETER_TYPE_UAV ||
         !VALID(buffer, VKDU_BUFFER) || !vkdu_same_device(command, buffer) || offset >= buffer->bytes || (offset & 3)) return E_INVALIDARG;
     ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(OBJ(ID3D12GraphicsCommandList, command), index, vkdu_buffer_address(buffer) + offset); return S_OK;
+}
+int32_t vkdu_command_cbv(vkdu_object *command, uint32_t index, vkdu_object *buffer, uint64_t offset)
+{
+    uint64_t address;
+    if (!RECORDING(command) || index >= command->slot_count ||
+        command->slots[index].type != D3D12_ROOT_PARAMETER_TYPE_CBV || (offset & 255) ||
+        !VALID(buffer, VKDU_BUFFER) || !vkdu_same_device(command, buffer) || offset >= buffer->bytes) return E_INVALIDARG;
+    /* Root descriptors are raw GPU addresses, with no descriptor bounds or
+     * null-read guarantee. Only forward addresses in a live owned buffer. */
+    address = vkdu_buffer_address(buffer) + offset;
+    if (!address || (address & 255)) return E_INVALIDARG;
+    ID3D12GraphicsCommandList_SetComputeRootConstantBufferView(OBJ(ID3D12GraphicsCommandList, command), index, address);
+    return S_OK;
 }
 int32_t vkdu_command_dispatch(vkdu_object *command, uint32_t x, uint32_t y, uint32_t z)
 {

@@ -18,7 +18,7 @@ creation and destruction, command close/reset/copy/transition/dispatch/execute,
 root signatures, compute shaders and pipelines. Private objects preserve their
 device context; errors from void DDIs reach the supplied error callback. Buffer
 copy placements use `BaseAddress.UMD.hResource` and `Offset`, with overflow-safe
-range checks. Root UAV addresses resolve against the bridge's owned buffer
+range checks. Root UAV and CBV addresses resolve against the bridge's owned buffer
 registry; this does not implement runtime GPUVA allocation. Unsupported table fields remain null; these partial tables must
 not yet be advertised to the Windows runtime.
 
@@ -31,8 +31,16 @@ the device; shader table handles must resolve into the currently bound heap.
 Root-table ranges preserve register spaces, explicit offsets and APPEND, with
 overflow-safe heap bounds. Command reset clears table and heap binding state.
 Buffer UAVs support raw, structured (including counters) and R32 typed views;
-other typed formats, textures, SRVs/CBVs/samplers and ranged descriptor copies
+other typed formats, textures, SRVs/samplers and ranged descriptor copies
 still require their native view/copy adapters.
+
+Constant buffers support native CreateConstantBufferView and compute root
+CBV callbacks, including 256-byte alignment, a 64-KiB descriptor-size bound,
+buffer ranges and same-device ownership. Heap CBVs with a zero BufferLocation
+create real null descriptors. Root CBVs instead require a live owned buffer
+address: root descriptors have no descriptor bounds/null-read guarantee.
+Unknown or zero root addresses reach the error callback before backend state
+changes. See the Microsoft [root descriptor contract](https://microsoft.github.io/DirectX-Specs/d3d/ResourceBinding.html#root-descriptors).
 
 Still required for a native system driver: OpenAdapter12 and version/caps
 negotiation; full device/core and graphics DDIs; runtime allocation, heap,
@@ -61,14 +69,26 @@ both the original root UAV and new descriptor-table readbacks (2048 words total)
 Windows three-architecture compile/ABI CI34593634076 passed at7e50d05;
 the complete paired parent CI34594763298 also passed at9e42361.
 
+The CBV continuation adds four independently reset 1024-word readbacks:
+root CBV at a nonzero buffer offset, copied table CBV at different buffer
+and heap offsets, a null table CBV, then valid root rebinding after reset.
+Rejected zero root bindings must preserve the preceding valid binding.
+Local CPU Vulkan passes all six workloads (6144 words). The original test
+incorrectly dispatched root address zero and faulted reading address4 in the
+CPU shader; the core placed the caller in round3/fence4 after the first three
+CBV readbacks succeeded. The updated test uses a valid allocation for that
+round and checks zero-root rejection. Three-architecture CBV CI is pending.
+
 `vkd3d-umd-gpu-probe --adapter LUID_LOW_HEX LUID_HIGH_HEX VENDOR_HEX DEVICE_HEX`
-executes the same two compute/readback workloads through the production backend.
+executes the same compute/readback workloads through the production backend.
 Its build excludes the CPU test-device entrypoint. Supply the actual OS adapter
 LUID and matching Vulkan IDs; device selection independently requires all of
 them and Mesa Turnip's driver ID. Missing/malformed identity fails before Vulkan
 loading. This test diagnoses real hardware backend integration without changing
 system registration. It is not a Windows runtime DDI/Present acceptance test;
-target execution remains pending.
+The earlier09146e1 two-workload checkpoint passed on the real ARM64 VIOGPU
+in1005ms with process-local Mesa56bd30c and the exact matched OS/Vulkan identity.
+Target execution of the new CBV extension remains pending.
 
 Driver-parent packaging must build from `external/vkd3d-proton`, retain Mesa4ace
 and KMD7648b72f or explicit validated successors, copy this candidate before PE
