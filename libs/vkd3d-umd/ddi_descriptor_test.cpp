@@ -191,7 +191,7 @@ int main() {
     device.pfnCreateUnorderedAccessView(h, nullptr, destination);
     REQUIRE(calls == before && reported == E_INVALIDARG);
     view.Format = DXGI_FORMAT_UNKNOWN; view.Buffer.StructureByteStride = 4;
-    view.Buffer.Flags = D3D12DDI_BUFFER_UAV_FLAG_NONE;
+    view.Buffer.Flags = static_cast<decltype(view.Buffer.Flags)>(0);
     view.Buffer.hDrvCounterResource = {&buffer}; view.Buffer.CounterOffsetInBytes = 0;
     reported = S_OK;
     device.pfnCreateUnorderedAccessView(h, &view, destination);
