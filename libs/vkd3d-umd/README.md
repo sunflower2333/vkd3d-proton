@@ -22,9 +22,21 @@ range checks. Root UAV addresses resolve against the bridge's owned buffer
 registry; this does not implement runtime GPUVA allocation. Unsupported table fields remain null; these partial tables must
 not yet be advertised to the Windows runtime.
 
+The descriptor continuation adds real descriptor heap creation/destruction,
+native CPU/GPU handle and stride queries, buffer UAV creation, simple descriptor
+copy, descriptor heap binding and compute root descriptor tables. WDK shader
+visibility flags are explicitly converted to the embedded API's different
+bit value. CPU descriptor handles are resolved against live heaps belonging to
+the device; shader table handles must resolve into the currently bound heap.
+Root-table ranges preserve register spaces, explicit offsets and APPEND, with
+overflow-safe heap bounds. Command reset clears table and heap binding state.
+Buffer UAVs support raw, structured (including counters) and R32 typed views;
+other typed formats, textures, SRVs/CBVs/samplers and ranged descriptor copies
+still require their native view/copy adapters.
+
 Still required for a native system driver: OpenAdapter12 and version/caps
 negotiation; full device/core and graphics DDIs; runtime allocation, heap,
-residency and GPUVA mapping; descriptor tables;
+residency and GPUVA mapping; remaining descriptor views and ranged copies;
 monitored fences referring to the runtime's actual GPU backing; shared surfaces,
 presentation, device-removal/TDR recovery and WDDM KMD integration. The backend
 fences used by the test are not the runtime's monitored-fence contract.
@@ -39,6 +51,14 @@ semantics, not VIOGPU acceleration, Windows-runtime loading or Display+Render.
 Windows x86/x64 ABI tests load the actual DLL, check guarded WDK table sizes,
 stdcall callbacks, exact exports and invalid-handle errors without GPU activity.
 ARM64 initially receives compile/link/PE validation until a separate runtime test.
+
+The descriptor backend test executes a second independent compute dispatch,
+reinitializing the output before dispatch and checking all 1024 words. It uses
+nonzero descriptor-table and range offsets, staging-to-visible descriptor copy,
+and rejects wrong-device heaps, invisible heaps, misaligned/out-of-range handles,
+invalid root indices and stale post-reset bindings. Local CPU Vulkan passes
+both the original root UAV and new descriptor-table readbacks (2048 words total).
+Windows three-architecture compile/ABI CI for this continuation is pending.
 
 Driver-parent packaging must build from `external/vkd3d-proton`, retain Mesa4ace
 and KMD7648b72f or explicit validated successors, copy this candidate before PE

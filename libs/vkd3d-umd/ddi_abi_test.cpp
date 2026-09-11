@@ -27,6 +27,10 @@ int main(int argc, char **argv) {
     REQUIRE(tables(nullptr, &commands.value, &queue.value) == E_INVALIDARG);
     REQUIRE(device.value.pfnCreateCommandQueue && device.value.pfnCreateComputeShader && device.value.pfnCreatePipelineState);
     REQUIRE(commands.value.pfnCopyBufferRegion && commands.value.pfnDispatch && queue.value.pfnExecuteCommandLists);
+    REQUIRE(device.value.pfnCreateDescriptorHeap && device.value.pfnDestroyDescriptorHeap && device.value.pfnGetDescriptorSizeInBytes);
+    REQUIRE(device.value.pfnGetCPUDescriptorHandleForHeapStart && device.value.pfnGetGPUDescriptorHandleForHeapStart);
+    REQUIRE(device.value.pfnCreateUnorderedAccessView && device.value.pfnCopyDescriptorsSimple);
+    REQUIRE(commands.value.pfnSetDescriptorHeaps && commands.value.pfnSetComputeRootDescriptorTable);
     REQUIRE(!device.value.pfnCreateHeapAndResource && !device.value.pfnCreateFence && !device.value.pfnMakeResident);
     REQUIRE(!queue.value.pfnSignalFence && !queue.value.pfnWaitForFence);
     D3D12DDI_HDEVICE h{};
@@ -35,6 +39,17 @@ int main(int argc, char **argv) {
     REQUIRE(device.value.pfnCreateCommandQueue(h, &q) == E_INVALIDARG);
     REQUIRE(device.value.pfnCreateCommandAllocator(h, nullptr) == E_INVALIDARG);
     REQUIRE(device.value.pfnCreateCommandList(h, nullptr) == E_INVALIDARG);
+    D3D12DDIARG_CREATE_DESCRIPTOR_HEAP_0001 heap_args{};
+    D3D12DDI_HDESCRIPTORHEAP heap{};
+    REQUIRE(device.value.pfnCalcPrivateDescriptorHeapSize(h, &heap_args) == size());
+    REQUIRE(device.value.pfnCreateDescriptorHeap(h, &heap_args, heap) == E_INVALIDARG);
+    REQUIRE(device.value.pfnGetDescriptorSizeInBytes(h, D3D12DDI_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) == 0);
+    REQUIRE(device.value.pfnGetCPUDescriptorHandleForHeapStart(h, heap).ptr == 0);
+    REQUIRE(device.value.pfnGetGPUDescriptorHandleForHeapStart(h, heap).ptr == 0);
+    device.value.pfnCopyDescriptorsSimple(h, 1, {}, {}, D3D12DDI_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    device.value.pfnCreateUnorderedAccessView(h, nullptr, {});
+    commands.value.pfnSetDescriptorHeaps({}, 0, nullptr);
+    commands.value.pfnSetComputeRootDescriptorTable({}, 0, {});
     REQUIRE(create(nullptr, nullptr, report, nullptr, &h) == E_INVALIDARG);
     REQUIRE(!h.pDrvPrivate);
     FreeLibrary(module);

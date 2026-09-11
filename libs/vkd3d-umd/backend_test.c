@@ -19,6 +19,7 @@ int main(void)
     vkdu_device *device = NULL, *wrong = NULL;
     vkdu_object *upload = NULL, *buffer = NULL, *readback = NULL;
     vkdu_object *queue = NULL, *allocator = NULL, *command = NULL, *root = NULL, *pipeline = NULL, *fence = NULL;
+    vkdu_object *cpu_heap = NULL, *gpu_heap = NULL, *table_root = NULL, *table_pipeline = NULL, *foreign_heap = NULL;
     struct vkdu_adapter absent = {{0}, 0xffffffff, 0xffffffff};
     struct vkdu_root_parameter parameter = {4, 0, 0, 0, 0};
     uint32_t *mapped, i;
@@ -81,9 +82,61 @@ int main(void)
     CHECK(vkdu_queue_signal(queue, fence, 2));
     CHECK(vkdu_queue_wait(queue, fence, 2));
     CHECK(vkdu_fence_wait(fence, 2, 30000));
+    /* Exercise an actual descriptor table with nonzero table and range offsets,
+     * and a staging-to-shader-visible copy. Reinitialize data so the earlier
+     * root-UAV dispatch cannot make this independent second readback pass. */
+    CHECK(vkdu_heap_create(device, 0, 8, 0, &cpu_heap));
+    CHECK(vkdu_heap_create(device, 0, 8, 1, &gpu_heap));
+    CHECK(vkdu_test_device_create(loader, &wrong));
+    CHECK(vkdu_heap_create(wrong, 0, 8, 0, &foreign_heap));
+    {
+        struct vkdu_descriptor_range range = {1, 1, 0, 0, 1};
+        struct vkdu_root_parameter table = {0, 0, 0, 0, 0, &range, 1};
+        uint32_t resolved = UINT32_MAX, stride = vkdu_descriptor_size(device, 0);
+        if (!stride || !vkdu_heap_resolve(gpu_heap, vkdu_heap_start(gpu_heap, 1) + 4 * stride, 1, &resolved) || resolved != 4) return 1;
+        if (vkdu_heap_resolve(gpu_heap, vkdu_heap_start(gpu_heap, 1) + 8 * stride, 1, &resolved) ||
+            vkdu_heap_resolve(gpu_heap, vkdu_heap_start(gpu_heap, 1) + 1, 1, &resolved) || vkdu_heap_start(cpu_heap, 1)) return 1;
+        REJECT(vkdu_descriptor_copy(gpu_heap, 4, foreign_heap, 2, 1));
+        REJECT(vkdu_descriptor_copy(cpu_heap, 4, gpu_heap, 2, 1));
+        REJECT(vkdu_descriptor_copy(gpu_heap, 8, cpu_heap, 2, 1));
+        REJECT(vkdu_buffer_uav(cpu_heap, 2, buffer, DXGI_FORMAT_R32_TYPELESS, UINT64_MAX, 1, 0, 1, NULL, 0));
+        REJECT(vkdu_buffer_uav(cpu_heap, 2, buffer, DXGI_FORMAT_R32_TYPELESS, 0, 1025, 0, 1, NULL, 0));
+        CHECK(vkdu_buffer_uav(cpu_heap, 2, buffer, DXGI_FORMAT_R32_TYPELESS, 0, 1024, 0, 1, NULL, 0));
+        CHECK(vkdu_descriptor_copy(gpu_heap, 4, cpu_heap, 2, 1));
+        CHECK(vkdu_root_create(device, &table, 1, 0, &table_root));
+        CHECK(vkdu_pipeline_create_tokens(device, table_root, execute_indirect_cs_code_dxbc + 21,
+                execute_indirect_cs_code_dxbc[22], &table_pipeline));
+    }
+    CHECK(vkdu_allocator_reset(allocator));
+    CHECK(vkdu_command_reset(command, allocator));
+    REJECT(vkdu_command_table(command, 0, gpu_heap, 3)); /* Reset erased binding state. */
+    CHECK(vkdu_command_transition(command, buffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST));
+    CHECK(vkdu_command_copy(command, buffer, 0, upload, 0, 4096));
+    CHECK(vkdu_command_transition(command, buffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+    CHECK(vkdu_command_root(command, table_root));
+    CHECK(vkdu_command_pipeline(command, table_pipeline));
+    REJECT(vkdu_command_table(command, 0, gpu_heap, 3)); /* Heap must actually be bound. */
+    REJECT(vkdu_command_heaps(command, 1, &cpu_heap));
+    CHECK(vkdu_command_heaps(command, 1, &gpu_heap));
+    REJECT(vkdu_command_table(command, 1, gpu_heap, 3));
+    REJECT(vkdu_command_table(command, 0, gpu_heap, 7)); /* Range extends outside heap. */
+    CHECK(vkdu_command_table(command, 0, gpu_heap, 3));
+    CHECK(vkdu_command_dispatch(command, 1024, 1, 1));
+    CHECK(vkdu_command_transition(command, buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE));
+    CHECK(vkdu_command_copy(command, readback, 0, buffer, 0, 4096));
+    CHECK(vkdu_command_close(command));
+    CHECK(vkdu_queue_execute(queue, 1, &command));
+    CHECK(vkdu_queue_signal(queue, fence, 3));
+    CHECK(vkdu_fence_wait(fence, 3, 30000));
+    CHECK(vkdu_buffer_map(readback, 0, 4096, (void **)&mapped));
+    for (i = 0; i < 1024; ++i) if (mapped[i] != i) { fprintf(stderr, "descriptor readback[%u]=%u\n", i, mapped[i]); return 1; }
+    CHECK(vkdu_buffer_unmap(readback, 0, 0));
     CHECK(vkdu_device_status(device));
     /* Caller follows D3D12 lifetime rules: reset/destroy only after completion. */
     vkdu_object_destroy(command); vkdu_object_destroy(allocator);
+    vkdu_object_destroy(table_pipeline); vkdu_object_destroy(table_root);
+    vkdu_object_destroy(gpu_heap); vkdu_object_destroy(cpu_heap);
+    vkdu_object_destroy(foreign_heap); vkdu_device_destroy(wrong);
     vkdu_object_destroy(pipeline); vkdu_object_destroy(root);
     vkdu_object_destroy(readback); vkdu_object_destroy(buffer); vkdu_object_destroy(upload);
     vkdu_object_destroy(fence); vkdu_object_destroy(queue); vkdu_device_destroy(device);
@@ -92,6 +145,6 @@ int main(void)
 #else
     dlclose(module);
 #endif
-    puts("PASS embedded compute shader, 1024 readbacks, copy, barriers, queue signal/wait, allocator reuse and error propagation");
+    puts("PASS root-UAV and descriptor-table compute, 2x1024 readbacks, nonzero offsets, descriptor copies, bounds/device/visibility rejection, reset, queue/fence and errors");
     return 0;
 }

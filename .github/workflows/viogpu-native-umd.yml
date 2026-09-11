@@ -1,7 +1,7 @@
 name: Native VIOGPU D3D12 bridge
 on:
   push:
-    branches: [viogpu-native-d3d12-umd]
+    branches: [viogpu-native-d3d12-umd, viogpu-native-d3d12-descriptors]
   workflow_dispatch:
 permissions:
   contents: read

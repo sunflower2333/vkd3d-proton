@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstring>
 #include <new>
+#include <memory>
 
 namespace {
 constexpr uint32_t context_magic = 0x564b4455, object_magic = 0x564b4f42;
@@ -16,6 +17,7 @@ struct Context {
     std::atomic<HRESULT> last_error{S_OK};
     SRWLOCK resources_lock = SRWLOCK_INIT;
     Object *resources = nullptr;
+    Object *descriptor_heaps = nullptr;
 };
 struct Object {
     uint32_t magic;
@@ -26,6 +28,8 @@ struct Object {
     uint32_t shader_words;
     Object *next;
     uint64_t address, bytes;
+    uint32_t descriptor_flags = 0;
+    uint32_t descriptor_type = UINT32_MAX;
 };
 Context *context(D3D12DDI_HDEVICE handle) {
     auto *value = static_cast<Context *>(handle.pDrvPrivate);
@@ -66,6 +70,10 @@ HRESULT bind(Context *ctx, void *memory, vkdu_object *value, vkdu_kind kind) {
         }
         entry->next = ctx->resources; ctx->resources = entry;
         ReleaseSRWLockExclusive(&ctx->resources_lock);
+    } else if (kind == VKDU_DESCRIPTOR_HEAP) {
+        AcquireSRWLockExclusive(&ctx->resources_lock);
+        entry->next = ctx->descriptor_heaps; ctx->descriptor_heaps = entry;
+        ReleaseSRWLockExclusive(&ctx->resources_lock);
     }
     ++ctx->references;
     return S_OK;
@@ -83,6 +91,93 @@ uint32_t command_type(D3D12DDI_COMMAND_QUEUE_FLAGS flags) {
     return UINT32_MAX;
 }
 bool belongs(Context *ctx, void *memory) { auto *o = object(memory); return o && o->context == ctx; }
+
+SIZE_T APIENTRY heap_size(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATE_DESCRIPTOR_HEAP_0001 *) { return sizeof(Object); }
+HRESULT APIENTRY heap_create(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATE_DESCRIPTOR_HEAP_0001 *args, D3D12DDI_HDESCRIPTORHEAP heap) {
+    auto *ctx = context(h); vkdu_object *value = nullptr;
+    if (!ctx || !args || args->NodeMask > 1 || (static_cast<UINT>(args->Flags) & ~3u)) return E_INVALIDARG;
+    // DDI SHADER_VISIBLE is bit 2; the embedded API uses bit 1. Map explicitly.
+    HRESULT hr = vkdu_heap_create(ctx->backend, args->Type, args->NumDescriptors,
+            (args->Flags & D3D12DDI_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0, &value);
+    hr = finish(ctx, heap.pDrvPrivate, value, VKDU_DESCRIPTOR_HEAP, hr);
+    if (SUCCEEDED(hr)) {
+        object(heap.pDrvPrivate)->descriptor_flags = args->Flags;
+        object(heap.pDrvPrivate)->descriptor_type = args->Type;
+    }
+    return hr;
+}
+void APIENTRY heap_destroy(D3D12DDI_HDEVICE h, D3D12DDI_HDESCRIPTORHEAP heap) {
+    if (belongs(context(h), heap.pDrvPrivate) && backend(heap.pDrvPrivate, VKDU_DESCRIPTOR_HEAP))
+        VioGpuD3D12BridgeUnbindObject(heap.pDrvPrivate);
+    else error(context(h), E_INVALIDARG);
+}
+UINT APIENTRY descriptor_size(D3D12DDI_HDEVICE h, D3D12DDI_DESCRIPTOR_HEAP_TYPE type) {
+    auto *ctx = context(h);
+    return ctx ? vkdu_descriptor_size(ctx->backend, type) : 0;
+}
+D3D12DDI_CPU_DESCRIPTOR_HANDLE APIENTRY heap_cpu(D3D12DDI_HDEVICE h, D3D12DDI_HDESCRIPTORHEAP heap) {
+    if (!belongs(context(h), heap.pDrvPrivate) || !(object(heap.pDrvPrivate)->descriptor_flags & D3D12DDI_DESCRIPTOR_HEAP_FLAG_CPU_VISIBLE)) return {};
+    return {static_cast<SIZE_T>(vkdu_heap_start(backend(heap.pDrvPrivate, VKDU_DESCRIPTOR_HEAP), 0))};
+}
+D3D12DDI_GPU_DESCRIPTOR_HANDLE APIENTRY heap_gpu(D3D12DDI_HDEVICE h, D3D12DDI_HDESCRIPTORHEAP heap) {
+    if (!belongs(context(h), heap.pDrvPrivate)) return {};
+    return {vkdu_heap_start(backend(heap.pDrvPrivate, VKDU_DESCRIPTOR_HEAP), 1)};
+}
+// Caller holds resources_lock until the backend operation is recorded.
+Object *find_heap(Context *ctx, uint64_t address, bool gpu, uint32_t *index) {
+    for (auto *p = ctx->descriptor_heaps; p; p = p->next) {
+        if (!gpu && !(p->descriptor_flags & D3D12DDI_DESCRIPTOR_HEAP_FLAG_CPU_VISIBLE)) continue;
+        if (vkdu_heap_resolve(p->backend, address, gpu, index)) return p;
+    }
+    return nullptr;
+}
+void APIENTRY create_uav(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATE_UNORDERED_ACCESS_VIEW_0002 *args, D3D12DDI_CPU_DESCRIPTOR_HANDLE destination) {
+    auto *ctx = context(h);
+    if (!ctx) return;
+    if (!args || args->ResourceDimension != D3D12DDI_RD_BUFFER) { error(ctx, E_NOTIMPL); return; }
+    uint32_t index = 0; HRESULT hr = E_INVALIDARG;
+    AcquireSRWLockShared(&ctx->resources_lock);
+    auto *heap = find_heap(ctx, destination.ptr, false, &index);
+    auto *resource = backend(args->hDrvResource.pDrvPrivate, VKDU_BUFFER);
+    auto *counter = backend(args->Buffer.hDrvCounterResource.pDrvPrivate, VKDU_BUFFER);
+    if (heap && (!args->Buffer.hDrvCounterResource.pDrvPrivate || counter))
+        hr = vkdu_buffer_uav(heap->backend, index, resource, args->Format, args->Buffer.FirstElement,
+                args->Buffer.NumElements, args->Buffer.StructureByteStride, args->Buffer.Flags,
+                counter, args->Buffer.CounterOffsetInBytes);
+    ReleaseSRWLockShared(&ctx->resources_lock);
+    error(ctx, hr);
+}
+void APIENTRY copy_descriptors_simple(D3D12DDI_HDEVICE h, UINT count, D3D12DDI_CPU_DESCRIPTOR_HANDLE destination,
+        D3D12DDI_CPU_DESCRIPTOR_HANDLE source, D3D12DDI_DESCRIPTOR_HEAP_TYPE type) {
+    auto *ctx = context(h);
+    if (!ctx) return;
+    if (!count) return;
+    uint32_t dst_index = 0, src_index = 0; HRESULT hr = E_INVALIDARG;
+    AcquireSRWLockShared(&ctx->resources_lock);
+    auto *dst = find_heap(ctx, destination.ptr, false, &dst_index);
+    auto *src = find_heap(ctx, source.ptr, false, &src_index);
+    if (dst && src && dst->descriptor_type == static_cast<uint32_t>(type) && src->descriptor_type == static_cast<uint32_t>(type))
+        hr = vkdu_descriptor_copy(dst->backend, dst_index, src->backend, src_index, count);
+    ReleaseSRWLockShared(&ctx->resources_lock);
+    error(ctx, hr);
+}
+void APIENTRY set_heaps(D3D12DDI_HCOMMANDLIST c, UINT count, D3D12DDI_HDESCRIPTORHEAP *heaps) {
+    auto *cmd = object(c.pDrvPrivate); vkdu_object *native[2] = {};
+    if (!cmd) return;
+    if (count > 2 || (count && !heaps)) { error(cmd, E_INVALIDARG); return; }
+    for (UINT i = 0; i < count; ++i) native[i] = backend(heaps[i].pDrvPrivate, VKDU_DESCRIPTOR_HEAP);
+    error(cmd, vkdu_command_heaps(cmd->backend, count, native));
+}
+void APIENTRY set_table(D3D12DDI_HCOMMANDLIST c, UINT index, D3D12DDI_GPU_DESCRIPTOR_HANDLE address) {
+    auto *cmd = object(c.pDrvPrivate);
+    if (!cmd) return;
+    auto *ctx = cmd->context; uint32_t first = 0; HRESULT hr = E_INVALIDARG;
+    AcquireSRWLockShared(&ctx->resources_lock);
+    auto *heap = find_heap(ctx, address.ptr, true, &first);
+    if (heap) hr = vkdu_command_table(cmd->backend, index, heap->backend, first);
+    ReleaseSRWLockShared(&ctx->resources_lock);
+    error(cmd, hr);
+}
 
 SIZE_T APIENTRY queue_size(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATECOMMANDQUEUE_0001 *) { return sizeof(Object); }
 HRESULT APIENTRY queue_create(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATECOMMANDQUEUE_0001 *args) {
@@ -182,14 +277,30 @@ void APIENTRY execute(D3D12DDI_HCOMMANDQUEUE q, UINT count, const D3D12DDI_HCOMM
 SIZE_T APIENTRY root_size(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATE_ROOT_SIGNATURE_0001 *) { return sizeof(Object); }
 HRESULT APIENTRY root_create(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATE_ROOT_SIGNATURE_0001 *args, D3D12DDI_HROOTSIGNATURE root) {
     auto *ctx = context(h); vkdu_object *value = nullptr; vkdu_root_parameter parameters[64]{};
+    std::unique_ptr<vkdu_descriptor_range[]> ranges; UINT used = 0;
     if (!ctx || !args || !args->pRootSignature || args->NodeMask > 1) return E_INVALIDARG;
     const auto &desc = *args->pRootSignature;
     if (desc.NumStaticSamplers || desc.NumParameters > 64 || (desc.NumParameters && !desc.pRootParameters)) return E_NOTIMPL;
     for (UINT i = 0; i < desc.NumParameters; ++i) {
+        if (desc.pRootParameters[i].ParameterType == D3D12DDI_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
+            ranges.reset(new (std::nothrow) vkdu_descriptor_range[4096]);
+            if (!ranges) return E_OUTOFMEMORY;
+            break;
+        }
+    }
+    for (UINT i = 0; i < desc.NumParameters; ++i) {
         const auto &p = desc.pRootParameters[i];
-        if (p.ParameterType == D3D12DDI_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) return E_NOTIMPL;
         parameters[i].type = p.ParameterType; parameters[i].visibility = p.ShaderVisibility;
-        if (p.ParameterType == D3D12DDI_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS) {
+        if (p.ParameterType == D3D12DDI_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
+            if (!p.DescriptorTable.pDescriptorRanges || !p.DescriptorTable.NumDescriptorRanges ||
+                p.DescriptorTable.NumDescriptorRanges > 4096 - used) return E_INVALIDARG;
+            parameters[i].ranges = ranges.get() + used; parameters[i].range_count = p.DescriptorTable.NumDescriptorRanges;
+            for (UINT j = 0; j < p.DescriptorTable.NumDescriptorRanges; ++j) {
+                const auto &r = p.DescriptorTable.pDescriptorRanges[j];
+                ranges[used++] = {static_cast<uint32_t>(r.RangeType), r.NumDescriptors, r.BaseShaderRegister,
+                    r.RegisterSpace, r.OffsetInDescriptorsFromTableStart};
+            }
+        } else if (p.ParameterType == D3D12DDI_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS) {
             parameters[i].shader_register = p.Constants.ShaderRegister; parameters[i].register_space = p.Constants.RegisterSpace;
             parameters[i].constant_count = p.Constants.Num32BitValues;
         } else {
@@ -262,9 +373,9 @@ extern "C" void APIENTRY VioGpuD3D12BridgeUnbindObject(void *memory) {
     auto *value = object(memory);
     if (!value) return;
     auto *ctx = value->context;
-    if (value->kind == VKDU_BUFFER) {
+    if (value->kind == VKDU_BUFFER || value->kind == VKDU_DESCRIPTOR_HEAP) {
         AcquireSRWLockExclusive(&ctx->resources_lock);
-        Object **p = &ctx->resources;
+        Object **p = value->kind == VKDU_BUFFER ? &ctx->resources : &ctx->descriptor_heaps;
         while (*p && *p != value) p = &(*p)->next;
         if (*p) *p = value->next;
         ReleaseSRWLockExclusive(&ctx->resources_lock);
@@ -284,10 +395,15 @@ extern "C" HRESULT APIENTRY VioGpuD3D12BridgeGetTables(D3D12DDI_DEVICE_FUNCS_COR
     device->pfnCalcPrivateRootSignatureSize = root_size; device->pfnCreateRootSignature = root_create; device->pfnDestroyRootSignature = root_destroy;
     device->pfnCalcPrivateShaderSize = shader_size; device->pfnCreateComputeShader = shader_create; device->pfnDestroyShader = shader_destroy;
     device->pfnCalcPrivatePipelineStateSize = pipeline_size; device->pfnCreatePipelineState = pipeline_create; device->pfnDestroyPipelineState = pipeline_destroy;
+    device->pfnCalcPrivateDescriptorHeapSize = heap_size; device->pfnCreateDescriptorHeap = heap_create; device->pfnDestroyDescriptorHeap = heap_destroy;
+    device->pfnGetDescriptorSizeInBytes = descriptor_size; device->pfnGetCPUDescriptorHandleForHeapStart = heap_cpu;
+    device->pfnGetGPUDescriptorHandleForHeapStart = heap_gpu; device->pfnCreateUnorderedAccessView = create_uav;
+    device->pfnCopyDescriptorsSimple = copy_descriptors_simple;
     commands->pfnCloseCommandList = command_close; commands->pfnResetCommandList = command_reset;
     commands->pfnCopyBufferRegion = copy; commands->pfnResourceBarrier = barriers; commands->pfnDispatch = dispatch;
     commands->pfnSetComputeRootSignature = root_set; commands->pfnSetPipelineState = pipeline_set;
     commands->pfnSetComputeRootUnorderedAccessView = root_uav;
+    commands->pfnSetDescriptorHeaps = set_heaps; commands->pfnSetComputeRootDescriptorTable = set_table;
     queue->pfnExecuteCommandLists = execute;
     // Native monitored-fence, allocation/residency, runtime GPUVA, graphics and
     // presentation contracts remain absent; do not advertise these tables.
