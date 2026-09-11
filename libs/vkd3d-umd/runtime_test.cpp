@@ -80,7 +80,7 @@ static unsigned heap_context_creates, heap_context_destroys, allocations, deallo
 static unsigned fail_deallocate, fail_unlock;
 static unsigned fail_context_destroy;
 static bool fail_context_create, invalid_context_info, retire_lock;
-static bool fail_allocate, partial_allocate, null_map, reset_allocate, retire_allocate, rename_lock;
+static bool fail_allocate, partial_allocate, partial_resource, null_map, reset_allocate, retire_allocate, rename_lock;
 static bool heap_callbacks_retired;
 static std::array<unsigned char, 65536> mapped_heap{};
 static const HANDLE expected_device = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(0x456a0));
@@ -140,6 +140,10 @@ static HRESULT APIENTRY heap_allocate(HANDLE runtime, D3DDDICB_ALLOCATE *args) {
             args->hKMResource = 73;
         }
     }
+    if (fail_allocate && partial_resource && args->hResource) {
+        if (!kernel_resources.insert(args->hResource).second) std::abort();
+        args->hKMResource = 73;
+    }
     if (reset_allocate) ++generation;
     if (retire_allocate) {
         native_destroy_device(error_device);
@@ -171,7 +175,7 @@ static HRESULT APIENTRY heap_lock(HANDLE runtime, D3DDDICB_LOCK *args) {
     valid_kernel_callback(runtime);
     auto found = kernel_heaps.find(args->hAllocation);
     if (found == kernel_heaps.end() || found->second.locked || !args->Flags.LockEntire ||
-            args->Flags.Discard || args->Flags.NoOverwrite || args->Flags.ReadOnly || args->NumPages || args->pPages)
+            args->Flags.Discard || args->Flags.NoExistingReference || args->Flags.ReadOnly || args->NumPages || args->pPages)
         std::abort();
     found->second.locked = true;
     if (rename_lock) {
@@ -241,6 +245,7 @@ static int test_native_heaps() {
     REQUIRE(kernel_heaps.begin()->second.address == 0x10010000 && kernel_heaps.begin()->second.resource == runtime_resource.handle);
     for (size_t i = sizeof(NativeHeapSlot); i < a.size(); ++i) REQUIRE(a[i] == 0xa5);
     REQUIRE(allocate(ha) == E_INVALIDARG && allocations == 1);
+    REQUIRE(table.pfnCreateHeapAndResource(create.hDrvDevice, &desc, hb, runtime_resource, nullptr, nullptr, {}) == E_INVALIDARG);
     REQUIRE(allocate(hb) == S_OK && allocations == 2 && heap_context_creates == 1);
     REQUIRE(kernel_heaps.rbegin()->second.address == 0x10020000);
     // The arena starts at a non-64K boundary, has no room for this large heap,
@@ -268,6 +273,9 @@ static int test_native_heaps() {
     rename_lock = false;
     destroy(ha); destroy(hb);
     REQUIRE(kernel_heaps.empty() && kernel_resources.empty() && !ctx->native_heaps);
+    fail_allocate = partial_resource = true;
+    REQUIRE(allocate(ha) == E_OUTOFMEMORY && kernel_heaps.empty() && kernel_resources.empty() && !ctx->native_heaps);
+    fail_allocate = partial_resource = false;
     // Failed allocation must not publish a runtime slot; even a failed cleanup
     // keeps its GPUVA quarantined until device retirement retries deallocation.
     a.fill(0xa5);
