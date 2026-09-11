@@ -17,7 +17,8 @@ int main(int argc, char **argv) {
     auto create = reinterpret_cast<decltype(&VioGpuD3D12BridgeCreate)>(GetProcAddress(module, "VioGpuD3D12BridgeCreate"));
     REQUIRE(tables && size && create);
     REQUIRE(!GetProcAddress(module, "D3D12CreateDevice"));
-    REQUIRE(!GetProcAddress(module, "OpenAdapter12"));
+    auto open = reinterpret_cast<PFND3D12DDI_OPENADAPTER>(GetProcAddress(module, "OpenAdapter12"));
+    REQUIRE(open && open(nullptr) == E_INVALIDARG);
     REQUIRE(!GetProcAddress(module, "vkdu_test_device_create"));
     Guarded<D3D12DDI_DEVICE_FUNCS_CORE_0003> device;
     Guarded<D3D12DDI_COMMAND_LIST_FUNCS_3D_0003> commands;

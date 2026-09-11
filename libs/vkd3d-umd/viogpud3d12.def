@@ -1,5 +1,6 @@
 LIBRARY viogpud3d12
 EXPORTS
+    OpenAdapter12
     VioGpuD3D12BridgeCreate
     VioGpuD3D12BridgeDestroy
     VioGpuD3D12BridgeStatus

@@ -22,6 +22,9 @@ struct vkdu_root_parameter {
 };
 
 int32_t vkdu_device_create(PFN_vkGetInstanceProcAddr loader, const struct vkdu_adapter *adapter, vkdu_device **out);
+/* Native runtime adapter identity is the KMD-provided LUID. Vulkan vendor and
+ * device IDs name the host GPU, not PCI 1AF4:1050; never invent their mapping. */
+int32_t vkdu_device_create_runtime(PFN_vkGetInstanceProcAddr loader, const uint8_t luid[8], vkdu_device **out);
 /* Test-only entrypoint is absent from the production bridge. CPU Vulkan only. */
 #ifdef VKDU_ENABLE_TEST_DEVICE
 int32_t vkdu_test_device_create(PFN_vkGetInstanceProcAddr loader, vkdu_device **out);

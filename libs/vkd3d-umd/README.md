@@ -1,8 +1,10 @@
 # Embedded native D3D12 DDI bridge
 
 This target statically embeds vkd3d-proton in `viogpud3d12.dll`. It does not
-import or replace the application `d3d12.dll`, export D3D12CreateDevice, register
-OpenAdapter12, or claim a complete native Windows driver. The engine revision
+import or replace the application `d3d12.dll` or export D3D12CreateDevice.
+It exports the genuine WDK OpenAdapter12 entrypoint, but advertises no complete
+DDI version or feature level yet and is not registered as the active D3D12 UMD.
+The engine revision
 and every submodule are pinned by the driver parent repository.
 
 Implemented backend operations create a device on the exact supplied Vulkan
@@ -88,8 +90,23 @@ the previous buffer's dimensions. This is exercised by shader GetDimensions
 and readback after first seeding the same source/destination slots with a live
 view, rather than testing only initially zeroed descriptor heaps.
 
-Still required for a native system driver: OpenAdapter12 and version/caps
-negotiation; full device/core and graphics DDIs; runtime allocation, heap,
+The native entry retains the original runtime adapter callback and validates the
+paired KMD's v0 prefix, VLID trailer and reset generation. Native CreateDevice
+uses runtime-owned private memory, separately retains the shared backend Context,
+copies the original device callbacks, and uses the system Vulkan loader for the
+process architecture. Selection requires exactly one Turnip physical device with
+the exact KMD LUID; guest PCI IDs are not assumed to equal host Vulkan IDs.
+Destruction detaches runtime callbacks before releasing the Context and unloads
+Vulkan only after the final backend reference is destroyed. Failure never deletes
+runtime-owned storage or publishes an incompletely initialized private slot.
+
+GetSupportedVersions deliberately returns zero entries, GetCaps refuses unsupported
+contracts, and FillDDITable refuses partial tables. This is real adapter/device
+lifecycle code with a WDK fixture, not successful Microsoft D3D12CreateDevice
+activation. The fixture does not enable an alternate production admission path.
+
+Still required for a native system driver: complete negotiated feature levels;
+full device/core and graphics DDIs; runtime allocation, heap,
 residency and GPUVA mapping; remaining descriptor views;
 monitored fences referring to the runtime's actual GPU backing; shared surfaces,
 presentation, device-removal/TDR recovery and WDDM KMD integration. The backend

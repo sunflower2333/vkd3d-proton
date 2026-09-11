@@ -7,6 +7,11 @@
 
 namespace {
 constexpr uint32_t context_magic = 0x564b4455, object_magic = 0x564b4f42;
+constexpr uint32_t native_device_magic = 0x564b4e44;
+struct NativeAdapter;
+struct Context;
+// Runtime owns this slot; child objects hold references to the separate Context.
+struct NativeDevice { uint32_t magic; Context *context; };
 struct Object;
 struct Context {
     uint32_t magic = context_magic;
@@ -18,6 +23,11 @@ struct Context {
     SRWLOCK resources_lock = SRWLOCK_INIT;
     Object *resources = nullptr;
     Object *descriptor_heaps = nullptr;
+    std::shared_ptr<NativeAdapter> native_adapter;
+    D3D12DDI_HRTDEVICE runtime_device{};
+    D3DDDI_DEVICECALLBACKS kernel_callbacks{};
+    D3D12DDI_CORELAYER_DEVICECALLBACKS_0003 runtime_callbacks{};
+    HMODULE vulkan_module = nullptr;
 };
 struct Object {
     uint32_t magic;
@@ -32,6 +42,12 @@ struct Object {
     uint32_t descriptor_type = UINT32_MAX;
 };
 Context *context(D3D12DDI_HDEVICE handle) {
+    if (handle.pDrvPrivate) {
+        uint32_t magic;
+        std::memcpy(&magic, handle.pDrvPrivate, sizeof(magic));
+        if (magic == native_device_magic)
+            return static_cast<NativeDevice *>(handle.pDrvPrivate)->context;
+    }
     auto *value = static_cast<Context *>(handle.pDrvPrivate);
     return value && value->magic == context_magic ? value : nullptr;
 }
@@ -45,7 +61,10 @@ vkdu_object *backend(void *memory, vkdu_kind kind) {
 }
 void release(Context *value) {
     if (value && --value->references == 0) {
-        value->magic = 0; vkdu_device_destroy(value->backend); delete value;
+        value->magic = 0; vkdu_device_destroy(value->backend);
+        // Backend destruction can call Vulkan; unload only after that finishes.
+        if (value->vulkan_module) FreeLibrary(value->vulkan_module);
+        delete value;
     }
 }
 void error(Context *value, HRESULT result) {
@@ -78,6 +97,7 @@ HRESULT bind(Context *ctx, void *memory, vkdu_object *value, vkdu_kind kind) {
     ++ctx->references;
     return S_OK;
 }
+
 HRESULT finish(Context *ctx, void *memory, vkdu_object *value, vkdu_kind kind, HRESULT result) {
     if (FAILED(result)) return result;
     result = bind(ctx, memory, value, kind);
@@ -534,3 +554,5 @@ extern "C" HRESULT APIENTRY VioGpuD3D12BridgeGetTables(D3D12DDI_DEVICE_FUNCS_COR
     // presentation contracts remain absent; do not advertise these tables.
     return S_OK;
 }
+
+#include "runtime.inc"

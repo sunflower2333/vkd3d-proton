@@ -24,11 +24,13 @@ $crossArgs = @()
 if ($Architecture -eq 'arm64') { $crossArgs = @('--cross-file', 'tools/umd-arm64-msvc.ini') }
 meson setup $buildDir @crossArgs --buildtype release -Ddebug=true -Denable_umd_bridge=true -Denable_umd_bridge_tests=true
 if ($LASTEXITCODE) { exit $LASTEXITCODE }
-meson compile -C $buildDir -j 3 viogpud3d12 vkd3d-umd-ddi-abi-test vkd3d-umd-ddi-descriptor-test vkd3d-umd-gpu-probe
+meson compile -C $buildDir -j 3 viogpud3d12 vkd3d-umd-ddi-abi-test vkd3d-umd-ddi-descriptor-test vkd3d-umd-gpu-probe vkd3d-umd-runtime-test
 if ($LASTEXITCODE) { exit $LASTEXITCODE }
 $dll = Join-Path $buildDir 'libs\vkd3d-umd\viogpud3d12.dll'
 $test = Join-Path $buildDir 'libs\vkd3d-umd\vkd3d-umd-ddi-abi-test.exe'
 if ($Architecture -ne 'arm64') {
+    & (Join-Path $buildDir 'libs\vkd3d-umd\vkd3d-umd-runtime-test.exe')
+    if ($LASTEXITCODE) { exit $LASTEXITCODE }
     & $test (Resolve-Path $dll).Path
     if ($LASTEXITCODE) { exit $LASTEXITCODE }
     & (Join-Path $buildDir 'libs\vkd3d-umd\vkd3d-umd-ddi-descriptor-test.exe')
@@ -41,6 +43,7 @@ New-Item -ItemType Directory -Force $output | Out-Null
 Copy-Item $dll,$test,(Join-Path $buildDir 'libs\vkd3d-umd\viogpud3d12.pdb') $output
 Copy-Item (Join-Path $buildDir 'libs\vkd3d-umd\vkd3d-umd-ddi-descriptor-test.exe') $output
 Copy-Item (Join-Path $buildDir 'libs\vkd3d-umd\vkd3d-umd-gpu-probe.exe') $output
+Copy-Item (Join-Path $buildDir 'libs\vkd3d-umd\vkd3d-umd-runtime-test.exe') $output
 Copy-Item libs/vkd3d-umd/README.md $output
 dumpbin /headers $dll | Out-File (Join-Path $output 'pe-headers.txt')
 dumpbin /exports $dll | Out-File (Join-Path $output 'exports.txt')
@@ -55,7 +58,7 @@ try {
 } finally { $stream.Dispose() }
 [PSCustomObject]@{Source=(& git rev-parse HEAD); Submodules=(& git submodule status --recursive);
     Architecture=$Architecture; WindowsKit=$sdkVersion; NativeRuntimeValidated=$false;
-    Contract='partial native DDI bridge; no OpenAdapter12; no app-local D3D12 replacement'} |
+    Contract='OpenAdapter12 and native lifecycle; zero advertised feature levels; no native runtime acceptance'} |
     ConvertTo-Json -Depth 4 | Set-Content (Join-Path $output 'source.json')
 $hashes = Get-ChildItem $output -File | Get-FileHash -Algorithm SHA256
 $hashes | ForEach-Object { $_.Hash + '  ' + [IO.Path]::GetFileName($_.Path) } |

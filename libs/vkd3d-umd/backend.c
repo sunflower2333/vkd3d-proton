@@ -42,7 +42,7 @@ static int32_t wrap(vkdu_device *device, enum vkdu_kind kind, HRESULT hr, IUnkno
     return S_OK;
 }
 
-static int32_t create_device(PFN_vkGetInstanceProcAddr loader, const struct vkdu_adapter *adapter, int test_cpu, vkdu_device **out)
+static int32_t create_device(PFN_vkGetInstanceProcAddr loader, const struct vkdu_adapter *adapter, int test_cpu, int runtime_identity, vkdu_device **out)
 {
     struct vkd3d_instance_create_info instance_info = {0};
     struct vkd3d_device_create_info device_info = {0};
@@ -74,7 +74,7 @@ static int32_t create_device(PFN_vkGetInstanceProcAddr loader, const struct vkdu
         properties(devices[i], &props);
         if (test_cpu ? props.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU :
             (id.deviceLUIDValid && !memcmp(id.deviceLUID, adapter->luid, 8) &&
-             props.properties.vendorID == adapter->vendor_id && props.properties.deviceID == adapter->device_id &&
+             (runtime_identity || (props.properties.vendorID == adapter->vendor_id && props.properties.deviceID == adapter->device_id)) &&
              driver.driverID == VK_DRIVER_ID_MESA_TURNIP)) {
             if (selected) { hr = E_INVALIDARG; goto done; } /* Never select ambiguously. */
             selected = devices[i];
@@ -99,10 +99,19 @@ done:
 }
 
 int32_t vkdu_device_create(PFN_vkGetInstanceProcAddr loader, const struct vkdu_adapter *adapter, vkdu_device **out)
-{ return create_device(loader, adapter, 0, out); }
+{ return create_device(loader, adapter, 0, 0, out); }
+int32_t vkdu_device_create_runtime(PFN_vkGetInstanceProcAddr loader, const uint8_t luid[8], vkdu_device **out)
+{
+    struct vkdu_adapter adapter = {0};
+    static const uint8_t zero_luid[8] = {0};
+    if (out) *out = NULL;
+    if (!luid || !memcmp(luid, zero_luid, sizeof(zero_luid))) return E_INVALIDARG;
+    memcpy(adapter.luid, luid, sizeof(adapter.luid));
+    return create_device(loader, &adapter, 0, 1, out);
+}
 #ifdef VKDU_ENABLE_TEST_DEVICE
 int32_t vkdu_test_device_create(PFN_vkGetInstanceProcAddr loader, vkdu_device **out)
-{ return create_device(loader, NULL, 1, out); }
+{ return create_device(loader, NULL, 1, 0, out); }
 #endif
 void vkdu_device_destroy(vkdu_device *device)
 { if (device) { ID3D12Device_Release(device->object); free(device); } }
