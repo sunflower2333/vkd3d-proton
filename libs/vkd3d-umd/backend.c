@@ -9,7 +9,7 @@
 #endif
 
 struct vkdu_device { ID3D12Device *object; };
-struct vkdu_root_slot { uint32_t type, extent, heap_type; };
+struct vkdu_root_slot { uint32_t type, extent, heap_type, unbounded; };
 struct vkdu_object {
     IUnknown *object;
     ID3D12Device *owner;
@@ -263,7 +263,7 @@ int32_t vkdu_command_table(vkdu_object *command, uint32_t index, vkdu_object *he
         command->slots[index].type != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE ||
         !VALID(heap, VKDU_DESCRIPTOR_HEAP) || !vkdu_same_device(command, heap) || !heap->shader_visible ||
         heap->heap_type > 1 || heap->heap_type != command->slots[index].heap_type || first >= heap->descriptor_count ||
-        (command->slots[index].extent != UINT32_MAX && command->slots[index].extent > heap->descriptor_count - first) ||
+        (!command->slots[index].unbounded && command->slots[index].extent > heap->descriptor_count - first) ||
         command->bound_heaps[heap->heap_type] != vkdu_heap_start(heap, 1)) return E_INVALIDARG;
     handle.ptr = vkdu_heap_start(heap, 1) + (uint64_t)first * heap->descriptor_stride;
     ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(OBJ(ID3D12GraphicsCommandList, command), index, handle);
@@ -382,6 +382,7 @@ int32_t vkdu_root_create(vkdu_device *device, const struct vkdu_root_parameter *
                 ranges[used].BaseShaderRegister = r->shader_register; ranges[used].RegisterSpace = r->register_space;
                 ranges[used++].OffsetInDescriptorsFromTableStart = r->offset;
                 append = r->count == UINT32_MAX ? UINT32_MAX : offset + r->count;
+                if (r->count == UINT32_MAX) slots[i].unbounded = 1;
                 if (append > extent) extent = append;
             }
             slots[i].extent = (uint32_t)extent;
@@ -448,7 +449,8 @@ int32_t vkdu_command_pipeline(vkdu_object *command, vkdu_object *pipeline)
 }
 int32_t vkdu_command_uav(vkdu_object *command, uint32_t index, vkdu_object *buffer, uint64_t offset)
 {
-    if (!RECORDING(command) || !VALID(buffer, VKDU_BUFFER) || !vkdu_same_device(command, buffer) || offset >= buffer->bytes || (offset & 3)) return E_INVALIDARG;
+    if (!RECORDING(command) || index >= command->slot_count || command->slots[index].type != D3D12_ROOT_PARAMETER_TYPE_UAV ||
+        !VALID(buffer, VKDU_BUFFER) || !vkdu_same_device(command, buffer) || offset >= buffer->bytes || (offset & 3)) return E_INVALIDARG;
     ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(OBJ(ID3D12GraphicsCommandList, command), index, vkdu_buffer_address(buffer) + offset); return S_OK;
 }
 int32_t vkdu_command_dispatch(vkdu_object *command, uint32_t x, uint32_t y, uint32_t z)

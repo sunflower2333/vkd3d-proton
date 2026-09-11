@@ -13,6 +13,9 @@ if vkd3d_platform == 'windows'
   if get_option('enable_umd_bridge_tests')
     umd_ddi_abi_test = executable('vkd3d-umd-ddi-abi-test', 'ddi_abi_test.cpp',
       include_directories : vkd3d_public_includes, cpp_args : ['-DNOMINMAX'])
+    umd_ddi_descriptor_test = executable('vkd3d-umd-ddi-descriptor-test', 'ddi_descriptor_test.cpp',
+      dependencies : [umd_backend_dep, lib_gdi32, lib_dxgi],
+      include_directories : vkd3d_private_includes, cpp_args : ['-DNOMINMAX'])
   endif
 endif
 
