@@ -1,4 +1,6 @@
 option('enable_tests',              type : 'boolean', value : false)
+option('enable_umd_bridge',         type : 'boolean', value : false)
+option('enable_umd_bridge_tests',   type : 'boolean', value : false)
 option('enable_extras',             type : 'boolean', value : false)
 option('enable_profiling',          type : 'boolean', value : false)
 option('enable_renderdoc',          type : 'boolean', value : false)

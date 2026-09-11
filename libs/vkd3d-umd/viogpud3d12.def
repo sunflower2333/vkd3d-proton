@@ -1,0 +1,9 @@
+LIBRARY viogpud3d12
+EXPORTS
+    VioGpuD3D12BridgeCreate
+    VioGpuD3D12BridgeDestroy
+    VioGpuD3D12BridgeStatus
+    VioGpuD3D12BridgeObjectSize
+    VioGpuD3D12BridgeGetTables
+    VioGpuD3D12BridgeBindObject
+    VioGpuD3D12BridgeUnbindObject

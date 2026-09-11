@@ -1,0 +1,256 @@
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+#include "ddi.h"
+#include <atomic>
+#include <cstring>
+#include <new>
+#include <vector>
+
+namespace {
+constexpr uint32_t context_magic = 0x564b4455, object_magic = 0x564b4f42;
+struct Context {
+    uint32_t magic = context_magic;
+    std::atomic_uint references{1};
+    vkdu_device *backend = nullptr;
+    VKDU_REPORT_ERROR report = nullptr;
+    void *report_context = nullptr;
+    std::atomic<HRESULT> last_error{S_OK};
+};
+struct Object {
+    uint32_t magic;
+    Context *context;
+    vkdu_object *backend;
+    vkdu_kind kind;
+    uint32_t *shader;
+    uint32_t shader_words;
+};
+Context *context(D3D12DDI_HDEVICE handle) {
+    auto *value = static_cast<Context *>(handle.pDrvPrivate);
+    return value && value->magic == context_magic ? value : nullptr;
+}
+Object *object(void *memory) {
+    auto *value = static_cast<Object *>(memory);
+    return value && value->magic == object_magic ? value : nullptr;
+}
+vkdu_object *backend(void *memory, vkdu_kind kind) {
+    auto *value = object(memory);
+    return value && value->kind == kind ? value->backend : nullptr;
+}
+void release(Context *value) {
+    if (value && --value->references == 0) {
+        value->magic = 0; vkdu_device_destroy(value->backend); delete value;
+    }
+}
+void error(Context *value, HRESULT result) {
+    if (!value || SUCCEEDED(result)) return;
+    value->last_error = result;
+    if (value->report) value->report(value->report_context, result);
+}
+void error(Object *value, HRESULT result) { if (value) error(value->context, result); }
+HRESULT bind(Context *ctx, void *memory, vkdu_object *value, vkdu_kind kind) {
+    if (!ctx || !memory || !vkdu_object_is(value, kind) || !vkdu_object_belongs(ctx->backend, value) || object(memory)) return E_INVALIDARG;
+    new (memory) Object{object_magic, ctx, value, kind, nullptr, 0};
+    ++ctx->references;
+    return S_OK;
+}
+HRESULT finish(Context *ctx, void *memory, vkdu_object *value, vkdu_kind kind, HRESULT result) {
+    if (FAILED(result)) return result;
+    result = bind(ctx, memory, value, kind);
+    if (FAILED(result)) vkdu_object_destroy(value);
+    return result;
+}
+uint32_t command_type(D3D12DDI_COMMAND_QUEUE_FLAGS flags) {
+    if (flags == D3D12DDI_COMMAND_QUEUE_FLAG_3D) return 0;
+    if (flags == D3D12DDI_COMMAND_QUEUE_FLAG_COMPUTE) return 2;
+    if (flags == D3D12DDI_COMMAND_QUEUE_FLAG_COPY) return 3;
+    return UINT32_MAX;
+}
+bool belongs(Context *ctx, void *memory) { auto *o = object(memory); return o && o->context == ctx; }
+
+SIZE_T APIENTRY queue_size(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATECOMMANDQUEUE_0001 *) { return sizeof(Object); }
+HRESULT APIENTRY queue_create(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATECOMMANDQUEUE_0001 *args) {
+    auto *ctx = context(h); vkdu_object *value = nullptr;
+    if (!ctx || !args || args->NodeMask > 1) return E_INVALIDARG;
+    HRESULT hr = vkdu_queue_create(ctx->backend, command_type(args->QueueFlags), &value);
+    return finish(ctx, args->hDrvCommandQueue.pDrvPrivate, value, VKDU_QUEUE, hr);
+}
+void APIENTRY queue_destroy(D3D12DDI_HDEVICE h, D3D12DDI_HCOMMANDQUEUE q) {
+    if (belongs(context(h), q.pDrvPrivate)) VioGpuD3D12BridgeUnbindObject(q.pDrvPrivate);
+    else error(context(h), E_INVALIDARG);
+}
+SIZE_T APIENTRY allocator_size(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATECOMMANDALLOCATOR *) { return sizeof(Object); }
+HRESULT APIENTRY allocator_create(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATECOMMANDALLOCATOR *args) {
+    auto *ctx = context(h); vkdu_object *value = nullptr;
+    if (!ctx || !args || args->Type != D3D12DDI_COMMAND_LIST_TYPE_DIRECT) return E_INVALIDARG;
+    HRESULT hr = vkdu_allocator_create(ctx->backend, command_type(args->QueueFlags), &value);
+    return finish(ctx, args->hDrvCommandAllocator.pDrvPrivate, value, VKDU_ALLOCATOR, hr);
+}
+void APIENTRY allocator_destroy(D3D12DDI_HDEVICE h, D3D12DDI_HCOMMANDALLOCATOR a) {
+    if (belongs(context(h), a.pDrvPrivate)) VioGpuD3D12BridgeUnbindObject(a.pDrvPrivate);
+    else error(context(h), E_INVALIDARG);
+}
+void APIENTRY allocator_reset(D3D12DDI_HCOMMANDALLOCATOR a) {
+    error(object(a.pDrvPrivate), vkdu_allocator_reset(backend(a.pDrvPrivate, VKDU_ALLOCATOR)));
+}
+SIZE_T APIENTRY command_size(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATE_COMMAND_LIST_0001 *) { return sizeof(Object); }
+HRESULT APIENTRY command_create(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATE_COMMAND_LIST_0001 *args) {
+    auto *ctx = context(h); vkdu_object *value = nullptr;
+    if (!ctx || !args || args->Type != D3D12DDI_COMMAND_LIST_TYPE_DIRECT || args->NodeMask > 1 || args->CommandListFlags ||
+        !belongs(ctx, args->hDrvCommandAllocator.pDrvPrivate)) return E_INVALIDARG;
+    HRESULT hr = vkdu_command_create(ctx->backend, backend(args->hDrvCommandAllocator.pDrvPrivate, VKDU_ALLOCATOR), command_type(args->QueueFlags), &value);
+    return finish(ctx, args->hDrvCommandList.pDrvPrivate, value, VKDU_COMMAND_LIST, hr);
+}
+void APIENTRY command_destroy(D3D12DDI_HDEVICE h, D3D12DDI_HCOMMANDLIST c) {
+    if (belongs(context(h), c.pDrvPrivate)) VioGpuD3D12BridgeUnbindObject(c.pDrvPrivate);
+    else error(context(h), E_INVALIDARG);
+}
+void APIENTRY command_close(D3D12DDI_HCOMMANDLIST c) {
+    error(object(c.pDrvPrivate), vkdu_command_close(backend(c.pDrvPrivate, VKDU_COMMAND_LIST)));
+}
+void APIENTRY command_reset(D3D12DDI_HCOMMANDLIST c, const D3D12DDIARG_RESETCOMMANDLIST *args) {
+    auto *cmd = object(c.pDrvPrivate);
+    if (!cmd) return;
+    if (!args || args->Slot || args->CommandListFlags || !belongs(cmd->context, args->hDrvCommandAllocator.pDrvPrivate)) { error(cmd, E_INVALIDARG); return; }
+    error(cmd, vkdu_command_reset(cmd->backend, backend(args->hDrvCommandAllocator.pDrvPrivate, VKDU_ALLOCATOR)));
+}
+void APIENTRY copy(D3D12DDI_HCOMMANDLIST c, D3D12DDIARG_BUFFER_PLACEMENT dst, D3D12DDIARG_BUFFER_PLACEMENT src, UINT64 bytes) {
+    auto *cmd = object(c.pDrvPrivate);
+    error(cmd, vkdu_command_copy(backend(c.pDrvPrivate, VKDU_COMMAND_LIST),
+            backend(dst.BaseAddress.UMD.hResource.pDrvPrivate, VKDU_BUFFER), dst.BaseAddress.UMD.Offset,
+            backend(src.BaseAddress.UMD.hResource.pDrvPrivate, VKDU_BUFFER), src.BaseAddress.UMD.Offset, bytes));
+}
+void APIENTRY barriers(D3D12DDI_HCOMMANDLIST c, UINT count, const D3D12DDIARG_RESOURCE_BARRIER_0003 *args) {
+    auto *cmd = object(c.pDrvPrivate);
+    if (!cmd) return;
+    if ((count && !args) || count > 65536) { error(cmd, E_INVALIDARG); return; }
+    // Validate the complete batch before recording any transition.
+    for (UINT i = 0; i < count; ++i) {
+        if (args[i].Type != D3D12DDI_RESOURCE_BARRIER_TYPE_TRANSITION || args[i].Flags ||
+            args[i].Transition.Subresource != UINT_MAX ||
+            !belongs(cmd->context, args[i].Transition.hResource.pDrvPrivate) ||
+            !backend(args[i].Transition.hResource.pDrvPrivate, VKDU_BUFFER)) { error(cmd, E_NOTIMPL); return; }
+    }
+    for (UINT i = 0; i < count; ++i) error(cmd, vkdu_command_transition(cmd->backend,
+            backend(args[i].Transition.hResource.pDrvPrivate, VKDU_BUFFER), args[i].Transition.StateBefore, args[i].Transition.StateAfter));
+}
+void APIENTRY dispatch(D3D12DDI_HCOMMANDLIST c, UINT x, UINT y, UINT z) {
+    error(object(c.pDrvPrivate), vkdu_command_dispatch(backend(c.pDrvPrivate, VKDU_COMMAND_LIST), x, y, z));
+}
+void APIENTRY root_set(D3D12DDI_HCOMMANDLIST c, D3D12DDI_HROOTSIGNATURE root) {
+    error(object(c.pDrvPrivate), vkdu_command_root(backend(c.pDrvPrivate, VKDU_COMMAND_LIST), backend(root.pDrvPrivate, VKDU_ROOT)));
+}
+void APIENTRY pipeline_set(D3D12DDI_HCOMMANDLIST c, D3D12DDI_HPIPELINESTATE pipeline) {
+    error(object(c.pDrvPrivate), vkdu_command_pipeline(backend(c.pDrvPrivate, VKDU_COMMAND_LIST), backend(pipeline.pDrvPrivate, VKDU_PIPELINE)));
+}
+void APIENTRY execute(D3D12DDI_HCOMMANDQUEUE q, UINT count, const D3D12DDI_HCOMMANDLIST *commands) {
+    auto *queue = object(q.pDrvPrivate); vkdu_object *native[64];
+    if (!queue) return;
+    if (!commands || !count || count > 64) { error(queue, E_INVALIDARG); return; }
+    for (UINT i = 0; i < count; ++i) native[i] = backend(commands[i].pDrvPrivate, VKDU_COMMAND_LIST);
+    error(queue, vkdu_queue_execute(queue->backend, count, native));
+}
+SIZE_T APIENTRY root_size(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATE_ROOT_SIGNATURE_0001 *) { return sizeof(Object); }
+HRESULT APIENTRY root_create(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATE_ROOT_SIGNATURE_0001 *args, D3D12DDI_HROOTSIGNATURE root) {
+    auto *ctx = context(h); vkdu_object *value = nullptr; vkdu_root_parameter parameters[64]{};
+    if (!ctx || !args || !args->pRootSignature || args->NodeMask > 1) return E_INVALIDARG;
+    const auto &desc = *args->pRootSignature;
+    if (desc.NumStaticSamplers || desc.NumParameters > 64 || (desc.NumParameters && !desc.pRootParameters)) return E_NOTIMPL;
+    for (UINT i = 0; i < desc.NumParameters; ++i) {
+        const auto &p = desc.pRootParameters[i];
+        if (p.ParameterType == D3D12DDI_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) return E_NOTIMPL;
+        parameters[i].type = p.ParameterType; parameters[i].visibility = p.ShaderVisibility;
+        if (p.ParameterType == D3D12DDI_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS) {
+            parameters[i].shader_register = p.Constants.ShaderRegister; parameters[i].register_space = p.Constants.RegisterSpace;
+            parameters[i].constant_count = p.Constants.Num32BitValues;
+        } else {
+            parameters[i].shader_register = p.Descriptor.ShaderRegister; parameters[i].register_space = p.Descriptor.RegisterSpace;
+        }
+    }
+    HRESULT hr = vkdu_root_create(ctx->backend, parameters, desc.NumParameters, desc.Flags, &value);
+    return finish(ctx, root.pDrvPrivate, value, VKDU_ROOT, hr);
+}
+void APIENTRY root_destroy(D3D12DDI_HDEVICE h, D3D12DDI_HROOTSIGNATURE root) {
+    if (belongs(context(h), root.pDrvPrivate)) VioGpuD3D12BridgeUnbindObject(root.pDrvPrivate);
+    else error(context(h), E_INVALIDARG);
+}
+SIZE_T APIENTRY shader_size(D3D12DDI_HDEVICE, const UINT *, D3D12DDI_HROOTSIGNATURE, const D3D12DDIARG_STAGE_IO_SIGNATURES *) { return sizeof(Object); }
+void APIENTRY shader_create(D3D12DDI_HDEVICE h, const UINT *tokens, D3D12DDI_HROOTSIGNATURE root, D3D12DDI_HSHADER shader, D3D12DDI_CREATE_SHADER_FLAGS flags) {
+    auto *ctx = context(h);
+    if (!ctx) return;
+    if (!tokens || !shader.pDrvPrivate || object(shader.pDrvPrivate) || flags || !belongs(ctx, root.pDrvPrivate) ||
+        tokens[1] < 2 || tokens[1] > 1024 * 1024 || (tokens[0] >> 16) != 5) { error(ctx, E_INVALIDARG); return; }
+    auto *copy = new (std::nothrow) uint32_t[tokens[1]];
+    if (!copy) { error(ctx, E_OUTOFMEMORY); return; }
+    std::memcpy(copy, tokens, tokens[1] * sizeof(uint32_t));
+    new (shader.pDrvPrivate) Object{object_magic, ctx, nullptr, VKDU_PIPELINE, copy, tokens[1]};
+    ++ctx->references;
+}
+void APIENTRY shader_destroy(D3D12DDI_HDEVICE h, D3D12DDI_HSHADER shader) {
+    if (belongs(context(h), shader.pDrvPrivate)) VioGpuD3D12BridgeUnbindObject(shader.pDrvPrivate);
+    else error(context(h), E_INVALIDARG);
+}
+SIZE_T APIENTRY pipeline_size(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATE_PIPELINE_STATE_0001 *) { return sizeof(Object); }
+HRESULT APIENTRY pipeline_create(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATE_PIPELINE_STATE_0001 *args) {
+    auto *ctx = context(h); vkdu_object *value = nullptr;
+    if (!ctx || !args || args->NodeMask > 1 || !belongs(ctx, args->hComputeShader.pDrvPrivate) || !belongs(ctx, args->hRootSignature.pDrvPrivate)) return E_INVALIDARG;
+    if (args->hVertexShader.pDrvPrivate || args->hPixelShader.pDrvPrivate || args->hDomainShader.pDrvPrivate ||
+        args->hHullShader.pDrvPrivate || args->hGeometryShader.pDrvPrivate) return E_NOTIMPL;
+    auto *shader = object(args->hComputeShader.pDrvPrivate);
+    if (!shader->shader) return E_INVALIDARG;
+    HRESULT hr = vkdu_pipeline_create_tokens(ctx->backend, backend(args->hRootSignature.pDrvPrivate, VKDU_ROOT), shader->shader, shader->shader_words, &value);
+    return finish(ctx, args->hDrvPipelineState.pDrvPrivate, value, VKDU_PIPELINE, hr);
+}
+void APIENTRY pipeline_destroy(D3D12DDI_HDEVICE h, D3D12DDI_HPIPELINESTATE pipeline) {
+    if (belongs(context(h), pipeline.pDrvPrivate)) VioGpuD3D12BridgeUnbindObject(pipeline.pDrvPrivate);
+    else error(context(h), E_INVALIDARG);
+}
+}
+
+extern "C" HRESULT APIENTRY VioGpuD3D12BridgeCreate(PFN_vkGetInstanceProcAddr loader, const vkdu_adapter *adapter,
+        VKDU_REPORT_ERROR report, void *report_context, D3D12DDI_HDEVICE *out) {
+    if (!out || !report) return E_INVALIDARG;
+    out->pDrvPrivate = nullptr;
+    auto *ctx = new (std::nothrow) Context;
+    if (!ctx) return E_OUTOFMEMORY;
+    HRESULT hr = vkdu_device_create(loader, adapter, &ctx->backend);
+    if (FAILED(hr)) { delete ctx; return hr; }
+    ctx->report = report; ctx->report_context = report_context; out->pDrvPrivate = ctx;
+    return S_OK;
+}
+extern "C" void APIENTRY VioGpuD3D12BridgeDestroy(D3D12DDI_HDEVICE h) { release(context(h)); }
+extern "C" HRESULT APIENTRY VioGpuD3D12BridgeStatus(D3D12DDI_HDEVICE h) {
+    auto *ctx = context(h);
+    if (!ctx) return E_INVALIDARG;
+    HRESULT hr = ctx->last_error.load();
+    return FAILED(hr) ? hr : vkdu_device_status(ctx->backend);
+}
+extern "C" SIZE_T APIENTRY VioGpuD3D12BridgeObjectSize(void) { return sizeof(Object); }
+extern "C" HRESULT APIENTRY VioGpuD3D12BridgeBindObject(D3D12DDI_HDEVICE h, void *memory, vkdu_object *value, vkdu_kind kind) {
+    return bind(context(h), memory, value, kind);
+}
+extern "C" void APIENTRY VioGpuD3D12BridgeUnbindObject(void *memory) {
+    auto *value = object(memory);
+    if (!value) return;
+    auto *ctx = value->context;
+    vkdu_object_destroy(value->backend); delete[] value->shader;
+    std::memset(value, 0, sizeof(*value)); release(ctx);
+}
+extern "C" HRESULT APIENTRY VioGpuD3D12BridgeGetTables(D3D12DDI_DEVICE_FUNCS_CORE_0003 *device,
+        D3D12DDI_COMMAND_LIST_FUNCS_3D_0003 *commands, D3D12DDI_COMMAND_QUEUE_FUNCS_CORE_0001 *queue) {
+    if (!device || !commands || !queue) return E_INVALIDARG;
+    *device = {}; *commands = {}; *queue = {};
+    // Assignment to actual WDK fields compile-checks ABI, including x86 stdcall.
+    device->pfnCalcPrivateCommandQueueSize = queue_size; device->pfnCreateCommandQueue = queue_create; device->pfnDestroyCommandQueue = queue_destroy;
+    device->pfnCalcPrivateCommandAllocatorSize = allocator_size; device->pfnCreateCommandAllocator = allocator_create;
+    device->pfnDestroyCommandAllocator = allocator_destroy; device->pfnResetCommandAllocator = allocator_reset;
+    device->pfnCalcPrivateCommandListSize = command_size; device->pfnCreateCommandList = command_create; device->pfnDestroyCommandList = command_destroy;
+    device->pfnCalcPrivateRootSignatureSize = root_size; device->pfnCreateRootSignature = root_create; device->pfnDestroyRootSignature = root_destroy;
+    device->pfnCalcPrivateShaderSize = shader_size; device->pfnCreateComputeShader = shader_create; device->pfnDestroyShader = shader_destroy;
+    device->pfnCalcPrivatePipelineStateSize = pipeline_size; device->pfnCreatePipelineState = pipeline_create; device->pfnDestroyPipelineState = pipeline_destroy;
+    commands->pfnCloseCommandList = command_close; commands->pfnResetCommandList = command_reset;
+    commands->pfnCopyBufferRegion = copy; commands->pfnResourceBarrier = barriers; commands->pfnDispatch = dispatch;
+    commands->pfnSetComputeRootSignature = root_set; commands->pfnSetPipelineState = pipeline_set;
+    queue->pfnExecuteCommandLists = execute;
+    // Native monitored-fence, allocation/residency, root GPUVA, graphics and
+    // presentation contracts remain absent; do not advertise these tables.
+    return S_OK;
+}
