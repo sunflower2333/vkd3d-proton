@@ -33,6 +33,12 @@ overflow-safe heap bounds. Command reset clears table and heap binding state.
 Buffer UAVs support raw, structured (including counters) and R32 typed views;
 other typed formats, textures and samplers still require their native view adapters.
 
+UAV creation resolves both data and optional counter handles in the locked live
+buffer registry, matching SRV ownership rules. Unknown non-null handles never
+get dereferenced or converted to null descriptors. Rejected late creation leaves
+the existing descriptor unchanged; actual WDK fixtures exercise invalid pointers,
+wrong object types, removed registry entries and valid counter forwarding.
+
 Native CopyDescriptors now resolves independently sized source/destination
 ranges across live owned heaps, including omitted size arrays (one descriptor
 per range), empty ranges and repeated source ranges. The backend validates all
@@ -58,6 +64,13 @@ other constants, and caller storage is copied during command recording.
 Root creation enforces the total64-DWORD budget, including table/root-descriptor
 costs. Command reset clears the bound layout so stale constants cannot be set
 without rebinding. This follows Microsoft's [root constants contract](https://learn.microsoft.com/windows/win32/direct3d12/using-constants-directly-in-the-root-signature).
+
+Root-constant checkpointbc61de9 passed all four standalone CI34609416636
+jobs and parent targetseven-vkd3dbc-constants-05:17workloads/17408correct
+words in1167ms, including both root32 partial-update rounds. Exact native
+adapter LUID581B/ICD9AA5/KMD58386, original DWM2140/Explorer5972 retained.
+Parent owns correlated host trace closure. This does not prove Microsoft
+runtime activation, graphics or Present support.
 
 Buffer SRVs support the native CreateShaderResourceView and compute root SRV
 callbacks, raw/structured/R32 typed views, same-device ownership, bounded

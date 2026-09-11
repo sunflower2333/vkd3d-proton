@@ -18,6 +18,8 @@ static unsigned calls, copies, tables_seen, destroys;
 static int passed_visibility = -1;
 static HRESULT next_result = S_OK, reported = S_OK;
 static uint32_t uav_index, table_index, table_first, root_offset, root_space;
+static vkdu_object *uav_buffer, *uav_counter;
+static uint64_t uav_counter_offset;
 static uint32_t cbv_index, cbv_bytes, root_cbv_index;
 static uint64_t cbv_offset;
 static vkdu_object *cbv_buffer;
@@ -53,8 +55,9 @@ static int test_resolve(vkdu_object *p, uint64_t address, int gpu, uint32_t *ind
     if (!start || address < start || (address - start) % 32 || (address - start) / 32 >= peer(p)->count) return 0;
     *index = static_cast<uint32_t>((address - start) / 32); return 1;
 }
-static int32_t test_uav(vkdu_object *, uint32_t index, vkdu_object *, uint32_t, uint64_t, uint32_t, uint32_t, uint32_t, vkdu_object *, uint64_t) {
-    ++calls; uav_index = index; return next_result;
+static int32_t test_uav(vkdu_object *, uint32_t index, vkdu_object *buffer, uint32_t, uint64_t, uint32_t, uint32_t, uint32_t, vkdu_object *counter, uint64_t offset) {
+    ++calls; uav_index = index; uav_buffer = buffer; uav_counter = counter; uav_counter_offset = offset;
+    return next_result;
 }
 static int32_t test_copy(vkdu_object *, uint32_t, vkdu_object *, uint32_t, uint32_t) { ++copies; return next_result; }
 static int32_t test_copy_ranges(vkdu_device *, uint32_t type,
@@ -163,8 +166,39 @@ int main() {
     view.Format = DXGI_FORMAT_R32_TYPELESS; view.Buffer.NumElements = 1024; view.Buffer.Flags = D3D12DDI_BUFFER_UAV_FLAG_RAW;
     D3D12DDI_CPU_DESCRIPTOR_HANDLE destination{static_cast<SIZE_T>(test_start(cpu.backend, 0) + 3 * 32)};
     device.pfnCreateUnorderedAccessView(h, &view, destination);
-    REQUIRE(uav_index == 3 && reported == S_OK);
+    REQUIRE(uav_index == 3 && reported == S_OK && uav_buffer == b && !uav_counter);
     unsigned before = calls;
+    view.hDrvResource = {reinterpret_cast<void *>(1)};
+    device.pfnCreateUnorderedAccessView(h, &view, destination);
+    REQUIRE(calls == before && reported == E_INVALIDARG);
+    view.hDrvResource = {&command};
+    device.pfnCreateUnorderedAccessView(h, &view, destination);
+    REQUIRE(calls == before && reported == E_INVALIDARG);
+    view.hDrvResource = {};
+    device.pfnCreateUnorderedAccessView(h, &view, destination);
+    REQUIRE(calls == before && reported == E_INVALIDARG);
+    view.hDrvResource = {&buffer};
+    auto *uav_resources = ctx.resources; ctx.resources = nullptr;
+    device.pfnCreateUnorderedAccessView(h, &view, destination);
+    REQUIRE(calls == before && reported == E_INVALIDARG);
+    ctx.resources = uav_resources;
+    view.Buffer.hDrvCounterResource = {reinterpret_cast<void *>(1)};
+    device.pfnCreateUnorderedAccessView(h, &view, destination);
+    REQUIRE(calls == before && reported == E_INVALIDARG);
+    view.Buffer.hDrvCounterResource = {&command};
+    device.pfnCreateUnorderedAccessView(h, &view, destination);
+    REQUIRE(calls == before && reported == E_INVALIDARG);
+    device.pfnCreateUnorderedAccessView(h, nullptr, destination);
+    REQUIRE(calls == before && reported == E_INVALIDARG);
+    view.Format = DXGI_FORMAT_UNKNOWN; view.Buffer.StructureByteStride = 4;
+    view.Buffer.Flags = D3D12DDI_BUFFER_UAV_FLAG_NONE;
+    view.Buffer.hDrvCounterResource = {&buffer}; view.Buffer.CounterOffsetInBytes = 0;
+    reported = S_OK;
+    device.pfnCreateUnorderedAccessView(h, &view, destination);
+    REQUIRE(calls == before + 1 && reported == S_OK && uav_buffer == b && uav_counter == b && uav_counter_offset == 0);
+    view.Buffer.hDrvCounterResource = {}; view.Buffer.StructureByteStride = 0;
+    view.Format = DXGI_FORMAT_R32_TYPELESS; view.Buffer.Flags = D3D12DDI_BUFFER_UAV_FLAG_RAW;
+    before = calls;
     ++destination.ptr;
     device.pfnCreateUnorderedAccessView(h, &view, destination);
     REQUIRE(calls == before && reported == E_INVALIDARG);

@@ -131,19 +131,26 @@ Object *find_heap(Context *ctx, uint64_t address, bool gpu, uint32_t *index) {
     }
     return nullptr;
 }
+// Caller holds resources_lock; never dereference an unregistered native handle.
+Object *find_buffer(Context *ctx, void *handle) {
+    for (auto *p = ctx->resources; p; p = p->next)
+        if (p == handle) return p;
+    return nullptr;
+}
 void APIENTRY create_uav(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATE_UNORDERED_ACCESS_VIEW_0002 *args, D3D12DDI_CPU_DESCRIPTOR_HANDLE destination) {
     auto *ctx = context(h);
     if (!ctx) return;
-    if (!args || args->ResourceDimension != D3D12DDI_RD_BUFFER) { error(ctx, E_NOTIMPL); return; }
+    if (!args) { error(ctx, E_INVALIDARG); return; }
+    if (args->ResourceDimension != D3D12DDI_RD_BUFFER) { error(ctx, E_NOTIMPL); return; }
     uint32_t index = 0; HRESULT hr = E_INVALIDARG;
     AcquireSRWLockShared(&ctx->resources_lock);
     auto *heap = find_heap(ctx, destination.ptr, false, &index);
-    auto *resource = backend(args->hDrvResource.pDrvPrivate, VKDU_BUFFER);
-    auto *counter = backend(args->Buffer.hDrvCounterResource.pDrvPrivate, VKDU_BUFFER);
-    if (heap && (!args->Buffer.hDrvCounterResource.pDrvPrivate || counter))
-        hr = vkdu_buffer_uav(heap->backend, index, resource, args->Format, args->Buffer.FirstElement,
+    auto *resource = find_buffer(ctx, args->hDrvResource.pDrvPrivate);
+    auto *counter = find_buffer(ctx, args->Buffer.hDrvCounterResource.pDrvPrivate);
+    if (heap && resource && (!args->Buffer.hDrvCounterResource.pDrvPrivate || counter))
+        hr = vkdu_buffer_uav(heap->backend, index, resource->backend, args->Format, args->Buffer.FirstElement,
                 args->Buffer.NumElements, args->Buffer.StructureByteStride, args->Buffer.Flags,
-                counter, args->Buffer.CounterOffsetInBytes);
+                counter ? counter->backend : nullptr, args->Buffer.CounterOffsetInBytes);
     ReleaseSRWLockShared(&ctx->resources_lock);
     error(ctx, hr);
 }
@@ -157,9 +164,7 @@ void APIENTRY create_srv(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATE_SHADER_RES
     auto *heap = find_heap(ctx, destination.ptr, false, &index);
     // Resolve only live owned resources. An unknown non-null handle must not
     // become a valid null descriptor or require dereferencing foreign memory.
-    Object *resource = nullptr;
-    for (auto *p = ctx->resources; p; p = p->next)
-        if (p == args->hDrvResource.pDrvPrivate) { resource = p; break; }
+    auto *resource = find_buffer(ctx, args->hDrvResource.pDrvPrivate);
     if (heap && (!args->hDrvResource.pDrvPrivate || resource))
         hr = vkdu_buffer_srv(heap->backend, index, resource ? resource->backend : nullptr,
                 args->Format, args->Buffer.FirstElement, args->Buffer.NumElements,
