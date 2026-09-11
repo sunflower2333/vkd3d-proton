@@ -62,8 +62,14 @@ struct NativeHeapOperation {
 struct NativeBackendCall {
     Context *ctx;
     unsigned depth;
-    explicit NativeBackendCall(Context *value) : ctx(value), depth(ctx->error_mutex.suspend()) {}
-    ~NativeBackendCall() { ctx->error_mutex.resume(depth); }
+    explicit NativeBackendCall(Context *value) : ctx(value) {
+        ++ctx->native_backend_calls;
+        depth = ctx->error_mutex.suspend();
+    }
+    ~NativeBackendCall() {
+        ctx->error_mutex.resume(depth);
+        --ctx->native_backend_calls;
+    }
 };
 
 NativeAbiHeader native_header(uint32_t size) { return {0x504d5644, 0, size, 0}; }
@@ -288,6 +294,12 @@ HRESULT APIENTRY native_heap_create(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATE
         {
             NativeBackendCall backend_call(ctx);
             hr = vkdu_memory_heap_import(ctx->backend, ctx, heap, heap->bytes, heap->cpu_visible, &memory);
+        }
+        // Import can synchronously retire the runtime. Do not begin placement
+        // against that device after reacquiring the callback lock.
+        if (SUCCEEDED(hr)) hr = native_heap_generation(ctx);
+        {
+            NativeBackendCall backend_call(ctx);
             if (SUCCEEDED(hr)) hr = vkdu_buffer_place(ctx->backend, memory, 0, resource->Width,
                                                        static_cast<uint32_t>(resource->InitialResourceState), &buffer);
             vkdu_object_destroy(memory);
@@ -400,6 +412,11 @@ void APIENTRY native_heap_destroy(D3D12DDI_HDEVICE h, D3D12DDI_HHEAP slot, D3D12
 void native_heap_retire(Context *ctx) {
     // Called before callback detachment. Pending callbacks cannot be interrupted
     // safely; the runtime's device destruction owns their remaining KMT handles.
+    // An unlocked backend import/destructor may still be using a mapped BO.
+    // Do not issue driver Unlock/Deallocate/DestroyContext while that call runs.
+    // This does not keep KMT backing alive after the runtime's own device
+    // teardown: cancellation is rechecked before further backend operations.
+    if (ctx->native_backend_calls) return;
     bool pending = ctx->native_context_pending || ctx->native_submitting;
     for (auto *heap = ctx->native_heaps; heap; heap = heap->next) {
         if (heap->pending || ctx->native_submitting) { pending = true; continue; }

@@ -62,6 +62,7 @@ struct Context {
     D3DDDI_PATCHLOCATIONLIST *native_patch_list = nullptr;
     uint32_t native_command_capacity = 0, native_allocation_capacity = 0, native_patch_capacity = 0;
     bool native_submitting = false;
+    unsigned native_backend_calls = 0;
     bool native_retiring = false;
     bool native_context_pending = false;
 };

@@ -127,6 +127,7 @@ struct ImportPeer {
 };
 static bool import_failure, placement_failure, retire_during_import;
 static unsigned imports, placements;
+static void retire_import_with_map(Context *, const mwd_allocation &);
 static int32_t test_import_heap(vkdu_device *device, void *owner, void *token, uint64_t size, int, vkdu_object **out) {
     *out = nullptr; ++imports;
     wait_backend_worker(&native_runtime_callbacks, owner);
@@ -138,7 +139,7 @@ static int32_t test_import_heap(vkdu_device *device, void *owner, void *token, u
     auto backing = std::make_shared<ImportOwner>();
     backing->context = static_cast<Context *>(owner); backing->allocation = allocation;
     *out = reinterpret_cast<vkdu_object *>(new ImportPeer{backing, device, VKDU_MEMORY_HEAP, allocation.address, size});
-    if (retire_during_import) native_destroy_device(error_device);
+    if (retire_during_import) retire_import_with_map(backing->context, allocation);
     return S_OK;
 }
 static int32_t test_place_buffer(vkdu_device *device, vkdu_object *memory, uint64_t offset, uint64_t size, uint32_t, vkdu_object **out) {
@@ -321,6 +322,27 @@ static HRESULT APIENTRY heap_render(HANDLE runtime, D3DDDICB_RENDER *args) {
     args->pNewPatchLocationList = patch_lists[1].data(); args->NewPatchLocationListSize = 1024;
     if (retire_render) { native_destroy_device(error_device); heap_callbacks_retired = true; }
     return render_result;
+}
+
+static void retire_import_with_map(Context *ctx, const mwd_allocation &allocation) {
+    void *mapped = nullptr;
+    uint32_t handle = 0;
+    if (FAILED(native_runtime_map(ctx, allocation.token, &mapped, &handle)) ||
+            !mapped || !kernel_heaps.count(handle)) std::abort();
+    // Observe mapped backing before retirement. The fake runtime does not
+    // implement final KMT device teardown, so never access this pointer after
+    // DestroyDevice returns or claim the runtime kept it alive for us.
+    static_cast<unsigned char *>(mapped)[0] = 0x5a;
+    const unsigned old_unlocks = unlocks, old_deallocations = deallocations;
+    const unsigned old_context_destroys = heap_context_destroys;
+    native_destroy_device(error_device);
+    if (unlocks != old_unlocks || deallocations != old_deallocations ||
+            heap_context_destroys != old_context_destroys ||
+            !kernel_heaps.count(handle) || !kernel_heaps.at(handle).locked) std::abort();
+    heap_callbacks_retired = true;
+    mapped = nullptr;
+    if (native_runtime_map(ctx, allocation.token, &mapped, &handle) != DXGI_ERROR_DEVICE_REMOVED || mapped)
+        std::abort();
 }
 
 static int test_native_heaps() {
@@ -559,9 +581,12 @@ static int test_native_heaps() {
     REQUIRE(OpenAdapter12(&open) == S_OK);
     REQUIRE(adapter.pfnCreateDevice(open.hAdapter, &create) == S_OK);
     error_device = create.hDrvDevice; retire_during_import = true;
+    const unsigned placements_before_retire = placements;
     REQUIRE(paired() == DXGI_ERROR_DEVICE_REMOVED && !context(create.hDrvDevice));
-    REQUIRE(kernel_heaps.empty());
-    retire_during_import = false;
+    REQUIRE(placements == placements_before_retire && kernel_heaps.size() == 1);
+    // Model runtime-owned final KMT teardown after the interrupted call unwinds.
+    kernel_heaps.clear(); kernel_resources.clear();
+    heap_callbacks_retired = retire_during_import = false;
     REQUIRE(adapter.pfnCloseAdapter(open.hAdapter) == S_OK);
     std::printf("PASS native buffer heaps/shared runtime allocation tokens/RenderCb replacements/reset/reentrant teardown (%zu-bit); DDI versions remain unsupported\n", sizeof(void *) * 8);
     return 0;
