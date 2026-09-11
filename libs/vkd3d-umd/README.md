@@ -114,7 +114,10 @@ KMD native allocations must fit its 32-bit allocation-size field. WRITE_COMBINE,
 L1, textures, primary/coherent-systemwide heaps and all resource creation remain
 unsupported. Runtime-owned heap storage need not be pre-zeroed. Failed cleanup
 keeps the allocation and VA reservation until device teardown; no AssumeNotInUse
-flag or synthetic KMT handle is used. Nested CPU mappings share one kernel lock,
+flag or synthetic KMT handle is used. Each non-null runtime resource belongs to
+one heap; deallocation releases both its kernel resource and allocation. Null
+runtime resources create device-owned allocations released by exact handle.
+Nested CPU mappings share one kernel lock,
 including ownership of handles renamed by LockCb. Synchronous device destruction
 detaches callbacks safely and delegates residual kernel handles to runtime device
 teardown, without stale callbacks or touching expired private slots.

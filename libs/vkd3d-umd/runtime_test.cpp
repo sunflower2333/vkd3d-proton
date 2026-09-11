@@ -9,6 +9,7 @@
 #include <cstring>
 #include <vector>
 #include <map>
+#include <set>
 
 static HRESULT backend_result = S_OK, query_result = S_OK;
 static unsigned loads, unloads, creates, destroys, query_calls, error_calls;
@@ -73,6 +74,7 @@ static void APIENTRY test_error(D3D10DDI_HRTDEVICE runtime, HRESULT result) {
 
 struct KernelHeap { uint64_t address, bytes; bool locked; HANDLE resource; };
 static std::map<D3DKMT_HANDLE, KernelHeap> kernel_heaps;
+static std::set<HANDLE> kernel_resources;
 static D3DKMT_HANDLE next_allocation = 101;
 static unsigned heap_context_creates, heap_context_destroys, allocations, deallocations, locks, unlocks;
 static unsigned fail_deallocate, fail_unlock;
@@ -97,7 +99,7 @@ static HRESULT APIENTRY heap_context_create(HANDLE runtime, D3DDDICB_CREATECONTE
 }
 static HRESULT APIENTRY heap_context_destroy(HANDLE runtime, const D3DDDICB_DESTROYCONTEXT *args) {
     valid_kernel_callback(runtime);
-    if (args->hContext != expected_context || !kernel_heaps.empty()) std::abort();
+    if (args->hContext != expected_context || !kernel_heaps.empty() || !kernel_resources.empty()) std::abort();
     ++heap_context_destroys;
     if (fail_context_destroy) { --fail_context_destroy; return E_FAIL; }
     return S_OK;
@@ -133,6 +135,10 @@ static HRESULT APIENTRY heap_allocate(HANDLE runtime, D3DDDICB_ALLOCATE *args) {
     if (!fail_allocate || partial_allocate) {
         args->pAllocationInfo->hAllocation = next_allocation++;
         kernel_heaps.emplace(args->pAllocationInfo->hAllocation, KernelHeap{data->iova, data->size, false, args->hResource});
+        if (args->hResource) {
+            if (!kernel_resources.insert(args->hResource).second) std::abort();
+            args->hKMResource = 73;
+        }
     }
     if (reset_allocate) ++generation;
     if (retire_allocate) {
@@ -143,12 +149,22 @@ static HRESULT APIENTRY heap_allocate(HANDLE runtime, D3DDDICB_ALLOCATE *args) {
 }
 static HRESULT APIENTRY heap_deallocate(HANDLE runtime, const D3DDDICB_DEALLOCATE *args) {
     valid_kernel_callback(runtime);
-    if (args->hResource || args->NumAllocations != 1 || !args->HandleList) std::abort();
-    auto found = kernel_heaps.find(*args->HandleList);
-    if (found == kernel_heaps.end() || found->second.locked) std::abort();
     ++deallocations;
     if (fail_deallocate) { --fail_deallocate; return DXGI_ERROR_WAS_STILL_DRAWING; }
-    kernel_heaps.erase(found);
+    if (args->hResource) {
+        if (args->NumAllocations || args->HandleList || !kernel_resources.erase(args->hResource)) std::abort();
+        for (auto found = kernel_heaps.begin(); found != kernel_heaps.end();) {
+            if (found->second.resource == args->hResource) {
+                if (found->second.locked) std::abort();
+                found = kernel_heaps.erase(found);
+            } else ++found;
+        }
+    } else {
+        if (args->NumAllocations != 1 || !args->HandleList) std::abort();
+        auto found = kernel_heaps.find(*args->HandleList);
+        if (found == kernel_heaps.end() || found->second.locked || found->second.resource) std::abort();
+        kernel_heaps.erase(found);
+    }
     return S_OK;
 }
 static HRESULT APIENTRY heap_lock(HANDLE runtime, D3DDDICB_LOCK *args) {
@@ -209,7 +225,9 @@ static int test_native_heaps() {
     a.fill(0xa5); b.fill(0xa5);
     D3D12DDI_HHEAP ha{}, hb{}; ha.pDrvPrivate = a.data(); hb.pDrvPrivate = b.data();
     auto allocate = [&](D3D12DDI_HHEAP heap) {
-        return table.pfnCreateHeapAndResource(create.hDrvDevice, &desc, heap, runtime_resource, nullptr, nullptr, {});
+        auto rt = runtime_resource;
+        if (heap.pDrvPrivate != ha.pDrvPrivate) rt.handle = nullptr;
+        return table.pfnCreateHeapAndResource(create.hDrvDevice, &desc, heap, rt, nullptr, nullptr, {});
     };
     auto destroy = [&](D3D12DDI_HHEAP heap) { table.pfnDestroyHeapAndResource(create.hDrvDevice, heap, {}); };
     REQUIRE(table.pfnCalcPrivateHeapAndResourceSizes(create.hDrvDevice, &desc, nullptr).Heap == sizeof(NativeHeapSlot));
@@ -249,7 +267,7 @@ static int test_native_heaps() {
     table.pfnUnmapHeap(create.hDrvDevice, ha); REQUIRE(unlocks == 1);
     rename_lock = false;
     destroy(ha); destroy(hb);
-    REQUIRE(kernel_heaps.empty() && !ctx->native_heaps);
+    REQUIRE(kernel_heaps.empty() && kernel_resources.empty() && !ctx->native_heaps);
     // Failed allocation must not publish a runtime slot; even a failed cleanup
     // keeps its GPUVA quarantined until device retirement retries deallocation.
     a.fill(0xa5);
@@ -261,7 +279,7 @@ static int test_native_heaps() {
     destroy(hb);
     REQUIRE(kernel_heaps.size() == 1);
     adapter.pfnDestroyDevice(create.hDrvDevice);
-    REQUIRE(kernel_heaps.empty() && heap_context_destroys == 1);
+    REQUIRE(kernel_heaps.empty() && kernel_resources.empty() && heap_context_destroys == 1);
     REQUIRE(adapter.pfnCloseAdapter(open.hAdapter) == S_OK);
 
     REQUIRE(OpenAdapter12(&open) == S_OK);
@@ -299,7 +317,7 @@ static int test_native_heaps() {
     for (auto byte : a) REQUIRE(byte == 0xa5);
     // The runtime owns remaining kernel objects after its device teardown.
     // No stale callback is allowed to clean them from a retired Context.
-    kernel_heaps.clear(); heap_callbacks_retired = retire_allocate = false;
+    kernel_heaps.clear(); kernel_resources.clear(); heap_callbacks_retired = retire_allocate = false;
     REQUIRE(adapter.pfnCloseAdapter(open.hAdapter) == S_OK);
     REQUIRE(OpenAdapter12(&open) == S_OK);
     REQUIRE(adapter.pfnCreateDevice(open.hAdapter, &create) == S_OK);
@@ -308,7 +326,7 @@ static int test_native_heaps() {
     mapping = reinterpret_cast<void *>(uintptr_t(1));
     REQUIRE(table.pfnMapHeap(create.hDrvDevice, ha, &mapping) == DXGI_ERROR_DEVICE_REMOVED && !mapping);
     REQUIRE(!context(create.hDrvDevice) && kernel_heaps.size() == 1 && kernel_heaps.begin()->second.locked);
-    kernel_heaps.clear(); heap_callbacks_retired = retire_lock = false;
+    kernel_heaps.clear(); kernel_resources.clear(); heap_callbacks_retired = retire_lock = false;
     REQUIRE(adapter.pfnCloseAdapter(open.hAdapter) == S_OK);
     REQUIRE(!native_contract_complete());
     std::printf("PASS native buffer heap runtime callbacks/KMT ownership/GPUVA/map/partial failure/reset/reentrant teardown (%zu-bit); resources and DDI versions remain unsupported\n", sizeof(void *) * 8);

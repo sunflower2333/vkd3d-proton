@@ -31,10 +31,11 @@ struct NativeHeap {
     NativeHeap *next = nullptr;
     void *slot = nullptr;
     D3DKMT_HANDLE allocation = 0;
+    HANDLE runtime_resource = nullptr;
     uint64_t address = 0, bytes = 0;
     void *mapped = nullptr;
     uint32_t map_count = 0;
-    bool cpu_visible = false, locked = false, pending = false;
+    bool cpu_visible = false, locked = false, pending = false, resource_created = false;
 };
 
 // One retained context and recursive lock cover every callback. A synchronous
@@ -110,13 +111,14 @@ HRESULT native_heap_cleanup(Context *ctx, NativeHeap *heap, bool retirement = fa
     heap->pending = true;
     HRESULT hr = native_heap_unlock(ctx, heap);
     // During normal operation DestroyDevice may have run inside UnlockCb.
-    if (SUCCEEDED(hr) && (retirement || !ctx->native_retiring) && heap->allocation) {
+    if (SUCCEEDED(hr) && (retirement || !ctx->native_retiring) && (heap->allocation || heap->resource_created)) {
         D3DDDICB_DEALLOCATE args{};
-        // Destroy by allocation, not hResource: a runtime resource may own more
-        // than this one allocation. Never assert AssumeNotInUse.
-        args.NumAllocations = 1; args.HandleList = &heap->allocation;
+        // This slice owns exactly one heap per runtime resource. Releasing only
+        // its allocation leaks the kernel resource (see DeallocateCb contract).
+        if (heap->resource_created) args.hResource = heap->runtime_resource;
+        else { args.NumAllocations = 1; args.HandleList = &heap->allocation; }
         hr = ctx->kernel_callbacks.pfnDeallocateCb(ctx->runtime_device.handle, &args);
-        if (SUCCEEDED(hr)) heap->allocation = 0;
+        if (SUCCEEDED(hr)) { heap->allocation = 0; heap->resource_created = false; }
     }
     heap->pending = false;
     return hr;
@@ -216,10 +218,14 @@ HRESULT APIENTRY native_heap_create(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATE
     if (FAILED(hr)) return hr;
     auto *ctx = op.ctx;
     if (!slot.pDrvPrivate || clear || resource_slot.pDrvPrivate || native_heap_find(ctx, slot.pDrvPrivate)) return E_INVALIDARG;
+    if (runtime_resource.handle)
+        for (auto *existing = ctx->native_heaps; existing; existing = existing->next)
+            if (existing->runtime_resource == runtime_resource.handle) return E_INVALIDARG;
     if (FAILED(hr = native_heap_generation(ctx)) || FAILED(hr = native_heap_open_context(ctx))) return hr;
     auto *heap = new (std::nothrow) NativeHeap;
     if (!heap) return E_OUTOFMEMORY;
     heap->bytes = args->ByteSize;
+    heap->slot = slot.pDrvPrivate; heap->runtime_resource = runtime_resource.handle;
     heap->cpu_visible = args->CPUPageProperty == D3D12DDI_CPU_PAGE_PROPERTY_WRITE_BACK;
     if (FAILED(hr = native_heap_reserve(ctx, heap))) { delete heap; return hr; }
     heap->pending = true;
@@ -233,14 +239,16 @@ HRESULT APIENTRY native_heap_create(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATE
     create.hResource = runtime_resource.handle; create.NumAllocations = 1; create.pAllocationInfo = &allocation;
     hr = ctx->kernel_callbacks.pfnAllocateCb(ctx->runtime_device.handle, &create);
     heap->allocation = allocation.hAllocation; heap->pending = false;
+    heap->resource_created = runtime_resource.handle && (SUCCEEDED(hr) || create.hKMResource || heap->allocation);
     if (!op.live()) hr = DXGI_ERROR_DEVICE_REMOVED;
     if (SUCCEEDED(hr) && !heap->allocation) hr = E_FAIL;
     if (SUCCEEDED(hr)) hr = native_heap_generation(ctx);
     if (FAILED(hr)) {
+        heap->slot = nullptr;
         if (op.live()) native_heap_cleanup(ctx, heap);
         // Retain an orphaned allocation and its VA when deallocation fails.
         // Runtime device destruction owns final kernel cleanup after retirement.
-        if (!heap->allocation) native_heap_erase(ctx, heap);
+        if (!heap->allocation && !heap->resource_created) native_heap_erase(ctx, heap);
         return hr;
     }
     heap->slot = slot.pDrvPrivate;
@@ -303,7 +311,7 @@ void APIENTRY native_heap_destroy(D3D12DDI_HDEVICE h, D3D12DDI_HHEAP slot, D3D12
     heap->slot = nullptr;
     std::memset(slot.pDrvPrivate, 0, sizeof(NativeHeapSlot));
     HRESULT hr = op.live() ? native_heap_cleanup(op.ctx, heap) : DXGI_ERROR_DEVICE_REMOVED;
-    if (!heap->allocation) native_heap_erase(op.ctx, heap);
+    if (!heap->allocation && !heap->resource_created) native_heap_erase(op.ctx, heap);
     error(op.ctx, hr);
 }
 
@@ -315,7 +323,7 @@ void native_heap_retire(Context *ctx) {
         if (heap->pending) { pending = true; continue; }
         HRESULT hr = native_heap_cleanup(ctx, heap, true);
         if (FAILED(hr)) ctx->last_error = hr;
-        pending |= heap->allocation != 0;
+        pending |= heap->allocation != 0 || heap->resource_created;
     }
     if (!pending && ctx->native_heap_context) {
         HRESULT hr = native_heap_close_context(ctx);
