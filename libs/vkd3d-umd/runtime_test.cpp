@@ -10,6 +10,8 @@
 #include <vector>
 #include <map>
 #include <set>
+#include <memory>
+#include <thread>
 
 static HRESULT backend_result = S_OK, query_result = S_OK;
 static unsigned loads, unloads, creates, destroys, query_calls, error_calls;
@@ -21,6 +23,22 @@ static uint64_t generation = 7;
 static D3D12DDI_HRTDEVICE last_runtime{};
 static const HANDLE expected_adapter = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(0x13570));
 static const std::array<uint8_t, 8> expected_luid{1,2,3,4,5,6,7,8};
+static void wait_backend_worker(const mwd_callbacks *callbacks, void *owner) {
+    HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!done) std::abort();
+    std::thread worker([=]() {
+        callbacks->status(owner);
+        uint32_t fence = 0;
+        callbacks->completed(owner, &fence);
+        SetEvent(done);
+    });
+    if (WaitForSingleObject(done, 2000) != WAIT_OBJECT_0) {
+        std::fprintf(stderr, "FAIL backend worker blocked by native callback lock\n");
+        std::abort();
+    }
+    worker.join(); CloseHandle(done);
+}
+struct TestDevice { const mwd_callbacks *callbacks; void *owner; };
 static HMODULE WINAPI test_load(LPCWSTR name, HANDLE, DWORD flags) {
     if (std::wcscmp(name, L"vulkan-1.dll") || flags != LOAD_LIBRARY_SEARCH_SYSTEM32) std::abort();
     ++loads;
@@ -36,12 +54,16 @@ static int32_t test_create(PFN_vkGetInstanceProcAddr loader, const uint8_t luid[
         const mwd_callbacks *callbacks, void *owner, vkdu_device **out) {
     if (!loader || std::memcmp(luid, expected_luid.data(), 8) || !owner || !mwd_callbacks_valid(callbacks)) std::abort();
     ++creates; *out = nullptr;
-    if (SUCCEEDED(backend_result)) *out = reinterpret_cast<vkdu_device *>(new unsigned(99));
+    if (SUCCEEDED(backend_result)) *out = reinterpret_cast<vkdu_device *>(new TestDevice{callbacks, owner});
     if (reset_during_create) ++generation;
     return backend_result;
 }
 static void test_destroy(vkdu_device *device) {
-    if (device) { ++destroys; delete reinterpret_cast<unsigned *>(device); }
+    if (device) {
+        auto *peer = reinterpret_cast<TestDevice *>(device);
+        wait_backend_worker(peer->callbacks, peer->owner);
+        ++destroys; delete peer;
+    }
 }
 static HRESULT APIENTRY test_query(HANDLE runtime, const D3DDDICB_QUERYADAPTERINFO *args) {
     if (runtime != expected_adapter || args->PrivateDriverDataSize != 160) std::abort();
@@ -64,14 +86,77 @@ static void APIENTRY test_error(D3D10DDI_HRTDEVICE runtime, HRESULT result) {
     if (retire_in_error) retire_in_error(error_device);
 }
 
+static int32_t test_import_heap(vkdu_device *, void *, void *, uint64_t, int, vkdu_object **);
+static int32_t test_place_buffer(vkdu_device *, vkdu_object *, uint64_t, uint64_t, uint32_t, vkdu_object **);
+static void test_object_destroy(vkdu_object *);
+static int test_object_is(vkdu_object *, vkdu_kind);
+static int test_object_belongs(vkdu_device *, vkdu_object *);
+static uint64_t test_buffer_address(vkdu_object *);
+static uint64_t test_buffer_size(vkdu_object *);
+
 #define LoadLibraryExW test_load
 #define GetProcAddress test_symbol
 #define FreeLibrary test_unload
 #define vkdu_device_create_shared test_create
 #define vkdu_device_destroy test_destroy
+#define vkdu_memory_heap_import test_import_heap
+#define vkdu_buffer_place test_place_buffer
+#define vkdu_object_destroy test_object_destroy
+#define vkdu_object_is test_object_is
+#define vkdu_object_belongs test_object_belongs
+#define vkdu_buffer_address test_buffer_address
+#define vkdu_buffer_size test_buffer_size
 #include "ddi.cpp"
 
 #define REQUIRE(x) do { if (!(x)) { std::fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #x); return 1; } } while (0)
+
+struct ImportOwner {
+    Context *context;
+    mwd_allocation allocation;
+    ~ImportOwner() { native_runtime_release(context, allocation.token); }
+};
+struct ImportPeer {
+    std::shared_ptr<ImportOwner> owner;
+    vkdu_device *device;
+    vkdu_kind kind;
+    uint64_t address, bytes;
+};
+static bool import_failure, placement_failure;
+static unsigned imports, placements;
+static int32_t test_import_heap(vkdu_device *device, void *owner, void *token, uint64_t size, int, vkdu_object **out) {
+    *out = nullptr; ++imports;
+    wait_backend_worker(&native_runtime_callbacks, owner);
+    if (import_failure) return E_OUTOFMEMORY;
+    mwd_allocation allocation{};
+    HRESULT hr = native_runtime_retain(owner, token, &allocation);
+    if (FAILED(hr)) return hr;
+    if (allocation.size != size) std::abort();
+    auto backing = std::make_shared<ImportOwner>();
+    backing->context = static_cast<Context *>(owner); backing->allocation = allocation;
+    *out = reinterpret_cast<vkdu_object *>(new ImportPeer{backing, device, VKDU_MEMORY_HEAP, allocation.address, size});
+    return S_OK;
+}
+static int32_t test_place_buffer(vkdu_device *device, vkdu_object *memory, uint64_t offset, uint64_t size, uint32_t, vkdu_object **out) {
+    *out = nullptr; ++placements;
+    if (placement_failure) return E_INVALIDARG;
+    auto *peer = reinterpret_cast<ImportPeer *>(memory);
+    if (peer->device != device || peer->kind != VKDU_MEMORY_HEAP || offset || size > peer->bytes) std::abort();
+    *out = reinterpret_cast<vkdu_object *>(new ImportPeer{peer->owner, device, VKDU_BUFFER, peer->address, size});
+    return S_OK;
+}
+static void test_object_destroy(vkdu_object *object) {
+    auto *peer = reinterpret_cast<ImportPeer *>(object);
+    if (peer) wait_backend_worker(&native_runtime_callbacks, peer->owner->context);
+    delete peer;
+}
+static int test_object_is(vkdu_object *object, vkdu_kind kind) {
+    return object && reinterpret_cast<ImportPeer *>(object)->kind == kind;
+}
+static int test_object_belongs(vkdu_device *device, vkdu_object *object) {
+    return object && reinterpret_cast<ImportPeer *>(object)->device == device;
+}
+static uint64_t test_buffer_address(vkdu_object *object) { return object ? reinterpret_cast<ImportPeer *>(object)->address : 0; }
+static uint64_t test_buffer_size(vkdu_object *object) { return object ? reinterpret_cast<ImportPeer *>(object)->bytes : 0; }
 
 struct KernelHeap { uint64_t address, bytes; bool locked; HANDLE resource; };
 static std::map<D3DKMT_HANDLE, KernelHeap> kernel_heaps;
@@ -376,6 +461,46 @@ static int test_native_heaps() {
     REQUIRE(OpenAdapter12(&open) == S_OK);
     REQUIRE(adapter.pfnCreateDevice(open.hAdapter, &create) == S_OK);
     ctx = context(create.hDrvDevice);
+    resource.ResourceType = D3D12DDI_RT_BUFFER; resource.Width = 4096;
+    resource.Height = resource.DepthOrArraySize = resource.MipLevels = resource.SampleDesc.Count = 1;
+    resource.Layout = D3D12DDI_TL_ROW_MAJOR;
+    resource.InitialResourceState = static_cast<D3D12DDI_RESOURCE_STATES>(0x400);
+    alignas(Object) std::array<unsigned char, sizeof(Object) + 8> resource_storage;
+    resource_storage.fill(0xa5);
+    D3D12DDI_HRESOURCE resource_handle{}; resource_handle.pDrvPrivate = resource_storage.data();
+    auto paired = [&]() {
+        return table.pfnCreateHeapAndResource(create.hDrvDevice, &desc, ha, {}, &resource, nullptr, resource_handle);
+    };
+    auto sizes = table.pfnCalcPrivateHeapAndResourceSizes(create.hDrvDevice, &desc, &resource);
+    REQUIRE(sizes.Heap == sizeof(NativeHeapSlot) && sizes.Resource == sizeof(Object));
+    unsigned before_pair = allocations;
+    REQUIRE(paired() == S_OK && allocations == before_pair + 1 && imports == 1 && placements == 1);
+    auto *paired_heap = native_heap_find(ctx, ha.pDrvPrivate);
+    REQUIRE(paired_heap && object(resource_handle.pDrvPrivate)->address == paired_heap->address && paired_heap->users == 2);
+    for (size_t i = sizeof(Object); i < resource_storage.size(); ++i) REQUIRE(resource_storage[i] == 0xa5);
+    // Destroying the heap slot cannot destroy the resource's imported backing.
+    destroy(ha);
+    REQUIRE(native_token(ctx, paired_heap) && paired_heap->users == 1 && kernel_heaps.size() == 1);
+    table.pfnDestroyHeapAndResource(create.hDrvDevice, {}, resource_handle);
+    REQUIRE(kernel_heaps.empty() && !ctx->native_heaps);
+    REQUIRE(paired() == S_OK);
+    table.pfnDestroyHeapAndResource(create.hDrvDevice, ha, resource_handle);
+    REQUIRE(kernel_heaps.empty() && !ctx->native_heaps);
+    // Both import failure and placement failure unwind their actual owners.
+    resource_storage.fill(0xa5); a.fill(0xa5); import_failure = true;
+    REQUIRE(paired() == E_OUTOFMEMORY && kernel_heaps.empty() && !ctx->native_heaps);
+    import_failure = false; placement_failure = true;
+    REQUIRE(paired() == E_INVALIDARG && kernel_heaps.empty() && !ctx->native_heaps);
+    placement_failure = false;
+    for (auto byte : resource_storage) REQUIRE(byte == 0xa5);
+    for (auto byte : a) REQUIRE(byte == 0xa5);
+    resource.ReuseBufferGPUVA.BaseAddress.UMD.Offset = 65536;
+    before_pair = allocations;
+    REQUIRE(paired() == DXGI_ERROR_UNSUPPORTED && allocations == before_pair);
+    resource.ReuseBufferGPUVA = {};
+    resource.Width = desc.ByteSize + 1;
+    REQUIRE(paired() == DXGI_ERROR_UNSUPPORTED && allocations == before_pair);
+    resource.Width = 4096;
     REQUIRE(allocate(hb) == S_OK);
     auto *token = native_heap_find(ctx, hb.pDrvPrivate);
     const unsigned allocation_count = allocations;

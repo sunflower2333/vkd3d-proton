@@ -56,6 +56,15 @@ struct NativeHeapOperation {
     bool live() const { return ctx && !ctx->native_retiring && ctx->runtime_device.handle && ctx->native_adapter; }
 };
 
+// Vulkan can wait for queue workers which enter the runtime callback lock.
+// Keep the operation's Context reference, but never that lock across a call
+// into Vulkan or a backend destructor.
+struct NativeBackendCall {
+    Context *ctx;
+    explicit NativeBackendCall(Context *value) : ctx(value) { ctx->error_mutex.unlock(); }
+    ~NativeBackendCall() { ctx->error_mutex.lock(); }
+};
+
 NativeAbiHeader native_header(uint32_t size) { return {0x504d5644, 0, size, 0}; }
 bool native_header_valid(const NativeAbiHeader &h, uint32_t size) {
     return h.magic == 0x504d5644 && !h.version && h.size == size && !h.reserved;
@@ -274,10 +283,14 @@ HRESULT APIENTRY native_heap_create(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATE
     if (SUCCEEDED(hr)) hr = native_heap_generation(ctx);
     if (SUCCEEDED(hr) && resource) {
         vkdu_object *memory = nullptr, *buffer = nullptr;
-        hr = vkdu_memory_heap_import(ctx->backend, ctx, heap, heap->bytes, heap->cpu_visible, &memory);
-        if (SUCCEEDED(hr)) hr = vkdu_buffer_place(ctx->backend, memory, 0, resource->Width,
-                                                   static_cast<uint32_t>(resource->InitialResourceState), &buffer);
-        vkdu_object_destroy(memory);
+        heap->slot = nullptr; // No native slot is published while Vulkan imports.
+        {
+            NativeBackendCall backend_call(ctx);
+            hr = vkdu_memory_heap_import(ctx->backend, ctx, heap, heap->bytes, heap->cpu_visible, &memory);
+            if (SUCCEEDED(hr)) hr = vkdu_buffer_place(ctx->backend, memory, 0, resource->Width,
+                                                       static_cast<uint32_t>(resource->InitialResourceState), &buffer);
+            vkdu_object_destroy(memory);
+        }
         if (SUCCEEDED(hr)) hr = native_heap_generation(ctx);
         if (SUCCEEDED(hr) && (!op.live() || vkdu_buffer_address(buffer) != heap->address))
             hr = DXGI_ERROR_DEVICE_REMOVED;
@@ -285,7 +298,10 @@ HRESULT APIENTRY native_heap_create(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATE
             hr = bind(ctx, resource_slot.pDrvPrivate, buffer, VKDU_BUFFER);
             if (SUCCEEDED(hr)) object(resource_slot.pDrvPrivate)->native_heap = heap;
         }
-        if (FAILED(hr)) vkdu_object_destroy(buffer);
+        if (FAILED(hr)) {
+            NativeBackendCall backend_call(ctx);
+            vkdu_object_destroy(buffer);
+        }
     }
     if (FAILED(hr)) {
         heap->slot = nullptr;
@@ -363,7 +379,11 @@ void APIENTRY native_heap_destroy(D3D12DDI_HDEVICE h, D3D12DDI_HHEAP slot, D3D12
         // The placed backend resource releases its imported BO before the
         // runtime heap owner is released. Separate resource destruction leaves
         // any still-live native heap slot intact.
-        VioGpuD3D12BridgeUnbindObject(resource.pDrvPrivate);
+        {
+            NativeBackendCall backend_call(op.ctx);
+            VioGpuD3D12BridgeUnbindObject(resource.pDrvPrivate);
+        }
+        heap = native_heap_find(op.ctx, slot.pDrvPrivate);
         if (!slot.pDrvPrivate) return;
     }
     if (!heap || heap->pending) { error(op.ctx, E_INVALIDARG); return; }
