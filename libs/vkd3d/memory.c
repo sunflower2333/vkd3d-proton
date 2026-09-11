@@ -1298,7 +1298,8 @@ static bool vkd3d_is_imported_allocation(const struct vkd3d_allocate_memory_info
 
     while (next)
     {
-        if (next->sType == VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR)
+        if (next->sType == VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR ||
+                next->sType == MWD_STYPE_IMPORT)
             return true;
 
         next = next->pNext;
@@ -2256,6 +2257,7 @@ HRESULT vkd3d_allocate_heap_memory(struct d3d12_device *device, struct vkd3d_mem
     alloc_info.heap_properties = info->heap_desc.Properties;
     alloc_info.heap_flags = info->heap_desc.Flags;
     alloc_info.host_ptr = info->host_ptr;
+    alloc_info.pNext = info->pNext;
     alloc_info.vk_memory_priority = info->vk_memory_priority;
     alloc_info.explicit_global_buffer_usage = info->explicit_global_buffer_usage;
 
@@ -2308,7 +2310,7 @@ HRESULT vkd3d_allocate_heap_memory(struct d3d12_device *device, struct vkd3d_mem
                 VK_OBJECT_TYPE_DEVICE_MEMORY, name_buffer);
     }
 
-    if (hr == E_OUTOFMEMORY && vkd3d_heap_allocation_accept_deferred_resource_placements(device,
+    if (hr == E_OUTOFMEMORY && !info->pNext && vkd3d_heap_allocation_accept_deferred_resource_placements(device,
             &info->heap_desc.Properties, info->heap_desc.Flags))
     {
         /* It's okay and sometimes expected that we fail here.

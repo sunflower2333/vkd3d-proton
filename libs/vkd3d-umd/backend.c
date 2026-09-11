@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #define COBJMACROS
 #include "vkd3d.h"
+#include "vkd3d_wddm.h"
 #include "backend.h"
 #include <stdlib.h>
 #include <string.h>
@@ -42,7 +43,8 @@ static int32_t wrap(vkdu_device *device, enum vkdu_kind kind, HRESULT hr, IUnkno
     return S_OK;
 }
 
-static int32_t create_device(PFN_vkGetInstanceProcAddr loader, const struct vkdu_adapter *adapter, int test_cpu, int runtime_identity, vkdu_device **out)
+static int32_t create_device(PFN_vkGetInstanceProcAddr loader, const struct vkdu_adapter *adapter, int test_cpu,
+        int runtime_identity, const struct mwd_device_create_info *runtime, vkdu_device **out)
 {
     struct vkd3d_instance_create_info instance_info = {0};
     struct vkd3d_device_create_info device_info = {0};
@@ -87,7 +89,8 @@ static int32_t create_device(PFN_vkGetInstanceProcAddr loader, const struct vkdu
     device_info.minimum_feature_level = D3D_FEATURE_LEVEL_11_0;
     device_info.independent = true;
     if (adapter) memcpy(&device_info.adapter_luid, adapter->luid, 8);
-    hr = vkd3d_create_device(&device_info, &IID_ID3D12Device, (void **)&device->object);
+    hr = runtime ? vkd3d_create_device_wddm(&device_info, runtime, &IID_ID3D12Device, (void **)&device->object) :
+                   vkd3d_create_device(&device_info, &IID_ID3D12Device, (void **)&device->object);
     if (SUCCEEDED(hr) && vkd3d_get_vk_physical_device(device->object) != selected) {
         ID3D12Device_Release(device->object); device->object = NULL; hr = DXGI_ERROR_NOT_FOUND;
     }
@@ -99,7 +102,7 @@ done:
 }
 
 int32_t vkdu_device_create(PFN_vkGetInstanceProcAddr loader, const struct vkdu_adapter *adapter, vkdu_device **out)
-{ return create_device(loader, adapter, 0, 0, out); }
+{ return create_device(loader, adapter, 0, 0, NULL, out); }
 int32_t vkdu_device_create_runtime(PFN_vkGetInstanceProcAddr loader, const uint8_t luid[8], vkdu_device **out)
 {
     struct vkdu_adapter adapter = {0};
@@ -107,11 +110,22 @@ int32_t vkdu_device_create_runtime(PFN_vkGetInstanceProcAddr loader, const uint8
     if (out) *out = NULL;
     if (!luid || !memcmp(luid, zero_luid, sizeof(zero_luid))) return E_INVALIDARG;
     memcpy(adapter.luid, luid, sizeof(adapter.luid));
-    return create_device(loader, &adapter, 0, 1, out);
+    return create_device(loader, &adapter, 0, 1, NULL, out);
+}
+int32_t vkdu_device_create_shared(PFN_vkGetInstanceProcAddr loader, const uint8_t luid[8],
+        const struct mwd_callbacks *callbacks, void *owner, vkdu_device **out)
+{
+    struct vkdu_adapter adapter = {0};
+    struct mwd_device_create_info runtime = {MWD_STYPE_DEVICE, NULL, callbacks, owner};
+    static const uint8_t zero[8] = {0};
+    if (out) *out = NULL;
+    if (!luid || !memcmp(luid, zero, 8) || !owner || !mwd_callbacks_valid(callbacks)) return E_INVALIDARG;
+    memcpy(adapter.luid, luid, 8);
+    return create_device(loader, &adapter, 0, 1, &runtime, out);
 }
 #ifdef VKDU_ENABLE_TEST_DEVICE
 int32_t vkdu_test_device_create(PFN_vkGetInstanceProcAddr loader, vkdu_device **out)
-{ return create_device(loader, NULL, 1, 0, out); }
+{ return create_device(loader, NULL, 1, 0, NULL, out); }
 #endif
 void vkdu_device_destroy(vkdu_device *device)
 { if (device) { ID3D12Device_Release(device->object); free(device); } }
@@ -122,6 +136,48 @@ void vkdu_object_destroy(vkdu_object *object)
 int vkdu_object_is(vkdu_object *object, enum vkdu_kind kind) { return VALID(object, kind); }
 int vkdu_same_device(vkdu_object *a, vkdu_object *b) { return a && b && a->owner == b->owner; }
 int vkdu_object_belongs(vkdu_device *device, vkdu_object *object) { return device && object && device->object == object->owner; }
+
+int32_t vkdu_memory_heap_import(vkdu_device *device, void *owner, void *token, uint64_t bytes,
+        int cpu_visible, vkdu_object **out)
+{
+    D3D12_HEAP_DESC desc = {0};
+    ID3D12Heap *heap = NULL;
+    HRESULT hr;
+    if (!out) return E_POINTER;
+    *out = NULL;
+    if (!device || !owner || !token || !bytes || bytes % 65536) return E_INVALIDARG;
+    desc.SizeInBytes = bytes; desc.Alignment = 65536;
+    desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+    desc.Properties.CreationNodeMask = desc.Properties.VisibleNodeMask = 1;
+    desc.Properties.Type = cpu_visible ? D3D12_HEAP_TYPE_READBACK : D3D12_HEAP_TYPE_DEFAULT;
+    hr = vkd3d_create_heap_wddm(device->object, &desc, owner, token, &heap);
+    hr = wrap(device, VKDU_MEMORY_HEAP, hr, (IUnknown *)heap, out);
+    if (SUCCEEDED(hr)) { (*out)->bytes = bytes; (*out)->heap_type = desc.Properties.Type; }
+    return hr;
+}
+
+int32_t vkdu_buffer_place(vkdu_device *device, vkdu_object *heap, uint64_t offset,
+        uint64_t bytes, uint32_t state, vkdu_object **out)
+{
+    D3D12_RESOURCE_DESC desc = {0};
+    ID3D12Resource *resource = NULL;
+    HRESULT hr;
+    if (!out) return E_POINTER;
+    *out = NULL;
+    if (!device || !VALID(heap, VKDU_MEMORY_HEAP) || heap->owner != device->object || !bytes ||
+            offset % 65536 || offset > heap->bytes || bytes > heap->bytes - offset ||
+            (state != D3D12_RESOURCE_STATE_COMMON && state != D3D12_RESOURCE_STATE_COPY_SOURCE &&
+             state != D3D12_RESOURCE_STATE_COPY_DEST) ||
+            (heap->heap_type == D3D12_HEAP_TYPE_READBACK && state != D3D12_RESOURCE_STATE_COPY_DEST)) return E_INVALIDARG;
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; desc.Width = bytes;
+    desc.Height = desc.DepthOrArraySize = desc.MipLevels = desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    hr = ID3D12Device_CreatePlacedResource(device->object, OBJ(ID3D12Heap, heap), offset, &desc, state, NULL,
+                                            &IID_ID3D12Resource, (void **)&resource);
+    hr = wrap(device, VKDU_BUFFER, hr, (IUnknown *)resource, out);
+    if (SUCCEEDED(hr)) { (*out)->bytes = bytes; (*out)->heap_type = heap->heap_type; }
+    return hr;
+}
 
 int32_t vkdu_buffer_create(vkdu_device *device, uint64_t bytes, uint32_t heap_type, uint32_t flags, uint32_t state, vkdu_object **out)
 {

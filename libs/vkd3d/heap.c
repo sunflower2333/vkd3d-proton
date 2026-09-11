@@ -300,7 +300,7 @@ static HRESULT validate_heap_desc(struct d3d12_device *device, const D3D12_HEAP_
 }
 
 static HRESULT d3d12_heap_init(struct d3d12_heap *heap, struct d3d12_device *device,
-        const D3D12_HEAP_DESC *desc, void* host_address)
+        const D3D12_HEAP_DESC *desc, void* host_address, const struct mwd_import_memory_info *runtime_import)
 {
     struct vkd3d_allocate_heap_memory_info alloc_info;
     HRESULT hr;
@@ -329,6 +329,7 @@ static HRESULT d3d12_heap_init(struct d3d12_heap *heap, struct d3d12_device *dev
     memset(&alloc_info, 0, sizeof(alloc_info));
     alloc_info.heap_desc = heap->desc;
     alloc_info.host_ptr = host_address;
+    alloc_info.pNext = runtime_import;
 
     if ((alloc_info.heap_desc.Flags & D3D12_HEAP_FLAG_DENY_BUFFERS) &&
         d3d12_device_allow_image_heap_suballocation(device))
@@ -412,7 +413,7 @@ HRESULT d3d12_heap_create(struct d3d12_device *device, const D3D12_HEAP_DESC *de
     if (!(object = vkd3d_malloc(sizeof(*object))))
         return E_OUTOFMEMORY;
 
-    if (FAILED(hr = d3d12_heap_init(object, device, desc, host_address)))
+    if (FAILED(hr = d3d12_heap_init(object, device, desc, host_address, NULL)))
     {
         vkd3d_free(object);
         return hr;
@@ -421,5 +422,27 @@ HRESULT d3d12_heap_create(struct d3d12_device *device, const D3D12_HEAP_DESC *de
     TRACE("Created heap %p.\n", object);
 
     *heap = object;
+    return S_OK;
+}
+
+HRESULT vkd3d_create_heap_wddm(ID3D12Device *iface, const D3D12_HEAP_DESC *desc,
+        void *owner, void *token, ID3D12Heap **heap)
+{
+    struct d3d12_device *device = impl_from_ID3D12Device((d3d12_device_iface *)iface);
+    struct mwd_import_memory_info import = {MWD_STYPE_IMPORT, NULL, owner, token};
+    struct d3d12_heap *object;
+    HRESULT hr;
+    if (!heap) return E_POINTER;
+    *heap = NULL;
+    if (!device || !owner || device->wddm_runtime_owner != owner || !token || !desc ||
+            desc->Flags != D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS || !desc->SizeInBytes ||
+            desc->Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) return E_INVALIDARG;
+    if (!(object = vkd3d_malloc(sizeof(*object)))) return E_OUTOFMEMORY;
+    if (FAILED(hr = d3d12_heap_init(object, device, desc, NULL, &import)))
+    {
+        vkd3d_free(object);
+        return hr;
+    }
+    *heap = (ID3D12Heap *)&object->ID3D12Heap_iface;
     return S_OK;
 }

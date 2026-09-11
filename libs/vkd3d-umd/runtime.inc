@@ -137,6 +137,8 @@ HRESULT native_load_vulkan(HMODULE *module, PFN_vkGetInstanceProcAddr *loader) {
     return S_OK;
 }
 
+#include "native_heap.inc"
+
 HRESULT APIENTRY native_create_device(D3D12DDI_HADAPTER handle, const D3D12DDIARG_CREATEDEVICE_0003 *args) {
     auto adapter = native_adapter(handle);
     if (!adapter || !args || !args->hDrvDevice.pDrvPrivate || !args->hRTDevice.handle ||
@@ -152,12 +154,21 @@ HRESULT APIENTRY native_create_device(D3D12DDI_HADAPTER handle, const D3D12DDIAR
     if (!ctx) return E_OUTOFMEMORY;
     PFN_vkGetInstanceProcAddr loader = nullptr;
     hr = native_load_vulkan(&ctx->vulkan_module, &loader);
-    if (SUCCEEDED(hr)) hr = vkdu_device_create_runtime(loader, adapter->luid.data(), &ctx->backend);
+    ctx->native_adapter = adapter;
+    ctx->runtime_device = args->hRTDevice;
+    ctx->kernel_callbacks = *args->pKTCallbacks;
+    ctx->runtime_callbacks = *args->p12UMCallbacks;
+    if (SUCCEEDED(hr)) hr = vkdu_device_create_shared(loader, adapter->luid.data(), &native_runtime_callbacks, ctx, &ctx->backend);
     // Backend creation may race a KMD reset; revalidate before publishing state.
     if (SUCCEEDED(hr)) hr = native_query_identity(*adapter, current_luid, current_generation);
     if (SUCCEEDED(hr) && (current_luid != adapter->luid || current_generation != adapter->generation))
         hr = DXGI_ERROR_DEVICE_REMOVED;
-    if (FAILED(hr)) { release(ctx); return hr; }
+    if (FAILED(hr)) {
+        ctx->native_retiring = true;
+        native_heap_retire(ctx);
+        ctx->runtime_device = {}; ctx->kernel_callbacks = {};
+        release(ctx); return hr;
+    }
     ctx->native_adapter = std::move(adapter);
     ctx->runtime_device = args->hRTDevice;
     ctx->kernel_callbacks = *args->pKTCallbacks;
@@ -188,8 +199,6 @@ void APIENTRY native_destroy_device(D3D12DDI_HDEVICE handle) {
     slot->context = nullptr; slot->magic = 0;
     release(ctx);
 }
-
-#include "native_heap.inc"
 
 HRESULT APIENTRY native_close_adapter(D3D12DDI_HADAPTER handle) {
     std::lock_guard<std::mutex> lock(native_adapters_lock);

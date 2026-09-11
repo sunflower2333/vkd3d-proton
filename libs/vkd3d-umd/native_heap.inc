@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 /* Included inside runtime.inc's anonymous namespace. This is a native KMD
- * heap owner, NOT a Vulkan resource-import path or WDDM2 GPUVA mapping DDI. */
+ * heap owner and shared Turnip allocation domain. Not a WDDM2 GPUVA DDI. */
 
 // Exact packed v0 subset of viogpu/shared/viogpu_wddm_abi.h. No host pointers.
 #pragma pack(push, 4)
@@ -35,6 +35,8 @@ struct NativeHeap {
     uint64_t address = 0, bytes = 0;
     void *mapped = nullptr;
     uint32_t map_count = 0;
+    uint32_t users = 1, flags = 4;
+    uint64_t alignment = native_heap_alignment;
     bool cpu_visible = false, locked = false, pending = false, resource_created = false;
 };
 
@@ -43,11 +45,13 @@ struct NativeHeap {
 // native_retiring after each callback and never use retired callback handles.
 struct NativeHeapOperation {
     Context *ctx;
+    bool retained;
     explicit NativeHeapOperation(Context *value) : ctx(value) {
-        if (ctx) { ++ctx->references; ctx->error_mutex.lock(); }
+        retained = ctx && !ctx->finalizing;
+        if (ctx) { if (retained) ++ctx->references; ctx->error_mutex.lock(); }
     }
     ~NativeHeapOperation() {
-        if (ctx) { ctx->error_mutex.unlock(); release(ctx); }
+        if (ctx) { ctx->error_mutex.unlock(); if (retained) release(ctx); }
     }
     bool live() const { return ctx && !ctx->native_retiring && ctx->runtime_device.handle && ctx->native_adapter; }
 };
@@ -70,9 +74,6 @@ HRESULT native_heap_generation(Context *ctx) {
 
 HRESULT native_heap_desc(const D3D12DDIARG_CREATEHEAP_0001 *heap,
         const D3D12DDIARG_CREATERESOURCE_0003 *resource) {
-    // Turnip WDDM has no runtime-allocation import contract. Never create a
-    // second Vulkan backing and report it as a resource on this native heap.
-    if (resource) return DXGI_ERROR_UNSUPPORTED;
     if (!heap || !heap->ByteSize || heap->ByteSize % native_heap_alignment ||
             heap->ByteSize > (UINT32_MAX & ~uint64_t(4095)) ||
             (heap->Alignment && heap->Alignment != native_heap_alignment) ||
@@ -80,6 +81,18 @@ HRESULT native_heap_desc(const D3D12DDIARG_CREATEHEAP_0001 *heap,
     if (heap->Flags != D3D12DDI_HEAP_FLAG_BUFFERS || heap->MemoryPool != D3D12DDI_MEMORY_POOL_L0 ||
             (heap->CPUPageProperty != D3D12DDI_CPU_PAGE_PROPERTY_NOT_AVAILABLE &&
              heap->CPUPageProperty != D3D12DDI_CPU_PAGE_PROPERTY_WRITE_BACK)) return DXGI_ERROR_UNSUPPORTED;
+    if (resource) {
+        D3D12DDIARG_BUFFER_PLACEMENT no_reuse{};
+        if (resource->ResourceType != D3D12DDI_RT_BUFFER || !resource->Width || resource->Width > heap->ByteSize ||
+                resource->Height != 1 || resource->DepthOrArraySize != 1 || resource->MipLevels != 1 ||
+                resource->Format != DXGI_FORMAT_UNKNOWN || resource->SampleDesc.Count != 1 || resource->SampleDesc.Quality ||
+                resource->Layout != D3D12DDI_TL_ROW_MAJOR || resource->Flags || resource->pRowMajorLayout ||
+                std::memcmp(&resource->ReuseBufferGPUVA, &no_reuse, sizeof(no_reuse))) return DXGI_ERROR_UNSUPPORTED;
+        const uint32_t state = static_cast<uint32_t>(resource->InitialResourceState);
+        if (state != 0 && state != 0x400 && state != 0x800) return DXGI_ERROR_UNSUPPORTED;
+        if (heap->CPUPageProperty == D3D12DDI_CPU_PAGE_PROPERTY_WRITE_BACK && state != 0x400)
+            return DXGI_ERROR_UNSUPPORTED;
+    }
     return S_OK;
 }
 
@@ -132,6 +145,9 @@ HRESULT native_heap_close_context(Context *ctx) {
     if (SUCCEEDED(hr)) {
         ctx->native_heap_context = nullptr;
         ctx->native_va_start = ctx->native_va_size = 0; ctx->native_context_id = 0;
+        ctx->native_queue_id = 0;
+        ctx->native_commands = nullptr; ctx->native_allocation_list = nullptr; ctx->native_patch_list = nullptr;
+        ctx->native_command_capacity = ctx->native_allocation_capacity = ctx->native_patch_capacity = 0;
     }
     return hr;
 }
@@ -175,6 +191,10 @@ HRESULT native_heap_open_context(Context *ctx) {
     if (SUCCEEDED(hr)) {
         ctx->native_va_start = info.va_start; ctx->native_va_size = info.va_size;
         ctx->native_context_id = info.context_id;
+        ctx->native_queue_id = info.queue_id;
+        ctx->native_commands = args.pCommandBuffer; ctx->native_command_capacity = args.CommandBufferSize;
+        ctx->native_allocation_list = args.pAllocationList; ctx->native_allocation_capacity = args.AllocationListSize;
+        ctx->native_patch_list = args.pPatchLocationList; ctx->native_patch_capacity = args.PatchLocationListSize;
     } else if (!ctx->native_retiring && ctx->native_heap_context) {
         // Keep ownership if cleanup fails, and retry before opening another.
         native_heap_close_context(ctx);
@@ -183,15 +203,17 @@ HRESULT native_heap_open_context(Context *ctx) {
     return hr;
 }
 
-HRESULT native_heap_reserve(Context *ctx, NativeHeap *heap) {
+HRESULT native_heap_reserve(Context *ctx, NativeHeap *heap, uint64_t requested = 0) {
     uint64_t cursor = ctx->native_va_start;
     const uint64_t end = cursor + ctx->native_va_size;
     auto **position = &ctx->native_heaps;
     while (true) {
-        if (cursor > UINT64_MAX - (native_heap_alignment - 1)) return E_OUTOFMEMORY;
-        cursor = (cursor + native_heap_alignment - 1) & ~(native_heap_alignment - 1);
+        if (cursor > UINT64_MAX - (heap->alignment - 1)) return E_OUTOFMEMORY;
+        cursor = (cursor + heap->alignment - 1) & ~(heap->alignment - 1);
         const uint64_t limit = *position ? (*position)->address : end;
-        if (cursor <= limit && heap->bytes <= limit - cursor) break;
+        if (requested && requested >= cursor && requested <= limit) cursor = requested;
+        if ((!requested || requested == cursor) && cursor <= limit && heap->bytes <= limit - cursor) break;
+        if (requested && requested < limit) return E_OUTOFMEMORY;
         if (!*position) return E_OUTOFMEMORY;
         cursor = (*position)->address + (*position)->bytes;
         position = &(*position)->next;
@@ -204,7 +226,10 @@ D3D12DDI_HEAP_AND_RESOURCE_SIZES APIENTRY native_heap_sizes(D3D12DDI_HDEVICE h,
         const D3D12DDIARG_CREATEHEAP_0001 *heap, const D3D12DDIARG_CREATERESOURCE_0003 *resource) {
     NativeHeapOperation op(context(h));
     D3D12DDI_HEAP_AND_RESOURCE_SIZES sizes{};
-    if (op.live() && SUCCEEDED(native_heap_desc(heap, resource))) sizes.Heap = sizeof(NativeHeapSlot);
+    if (op.live() && SUCCEEDED(native_heap_desc(heap, resource))) {
+        sizes.Heap = sizeof(NativeHeapSlot);
+        if (resource) sizes.Resource = sizeof(Object);
+    }
     return sizes;
 }
 
@@ -217,7 +242,8 @@ HRESULT APIENTRY native_heap_create(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATE
     HRESULT hr = native_heap_desc(args, resource);
     if (FAILED(hr)) return hr;
     auto *ctx = op.ctx;
-    if (!slot.pDrvPrivate || clear || resource_slot.pDrvPrivate || native_heap_find(ctx, slot.pDrvPrivate)) return E_INVALIDARG;
+    if (!slot.pDrvPrivate || clear || (resource != nullptr) != (resource_slot.pDrvPrivate != nullptr) ||
+            native_heap_find(ctx, slot.pDrvPrivate)) return E_INVALIDARG;
     if (runtime_resource.handle)
         for (auto *existing = ctx->native_heaps; existing; existing = existing->next)
             if (existing->runtime_resource == runtime_resource.handle) return E_INVALIDARG;
@@ -227,12 +253,15 @@ HRESULT APIENTRY native_heap_create(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATE
     heap->bytes = args->ByteSize;
     heap->slot = slot.pDrvPrivate; heap->runtime_resource = runtime_resource.handle;
     heap->cpu_visible = args->CPUPageProperty == D3D12DDI_CPU_PAGE_PROPERTY_WRITE_BACK;
+    // Turnip's coherent Vulkan memory types are CPU visible even when the
+    // native D3D heap prohibits MapHeap. Keep the DDI permission separate.
+    heap->flags = 6;
     if (FAILED(hr = native_heap_reserve(ctx, heap))) { delete heap; return hr; }
     heap->pending = true;
     NativeAllocationInfo data{};
     data.header = native_header(sizeof(data)); data.size = heap->bytes; data.alignment = 4096;
     data.iova = heap->address; data.generation = ctx->native_adapter->generation;
-    data.flags = 4 | (heap->cpu_visible ? 2 : 0); data.context_id = ctx->native_context_id;
+    data.flags = heap->flags; data.context_id = ctx->native_context_id;
     D3DDDI_ALLOCATIONINFO allocation{};
     allocation.pPrivateDriverData = &data; allocation.PrivateDriverDataSize = sizeof(data);
     D3DDDICB_ALLOCATE create{};
@@ -243,6 +272,21 @@ HRESULT APIENTRY native_heap_create(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATE
     if (!op.live()) hr = DXGI_ERROR_DEVICE_REMOVED;
     if (SUCCEEDED(hr) && !heap->allocation) hr = E_FAIL;
     if (SUCCEEDED(hr)) hr = native_heap_generation(ctx);
+    if (SUCCEEDED(hr) && resource) {
+        vkdu_object *memory = nullptr, *buffer = nullptr;
+        hr = vkdu_memory_heap_import(ctx->backend, ctx, heap, heap->bytes, heap->cpu_visible, &memory);
+        if (SUCCEEDED(hr)) hr = vkdu_buffer_place(ctx->backend, memory, 0, resource->Width,
+                                                   static_cast<uint32_t>(resource->InitialResourceState), &buffer);
+        vkdu_object_destroy(memory);
+        if (SUCCEEDED(hr)) hr = native_heap_generation(ctx);
+        if (SUCCEEDED(hr) && (!op.live() || vkdu_buffer_address(buffer) != heap->address))
+            hr = DXGI_ERROR_DEVICE_REMOVED;
+        if (SUCCEEDED(hr)) {
+            hr = bind(ctx, resource_slot.pDrvPrivate, buffer, VKDU_BUFFER);
+            if (SUCCEEDED(hr)) object(resource_slot.pDrvPrivate)->native_heap = heap;
+        }
+        if (FAILED(hr)) vkdu_object_destroy(buffer);
+    }
     if (FAILED(hr)) {
         heap->slot = nullptr;
         if (op.live()) native_heap_cleanup(ctx, heap);
@@ -256,14 +300,13 @@ HRESULT APIENTRY native_heap_create(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATE
     return S_OK;
 }
 
-HRESULT APIENTRY native_heap_map(D3D12DDI_HDEVICE h, D3D12DDI_HHEAP slot, void **out) {
+HRESULT native_heap_map_record(Context *value, NativeHeap *heap, void **out) {
     if (!out) return E_POINTER;
     *out = nullptr;
-    NativeHeapOperation op(context(h));
+    NativeHeapOperation op(value);
     if (!op.live()) return DXGI_ERROR_DEVICE_REMOVED;
     auto *ctx = op.ctx;
-    auto *heap = native_heap_find(ctx, slot.pDrvPrivate);
-    if (!heap || !heap->cpu_visible || heap->pending || !heap->allocation) return E_INVALIDARG;
+    if (!heap || !(heap->flags & 2) || heap->pending || !heap->allocation) return E_INVALIDARG;
     HRESULT hr = native_heap_generation(ctx);
     if (FAILED(hr)) return hr;
     if (heap->map_count == UINT32_MAX) return E_INVALIDARG;
@@ -290,6 +333,12 @@ HRESULT APIENTRY native_heap_map(D3D12DDI_HDEVICE h, D3D12DDI_HHEAP slot, void *
     return S_OK;
 }
 
+HRESULT APIENTRY native_heap_map(D3D12DDI_HDEVICE h, D3D12DDI_HHEAP slot, void **out) {
+    NativeHeapOperation op(context(h));
+    auto *heap = op.ctx ? native_heap_find(op.ctx, slot.pDrvPrivate) : nullptr;
+    return native_heap_map_record(op.ctx, heap && heap->cpu_visible ? heap : nullptr, out);
+}
+
 void APIENTRY native_heap_unmap(D3D12DDI_HDEVICE h, D3D12DDI_HHEAP slot) {
     NativeHeapOperation op(context(h));
     if (!op.live()) return;
@@ -306,10 +355,22 @@ void APIENTRY native_heap_destroy(D3D12DDI_HDEVICE h, D3D12DDI_HHEAP slot, D3D12
     NativeHeapOperation op(context(h));
     if (!op.ctx) return;
     auto *heap = native_heap_find(op.ctx, slot.pDrvPrivate);
-    if (!heap || resource.pDrvPrivate || heap->pending) { error(op.ctx, E_INVALIDARG); return; }
+    if (resource.pDrvPrivate) {
+        auto *obj = object(resource.pDrvPrivate);
+        if (!obj || obj->context != op.ctx || !obj->native_heap || (heap && obj->native_heap != heap)) {
+            error(op.ctx, E_INVALIDARG); return;
+        }
+        // The placed backend resource releases its imported BO before the
+        // runtime heap owner is released. Separate resource destruction leaves
+        // any still-live native heap slot intact.
+        VioGpuD3D12BridgeUnbindObject(resource.pDrvPrivate);
+        if (!slot.pDrvPrivate) return;
+    }
+    if (!heap || heap->pending) { error(op.ctx, E_INVALIDARG); return; }
     // Runtime memory expires on return, even when kernel cleanup fails.
     heap->slot = nullptr;
     std::memset(slot.pDrvPrivate, 0, sizeof(NativeHeapSlot));
+    if (heap->users > 1) { --heap->users; return; }
     HRESULT hr = op.live() ? native_heap_cleanup(op.ctx, heap) : DXGI_ERROR_DEVICE_REMOVED;
     if (!heap->allocation && !heap->resource_created) native_heap_erase(op.ctx, heap);
     error(op.ctx, hr);
@@ -318,9 +379,9 @@ void APIENTRY native_heap_destroy(D3D12DDI_HDEVICE h, D3D12DDI_HHEAP slot, D3D12
 void native_heap_retire(Context *ctx) {
     // Called before callback detachment. Pending callbacks cannot be interrupted
     // safely; the runtime's device destruction owns their remaining KMT handles.
-    bool pending = ctx->native_context_pending;
+    bool pending = ctx->native_context_pending || ctx->native_submitting;
     for (auto *heap = ctx->native_heaps; heap; heap = heap->next) {
-        if (heap->pending) { pending = true; continue; }
+        if (heap->pending || ctx->native_submitting) { pending = true; continue; }
         HRESULT hr = native_heap_cleanup(ctx, heap, true);
         if (FAILED(hr)) ctx->last_error = hr;
         pending |= heap->allocation != 0 || heap->resource_created;
@@ -347,3 +408,5 @@ void native_heap_tables(D3D12DDI_DEVICE_FUNCS_CORE_0003 *table) {
     table->pfnMapHeap = native_heap_map;
     table->pfnUnmapHeap = native_heap_unmap;
 }
+
+#include "runtime_memory.inc"

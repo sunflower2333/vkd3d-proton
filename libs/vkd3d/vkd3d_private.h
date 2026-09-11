@@ -30,6 +30,7 @@
 #include "rbtree.h"
 
 #include "vkd3d.h"
+#include "vkd3d_wddm.h"
 #include "vkd3d_build.h"
 #include "vkd3d_version.h"
 #include "vkd3d_shader.h"
@@ -815,6 +816,7 @@ struct vkd3d_allocate_memory_info
 
 struct vkd3d_allocate_heap_memory_info
 {
+    const void *pNext;
     D3D12_HEAP_DESC heap_desc;
     void *host_ptr;
     uint32_t extra_allocation_flags;
@@ -5972,10 +5974,12 @@ struct d3d12_device
     } vendor_hacks;
 
     bool independent_device;
+    void *wddm_runtime_owner;
 };
 
 HRESULT d3d12_device_create(struct vkd3d_instance *instance,
-        const struct vkd3d_device_create_info *create_info, struct d3d12_device **device);
+        const struct vkd3d_device_create_info *create_info, const struct mwd_device_create_info *runtime,
+        struct d3d12_device **device);
 struct vkd3d_queue_family_info *d3d12_device_get_vkd3d_queue_family(struct d3d12_device *device,
         D3D12_COMMAND_LIST_TYPE type,
         uint32_t vk_family_index);

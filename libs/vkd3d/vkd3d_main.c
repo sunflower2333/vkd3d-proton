@@ -21,8 +21,8 @@
 #define INITGUID
 #include "vkd3d_private.h"
 
-HRESULT vkd3d_create_device(const struct vkd3d_device_create_info *create_info,
-        REFIID iid, void **device)
+static HRESULT create_device(const struct vkd3d_device_create_info *create_info,
+        const struct mwd_device_create_info *runtime, REFIID iid, void **device)
 {
     struct vkd3d_instance *instance;
     struct d3d12_device *object;
@@ -60,12 +60,27 @@ HRESULT vkd3d_create_device(const struct vkd3d_device_create_info *create_info,
         return E_FAIL;
     }
 
-    hr = d3d12_device_create(instance, create_info, &object);
+    hr = d3d12_device_create(instance, create_info, runtime, &object);
     vkd3d_instance_decref(instance);
     if (FAILED(hr))
         return hr;
 
     return return_interface(&object->ID3D12Device_iface, &IID_ID3D12Device, iid, device);
+}
+
+HRESULT vkd3d_create_device(const struct vkd3d_device_create_info *info, REFIID iid, void **device)
+{
+    return create_device(info, NULL, iid, device);
+}
+
+HRESULT vkd3d_create_device_wddm(const struct vkd3d_device_create_info *info,
+        const struct mwd_device_create_info *runtime, REFIID iid, void **device)
+{
+    if (!device) return E_POINTER;
+    *device = NULL;
+    if (!info || !info->independent || !runtime || runtime->sType != MWD_STYPE_DEVICE ||
+            runtime->pNext || !runtime->owner || !mwd_callbacks_valid(runtime->callbacks)) return E_INVALIDARG;
+    return create_device(info, runtime, iid, device);
 }
 
 /* ID3D12RootSignatureDeserializer */

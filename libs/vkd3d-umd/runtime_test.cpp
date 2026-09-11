@@ -32,8 +32,9 @@ static FARPROC WINAPI test_symbol(HMODULE, LPCSTR name) {
     return reinterpret_cast<FARPROC>(static_cast<uintptr_t>(0x35790));
 }
 static BOOL WINAPI test_unload(HMODULE) { ++unloads; return TRUE; }
-static int32_t test_create(PFN_vkGetInstanceProcAddr loader, const uint8_t luid[8], vkdu_device **out) {
-    if (!loader || std::memcmp(luid, expected_luid.data(), 8)) std::abort();
+static int32_t test_create(PFN_vkGetInstanceProcAddr loader, const uint8_t luid[8],
+        const mwd_callbacks *callbacks, void *owner, vkdu_device **out) {
+    if (!loader || std::memcmp(luid, expected_luid.data(), 8) || !owner || !mwd_callbacks_valid(callbacks)) std::abort();
     ++creates; *out = nullptr;
     if (SUCCEEDED(backend_result)) *out = reinterpret_cast<vkdu_device *>(new unsigned(99));
     if (reset_during_create) ++generation;
@@ -66,7 +67,7 @@ static void APIENTRY test_error(D3D10DDI_HRTDEVICE runtime, HRESULT result) {
 #define LoadLibraryExW test_load
 #define GetProcAddress test_symbol
 #define FreeLibrary test_unload
-#define vkdu_device_create_runtime test_create
+#define vkdu_device_create_shared test_create
 #define vkdu_device_destroy test_destroy
 #include "ddi.cpp"
 
@@ -85,6 +86,12 @@ static bool heap_callbacks_retired;
 static std::array<unsigned char, 65536> mapped_heap{};
 static const HANDLE expected_device = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(0x456a0));
 static const HANDLE expected_context = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(0xabc50));
+static std::array<unsigned char, 65536> commands[2];
+static std::array<D3DDDI_ALLOCATIONLIST, 1024> allocation_lists[2];
+static std::array<D3DDDI_PATCHLOCATIONLIST, 1024> patch_lists[2];
+static unsigned renders;
+static HRESULT render_result = S_OK;
+static bool retire_render;
 static void valid_kernel_callback(HANDLE runtime) {
     if (runtime != expected_device || heap_callbacks_retired) std::abort();
 }
@@ -95,6 +102,9 @@ static HRESULT APIENTRY heap_context_create(HANDLE runtime, D3DDDICB_CREATECONTE
             data->generation != generation || data->flags || data->reserved || args->NodeOrdinal || args->EngineAffinity != 1)
         std::abort();
     ++heap_context_creates; args->hContext = expected_context;
+    args->pCommandBuffer = commands[0].data(); args->CommandBufferSize = 65536;
+    args->pAllocationList = allocation_lists[0].data(); args->AllocationListSize = 1024;
+    args->pPatchLocationList = patch_lists[0].data(); args->PatchLocationListSize = 1024;
     return fail_context_create ? E_OUTOFMEMORY : S_OK;
 }
 static HRESULT APIENTRY heap_context_destroy(HANDLE runtime, const D3DDDICB_DESTROYCONTEXT *args) {
@@ -106,6 +116,13 @@ static HRESULT APIENTRY heap_context_destroy(HANDLE runtime, const D3DDDICB_DEST
 }
 static HRESULT APIENTRY heap_escape(HANDLE adapter, const D3DDDICB_ESCAPE *args) {
     valid_kernel_callback(args->hDevice);
+    if (args->PrivateDriverDataSize == sizeof(NativeFenceInfo)) {
+        auto *fence = static_cast<NativeFenceInfo *>(args->pPrivateDriverData);
+        if (adapter != expected_adapter || args->hContext != expected_context || fence->opcode != 2 ||
+                fence->expected_generation != generation || fence->completed || fence->context_id) std::abort();
+        fence->generation = generation; fence->context_id = 83; fence->completed = 9;
+        return S_OK;
+    }
     auto *info = static_cast<NativeContextInfo *>(args->pPrivateDriverData);
     if (adapter != expected_adapter || args->hContext != expected_context || args->PrivateDriverDataSize != sizeof(*info) ||
             !native_header_valid(info->header, sizeof(*info)) || info->opcode != 1 || info->flags ||
@@ -123,9 +140,9 @@ static HRESULT APIENTRY heap_allocate(HANDLE runtime, D3DDDICB_ALLOCATE *args) {
     auto *data = static_cast<NativeAllocationInfo *>(args->pAllocationInfo->pPrivateDriverData);
     if (args->pAllocationInfo->PrivateDriverDataSize != sizeof(*data) || !native_header_valid(data->header, sizeof(*data)) ||
             data->alignment != 4096 || data->context_id != 83 || data->generation != generation ||
-            (data->flags != 4 && data->flags != 6) || data->format || data->width || data->height || data->pitch ||
-            data->refresh_numerator || data->refresh_denominator || data->iova < 0x10010000 ||
-            data->iova % 65536 || data->size % 65536 || data->iova + data->size > 0x10081000)
+            (data->flags != 4 && data->flags != 6 && data->flags != 14) || data->format || data->width || data->height || data->pitch ||
+            data->refresh_numerator || data->refresh_denominator || data->iova < 0x10001000 ||
+            data->iova % 4096 || data->size % 4096 || data->iova + data->size > 0x10081000)
         std::abort();
     for (const auto &item : kernel_heaps) {
         const auto &heap = item.second;
@@ -197,6 +214,24 @@ static HRESULT APIENTRY heap_unlock(HANDLE runtime, const D3DDDICB_UNLOCK *args)
     return S_OK;
 }
 
+static HRESULT APIENTRY heap_render(HANDLE runtime, D3DDDICB_RENDER *args) {
+    valid_kernel_callback(runtime);
+    if (args->hContext != expected_context || args->NumAllocations != 1 || args->NumPatchLocations != 1 ||
+            args->CommandOffset || args->Flags.Value) std::abort();
+    auto *header = static_cast<NativeRenderInfo *>(args->pNewCommandBuffer);
+    auto *refs = reinterpret_cast<NativeRenderReference *>(static_cast<unsigned char *>(args->pNewCommandBuffer) + 64);
+    if (!native_header_valid(header->header, args->CommandLength) || header->generation != generation ||
+            header->stream_offset != 96 || header->references_count != 1 || refs->length != 4096 ||
+            !kernel_heaps.count(args->pNewAllocationList[0].hAllocation) ||
+            args->pNewPatchLocationList[0].PatchOffset != 96) std::abort();
+    ++renders;
+    args->pNewCommandBuffer = commands[1].data(); args->NewCommandBufferSize = 65536;
+    args->pNewAllocationList = allocation_lists[1].data(); args->NewAllocationListSize = 1024;
+    args->pNewPatchLocationList = patch_lists[1].data(); args->NewPatchLocationListSize = 1024;
+    if (retire_render) { native_destroy_device(error_device); heap_callbacks_retired = true; }
+    return render_result;
+}
+
 static int test_native_heaps() {
     D3DDDI_ADAPTERCALLBACKS adapter_callbacks{};
     adapter_callbacks.pfnQueryAdapterInfoCb = test_query;
@@ -207,7 +242,7 @@ static int test_native_heaps() {
     D3DDDI_DEVICECALLBACKS kt{};
     kt.pfnCreateContextCb = heap_context_create; kt.pfnDestroyContextCb = heap_context_destroy;
     kt.pfnEscapeCb = heap_escape; kt.pfnAllocateCb = heap_allocate; kt.pfnDeallocateCb = heap_deallocate;
-    kt.pfnLockCb = heap_lock; kt.pfnUnlockCb = heap_unlock;
+    kt.pfnLockCb = heap_lock; kt.pfnUnlockCb = heap_unlock; kt.pfnRenderCb = heap_render;
     D3D12DDI_CORELAYER_DEVICECALLBACKS_0003 um{}; um.pfnSetErrorCb = test_error;
     alignas(NativeDevice) std::array<unsigned char, sizeof(NativeDevice)> memory{};
     D3D12DDIARG_CREATEDEVICE_0003 create{};
@@ -337,7 +372,54 @@ static int test_native_heaps() {
     kernel_heaps.clear(); kernel_resources.clear(); heap_callbacks_retired = retire_lock = false;
     REQUIRE(adapter.pfnCloseAdapter(open.hAdapter) == S_OK);
     REQUIRE(!native_contract_complete());
-    std::printf("PASS native buffer heap runtime callbacks/KMT ownership/GPUVA/map/partial failure/reset/reentrant teardown (%zu-bit); resources and DDI versions remain unsupported\n", sizeof(void *) * 8);
+    // One real allocation token survives destruction of its public heap slot.
+    REQUIRE(OpenAdapter12(&open) == S_OK);
+    REQUIRE(adapter.pfnCreateDevice(open.hAdapter, &create) == S_OK);
+    ctx = context(create.hDrvDevice);
+    REQUIRE(allocate(hb) == S_OK);
+    auto *token = native_heap_find(ctx, hb.pDrvPrivate);
+    const unsigned allocation_count = allocations;
+    mwd_allocation imported{}, internal{};
+    mwd_context_info shared{};
+    REQUIRE(native_runtime_context(ctx, &shared) == S_OK && shared.context_id == 83 && shared.queue_id == 1);
+    REQUIRE(native_runtime_retain(ctx, token, &imported) == S_OK && allocations == allocation_count);
+    REQUIRE(imported.handle == token->allocation && imported.address == token->address);
+    REQUIRE(native_runtime_allocate(ctx, 4096, 4096, imported.address, 6, &internal) == E_OUTOFMEMORY);
+    REQUIRE(native_runtime_allocate(ctx, 4096, 4096, 0, 6, &internal) == S_OK);
+    REQUIRE(internal.address + internal.size <= imported.address || imported.address + imported.size <= internal.address);
+    REQUIRE(native_runtime_retain(ctx, reinterpret_cast<void *>(uintptr_t(0x123)), &internal) == E_INVALIDARG);
+    // Re-obtain the internal token whose output was deliberately cleared by the invalid retain.
+    for (auto *p = ctx->native_heaps; p; p = p->next) if (p != token) native_export(ctx, p, &internal);
+    destroy(hb);
+    REQUIRE(native_token(ctx, token) && kernel_heaps.count(imported.handle));
+    unsigned map_count = locks, unmap_count = unlocks;
+    uint32_t mapped_handle = 0;
+    REQUIRE(native_runtime_map(ctx, token, &mapping, &mapped_handle) == S_OK && mapped_handle == imported.handle);
+    REQUIRE(native_runtime_map(ctx, token, &again, &mapped_handle) == S_OK && locks == map_count + 1);
+    REQUIRE(native_runtime_unmap(ctx, token) == S_OK && unlocks == unmap_count);
+    REQUIRE(native_runtime_unmap(ctx, token) == S_OK && unlocks == unmap_count + 1);
+    std::array<unsigned char, 16> stream{};
+    mwd_reference reference{token, 0, 4096, 3, 0};
+    REQUIRE(native_runtime_submit(ctx, stream.data(), stream.size(), &reference, 1) == S_OK && renders == 1);
+    REQUIRE(ctx->native_commands == commands[1].data() && ctx->native_allocation_list == allocation_lists[1].data());
+    reference.offset = imported.size;
+    REQUIRE(native_runtime_submit(ctx, stream.data(), stream.size(), &reference, 1) == E_INVALIDARG && renders == 1);
+    reference.offset = 0; render_result = E_OUTOFMEMORY;
+    ctx->native_commands = commands[0].data();
+    REQUIRE(native_runtime_submit(ctx, stream.data(), stream.size(), &reference, 1) == E_OUTOFMEMORY);
+    REQUIRE(ctx->native_commands == commands[1].data()); render_result = S_OK;
+    uint32_t completed = 0;
+    REQUIRE(native_runtime_completed(ctx, &completed) == S_OK && completed == 9);
+    fail_deallocate = 1;
+    REQUIRE(native_runtime_release(ctx, token) == DXGI_ERROR_WAS_STILL_DRAWING && native_token(ctx, token));
+    REQUIRE(native_runtime_release(ctx, token) == S_OK && !native_token(ctx, token));
+    reference.token = internal.token;
+    retire_render = true; error_device = create.hDrvDevice;
+    REQUIRE(native_runtime_submit(ctx, stream.data(), stream.size(), &reference, 1) == DXGI_ERROR_DEVICE_REMOVED);
+    REQUIRE(!context(create.hDrvDevice) && kernel_heaps.size() == 1);
+    kernel_heaps.clear(); heap_callbacks_retired = retire_render = false;
+    REQUIRE(adapter.pfnCloseAdapter(open.hAdapter) == S_OK);
+    std::printf("PASS native buffer heaps/shared runtime allocation tokens/RenderCb replacements/reset/reentrant teardown (%zu-bit); DDI versions remain unsupported\n", sizeof(void *) * 8);
     return 0;
 }
 

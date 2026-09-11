@@ -5,6 +5,7 @@
 #include <new>
 #include <memory>
 #include <mutex>
+#include "mesa_wddm_runtime.h"
 
 namespace {
 constexpr uint32_t context_magic = 0x564b4455, object_magic = 0x564b4f42;
@@ -38,6 +39,12 @@ struct Context {
     HANDLE native_heap_context = nullptr;
     uint64_t native_va_start = 0, native_va_size = 0;
     uint32_t native_context_id = 0;
+    uint32_t native_queue_id = 0;
+    void *native_commands = nullptr;
+    D3DDDI_ALLOCATIONLIST *native_allocation_list = nullptr;
+    D3DDDI_PATCHLOCATIONLIST *native_patch_list = nullptr;
+    uint32_t native_command_capacity = 0, native_allocation_capacity = 0, native_patch_capacity = 0;
+    bool native_submitting = false, finalizing = false;
     bool native_retiring = false;
     bool native_context_pending = false;
 };
@@ -52,6 +59,7 @@ struct Object {
     uint64_t address, bytes;
     uint32_t descriptor_flags = 0;
     uint32_t descriptor_type = UINT32_MAX;
+    NativeHeap *native_heap = nullptr;
 };
 Context *context(D3D12DDI_HDEVICE handle) {
     if (handle.pDrvPrivate) {
@@ -73,8 +81,10 @@ vkdu_object *backend(void *memory, vkdu_kind kind) {
 }
 void release(Context *value) {
     if (value && --value->references == 0) {
+        value->finalizing = true;
+        vkdu_device_destroy(value->backend);
         native_heap_forget(value);
-        value->magic = 0; vkdu_device_destroy(value->backend);
+        value->magic = 0;
         // Backend destruction can call Vulkan; unload only after that finishes.
         if (value->vulkan_module) FreeLibrary(value->vulkan_module);
         delete value;

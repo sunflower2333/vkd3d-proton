@@ -4171,8 +4171,9 @@ static void d3d12_device_init_workarounds(struct d3d12_device *device)
 }
 
 static HRESULT vkd3d_create_vk_device(struct d3d12_device *device,
-        const struct vkd3d_device_create_info *create_info)
+        const struct vkd3d_device_create_info *create_info, const struct mwd_device_create_info *runtime)
 {
+    struct mwd_device_create_info runtime_info;
     const struct vkd3d_vk_instance_procs *vk_procs = &device->vkd3d_instance->vk_procs;
     struct vkd3d_device_queue_info device_queue_info;
     VkPhysicalDeviceProperties device_properties;
@@ -4268,6 +4269,23 @@ static HRESULT vkd3d_create_vk_device(struct d3d12_device *device,
     /* Create device */
     device_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     device_info.pNext = device->device_info.features2.pNext;
+    if (runtime)
+    {
+        struct mwd_support support = {MWD_STYPE_SUPPORT};
+        VkPhysicalDeviceProperties2 properties = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        properties.pNext = &support;
+        VK_CALL(vkGetPhysicalDeviceProperties2(physical_device, &properties));
+        if (support.magic != MWD_RUNTIME_MAGIC || support.version != MWD_RUNTIME_ABI_VERSION ||
+                support.size != sizeof(struct mwd_callbacks) || support.flags != 1)
+        {
+            vkd3d_free(user_extension_supported);
+            vkd3d_free(extensions);
+            return DXGI_ERROR_UNSUPPORTED;
+        }
+        runtime_info = *runtime;
+        runtime_info.pNext = device_info.pNext;
+        device_info.pNext = &runtime_info;
+    }
     device_info.flags = 0;
     device_info.queueCreateInfoCount = device_queue_info.vk_family_count;
     device_info.pQueueCreateInfos = device_queue_info.vk_queue_create_info;
@@ -11576,7 +11594,8 @@ static void d3d12_device_reserve_internal_sparse_queue(struct d3d12_device *devi
 }
 
 static HRESULT d3d12_device_init(struct d3d12_device *device,
-        struct vkd3d_instance *instance, const struct vkd3d_device_create_info *create_info)
+        struct vkd3d_instance *instance, const struct vkd3d_device_create_info *create_info,
+        const struct mwd_device_create_info *runtime)
 {
     const struct vkd3d_vk_device_procs *vk_procs;
     HRESULT hr;
@@ -11633,7 +11652,8 @@ static HRESULT d3d12_device_init(struct d3d12_device *device,
         goto out_free_vertex_input_lock;
     }
 
-    if (FAILED(hr = vkd3d_create_vk_device(device, create_info)))
+    device->wddm_runtime_owner = runtime ? runtime->owner : NULL;
+    if (FAILED(hr = vkd3d_create_vk_device(device, create_info, runtime)))
         goto out_free_fragment_output_lock;
 
     if (FAILED(hr = vkd3d_private_store_init(&device->private_store)))
@@ -11924,7 +11944,8 @@ bool d3d12_device_validate_shader_meta(struct d3d12_device *device, const struct
 }
 
 HRESULT d3d12_device_create(struct vkd3d_instance *instance,
-        const struct vkd3d_device_create_info *create_info, struct d3d12_device **device)
+        const struct vkd3d_device_create_info *create_info, const struct mwd_device_create_info *runtime,
+        struct d3d12_device **device)
 {
     bool reject_existing_device = false;
     bool forced_singletons = false;
@@ -11949,6 +11970,9 @@ HRESULT d3d12_device_create(struct vkd3d_instance *instance,
             reject_existing_device = true;
         }
     }
+
+    if (runtime && (!create_info->independent || forced_singletons))
+        return DXGI_ERROR_UNSUPPORTED;
 
     pthread_mutex_lock(&d3d12_device_map_mutex);
 
@@ -11987,7 +12011,7 @@ HRESULT d3d12_device_create(struct vkd3d_instance *instance,
 
     memset(object, 0, sizeof(*object));
 
-    if (FAILED(hr = d3d12_device_init(object, instance, create_info)))
+    if (FAILED(hr = d3d12_device_init(object, instance, create_info, runtime)))
     {
         vkd3d_free_aligned(object);
         pthread_mutex_unlock(&d3d12_device_map_mutex);

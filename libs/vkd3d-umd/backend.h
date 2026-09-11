@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <vulkan/vulkan.h>
+#include "mesa_wddm_runtime.h"
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -11,7 +12,7 @@ extern "C" {
 /* No Windows SDK or generated COM types cross this internal ABI. */
 typedef struct vkdu_device vkdu_device;
 typedef struct vkdu_object vkdu_object;
-enum vkdu_kind { VKDU_BUFFER, VKDU_QUEUE, VKDU_ALLOCATOR, VKDU_COMMAND_LIST, VKDU_ROOT, VKDU_PIPELINE, VKDU_FENCE, VKDU_DESCRIPTOR_HEAP };
+enum vkdu_kind { VKDU_BUFFER, VKDU_QUEUE, VKDU_ALLOCATOR, VKDU_COMMAND_LIST, VKDU_ROOT, VKDU_PIPELINE, VKDU_FENCE, VKDU_DESCRIPTOR_HEAP, VKDU_MEMORY_HEAP };
 struct vkdu_adapter { uint8_t luid[8]; uint32_t vendor_id, device_id; };
 struct vkdu_descriptor_range { uint32_t type, count, shader_register, register_space, offset; };
 struct vkdu_descriptor_span { vkdu_object *heap; uint32_t first, count; };
@@ -25,6 +26,12 @@ int32_t vkdu_device_create(PFN_vkGetInstanceProcAddr loader, const struct vkdu_a
 /* Native runtime adapter identity is the KMD-provided LUID. Vulkan vendor and
  * device IDs name the host GPU, not PCI 1AF4:1050; never invent their mapping. */
 int32_t vkdu_device_create_runtime(PFN_vkGetInstanceProcAddr loader, const uint8_t luid[8], vkdu_device **out);
+int32_t vkdu_device_create_shared(PFN_vkGetInstanceProcAddr loader, const uint8_t luid[8],
+        const struct mwd_callbacks *callbacks, void *owner, vkdu_device **out);
+int32_t vkdu_memory_heap_import(vkdu_device *device, void *owner, void *token, uint64_t bytes,
+        int cpu_visible, vkdu_object **out);
+int32_t vkdu_buffer_place(vkdu_device *device, vkdu_object *heap, uint64_t offset,
+        uint64_t bytes, uint32_t state, vkdu_object **out);
 /* Test-only entrypoint is absent from the production bridge. CPU Vulkan only. */
 #ifdef VKDU_ENABLE_TEST_DEVICE
 int32_t vkdu_test_device_create(PFN_vkGetInstanceProcAddr loader, vkdu_device **out);
