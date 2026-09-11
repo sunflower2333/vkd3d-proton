@@ -3,10 +3,10 @@
 #include <atomic>
 #include <cstring>
 #include <new>
-#include <vector>
 
 namespace {
 constexpr uint32_t context_magic = 0x564b4455, object_magic = 0x564b4f42;
+struct Object;
 struct Context {
     uint32_t magic = context_magic;
     std::atomic_uint references{1};
@@ -14,6 +14,8 @@ struct Context {
     VKDU_REPORT_ERROR report = nullptr;
     void *report_context = nullptr;
     std::atomic<HRESULT> last_error{S_OK};
+    SRWLOCK resources_lock = SRWLOCK_INIT;
+    Object *resources = nullptr;
 };
 struct Object {
     uint32_t magic;
@@ -22,6 +24,8 @@ struct Object {
     vkdu_kind kind;
     uint32_t *shader;
     uint32_t shader_words;
+    Object *next;
+    uint64_t address, bytes;
 };
 Context *context(D3D12DDI_HDEVICE handle) {
     auto *value = static_cast<Context *>(handle.pDrvPrivate);
@@ -48,7 +52,21 @@ void error(Context *value, HRESULT result) {
 void error(Object *value, HRESULT result) { if (value) error(value->context, result); }
 HRESULT bind(Context *ctx, void *memory, vkdu_object *value, vkdu_kind kind) {
     if (!ctx || !memory || !vkdu_object_is(value, kind) || !vkdu_object_belongs(ctx->backend, value) || object(memory)) return E_INVALIDARG;
-    new (memory) Object{object_magic, ctx, value, kind, nullptr, 0};
+    auto *entry = new (memory) Object{object_magic, ctx, value, kind, nullptr, 0, nullptr, 0, 0};
+    if (kind == VKDU_BUFFER) {
+        entry->address = vkdu_buffer_address(value); entry->bytes = vkdu_buffer_size(value);
+        if (!entry->address || !entry->bytes || entry->bytes > UINT64_MAX - entry->address) {
+            std::memset(entry, 0, sizeof(*entry)); return E_INVALIDARG;
+        }
+        AcquireSRWLockExclusive(&ctx->resources_lock);
+        for (auto *p = ctx->resources; p; p = p->next) {
+            if (entry->address < p->address + p->bytes && p->address < entry->address + entry->bytes) {
+                ReleaseSRWLockExclusive(&ctx->resources_lock); std::memset(entry, 0, sizeof(*entry)); return E_INVALIDARG;
+            }
+        }
+        entry->next = ctx->resources; ctx->resources = entry;
+        ReleaseSRWLockExclusive(&ctx->resources_lock);
+    }
     ++ctx->references;
     return S_OK;
 }
@@ -141,6 +159,19 @@ void APIENTRY root_set(D3D12DDI_HCOMMANDLIST c, D3D12DDI_HROOTSIGNATURE root) {
 void APIENTRY pipeline_set(D3D12DDI_HCOMMANDLIST c, D3D12DDI_HPIPELINESTATE pipeline) {
     error(object(c.pDrvPrivate), vkdu_command_pipeline(backend(c.pDrvPrivate, VKDU_COMMAND_LIST), backend(pipeline.pDrvPrivate, VKDU_PIPELINE)));
 }
+void APIENTRY root_uav(D3D12DDI_HCOMMANDLIST c, UINT index, D3D12DDI_GPU_VIRTUAL_ADDRESS address) {
+    auto *cmd = object(c.pDrvPrivate);
+    if (!cmd) return;
+    auto *ctx = cmd->context; HRESULT hr = E_INVALIDARG;
+    AcquireSRWLockShared(&ctx->resources_lock);
+    for (auto *p = ctx->resources; p; p = p->next) {
+        if (address >= p->address && address - p->address < p->bytes) {
+            hr = vkdu_command_uav(cmd->backend, index, p->backend, address - p->address); break;
+        }
+    }
+    ReleaseSRWLockShared(&ctx->resources_lock);
+    error(cmd, hr);
+}
 void APIENTRY execute(D3D12DDI_HCOMMANDQUEUE q, UINT count, const D3D12DDI_HCOMMANDLIST *commands) {
     auto *queue = object(q.pDrvPrivate); vkdu_object *native[64];
     if (!queue) return;
@@ -181,7 +212,7 @@ void APIENTRY shader_create(D3D12DDI_HDEVICE h, const UINT *tokens, D3D12DDI_HRO
     auto *copy = new (std::nothrow) uint32_t[tokens[1]];
     if (!copy) { error(ctx, E_OUTOFMEMORY); return; }
     std::memcpy(copy, tokens, tokens[1] * sizeof(uint32_t));
-    new (shader.pDrvPrivate) Object{object_magic, ctx, nullptr, VKDU_PIPELINE, copy, tokens[1]};
+    new (shader.pDrvPrivate) Object{object_magic, ctx, nullptr, VKDU_PIPELINE, copy, tokens[1], nullptr, 0, 0};
     ++ctx->references;
 }
 void APIENTRY shader_destroy(D3D12DDI_HDEVICE h, D3D12DDI_HSHADER shader) {
@@ -231,6 +262,13 @@ extern "C" void APIENTRY VioGpuD3D12BridgeUnbindObject(void *memory) {
     auto *value = object(memory);
     if (!value) return;
     auto *ctx = value->context;
+    if (value->kind == VKDU_BUFFER) {
+        AcquireSRWLockExclusive(&ctx->resources_lock);
+        Object **p = &ctx->resources;
+        while (*p && *p != value) p = &(*p)->next;
+        if (*p) *p = value->next;
+        ReleaseSRWLockExclusive(&ctx->resources_lock);
+    }
     vkdu_object_destroy(value->backend); delete[] value->shader;
     std::memset(value, 0, sizeof(*value)); release(ctx);
 }
@@ -249,8 +287,9 @@ extern "C" HRESULT APIENTRY VioGpuD3D12BridgeGetTables(D3D12DDI_DEVICE_FUNCS_COR
     commands->pfnCloseCommandList = command_close; commands->pfnResetCommandList = command_reset;
     commands->pfnCopyBufferRegion = copy; commands->pfnResourceBarrier = barriers; commands->pfnDispatch = dispatch;
     commands->pfnSetComputeRootSignature = root_set; commands->pfnSetPipelineState = pipeline_set;
+    commands->pfnSetComputeRootUnorderedAccessView = root_uav;
     queue->pfnExecuteCommandLists = execute;
-    // Native monitored-fence, allocation/residency, root GPUVA, graphics and
+    // Native monitored-fence, allocation/residency, runtime GPUVA, graphics and
     // presentation contracts remain absent; do not advertise these tables.
     return S_OK;
 }

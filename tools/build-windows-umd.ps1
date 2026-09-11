@@ -20,7 +20,9 @@ foreach ($header in @('windows.h','d3d12umddi.h','d3d10umddi.h','d3dumddi.h','d3
     Write-Output "$header=$($found.FullName)"
 }
 $buildDir = 'build-umd-' + $Architecture
-meson setup $buildDir --buildtype release -Ddebug=true -Denable_umd_bridge=true -Denable_umd_bridge_tests=true
+$crossArgs = @()
+if ($Architecture -eq 'arm64') { $crossArgs = @('--cross-file', 'tools/umd-arm64-msvc.ini') }
+meson setup $buildDir @crossArgs --buildtype release -Ddebug=true -Denable_umd_bridge=true -Denable_umd_bridge_tests=true
 if ($LASTEXITCODE) { exit $LASTEXITCODE }
 meson compile -C $buildDir -j 3 viogpud3d12 vkd3d-umd-ddi-abi-test
 if ($LASTEXITCODE) { exit $LASTEXITCODE }

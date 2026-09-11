@@ -18,12 +18,13 @@ creation and destruction, command close/reset/copy/transition/dispatch/execute,
 root signatures, compute shaders and pipelines. Private objects preserve their
 device context; errors from void DDIs reach the supplied error callback. Buffer
 copy placements use `BaseAddress.UMD.hResource` and `Offset`, with overflow-safe
-range checks. Unsupported table fields remain null; these partial tables must
+range checks. Root UAV addresses resolve against the bridge's owned buffer
+registry; this does not implement runtime GPUVA allocation. Unsupported table fields remain null; these partial tables must
 not yet be advertised to the Windows runtime.
 
 Still required for a native system driver: OpenAdapter12 and version/caps
 negotiation; full device/core and graphics DDIs; runtime allocation, heap,
-residency and GPUVA mapping; descriptor tables and root GPUVA resolution;
+residency and GPUVA mapping; descriptor tables;
 monitored fences referring to the runtime's actual GPU backing; shared surfaces,
 presentation, device-removal/TDR recovery and WDDM KMD integration. The backend
 fences used by the test are not the runtime's monitored-fence contract.
