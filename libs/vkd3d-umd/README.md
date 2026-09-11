@@ -18,7 +18,7 @@ creation and destruction, command close/reset/copy/transition/dispatch/execute,
 root signatures, compute shaders and pipelines. Private objects preserve their
 device context; errors from void DDIs reach the supplied error callback. Buffer
 copy placements use `BaseAddress.UMD.hResource` and `Offset`, with overflow-safe
-range checks. Root UAV and CBV addresses resolve against the bridge's owned buffer
+range checks. Root UAV, CBV and SRV addresses resolve against the bridge's owned buffer
 registry; this does not implement runtime GPUVA allocation. Unsupported table fields remain null; these partial tables must
 not yet be advertised to the Windows runtime.
 
@@ -31,7 +31,7 @@ the device; shader table handles must resolve into the currently bound heap.
 Root-table ranges preserve register spaces, explicit offsets and APPEND, with
 overflow-safe heap bounds. Command reset clears table and heap binding state.
 Buffer UAVs support raw, structured (including counters) and R32 typed views;
-other typed formats, textures, SRVs/samplers and ranged descriptor copies
+other typed formats, textures, samplers and ranged descriptor copies
 still require their native view/copy adapters.
 
 Constant buffers support native CreateConstantBufferView and compute root
@@ -41,6 +41,22 @@ create real null descriptors. Root CBVs instead require a live owned buffer
 address: root descriptors have no descriptor bounds/null-read guarantee.
 Unknown or zero root addresses reach the error callback before backend state
 changes. See the Microsoft [root descriptor contract](https://microsoft.github.io/DirectX-Specs/d3d/ResourceBinding.html#root-descriptors).
+
+Buffer SRVs support the native CreateShaderResourceView and compute root SRV
+callbacks, raw/structured/R32 typed views, same-device ownership, bounded
+element ranges and valid null table descriptors. The DDI resolves resource
+handles from its live registry before reading them; unknown non-null handles
+are errors, never converted to null. Root SRVs require aligned owned addresses.
+Non-default buffer component mappings return E_NOTIMPL because the embedded
+engine currently implements swizzles only for textures. This limitation must
+be resolved before advertising complete shader-resource support.
+
+Descriptor reuse tests exposed stale buffer-range metadata when replacing a
+live SRV with a null descriptor. The engine now clears auxiliary ranges and
+preserves their copy flag, so direct and copied null descriptors cannot retain
+the previous buffer's dimensions. This is exercised by shader GetDimensions
+and readback after first seeding the same source/destination slots with a live
+view, rather than testing only initially zeroed descriptor heaps.
 
 Still required for a native system driver: OpenAdapter12 and version/caps
 negotiation; full device/core and graphics DDIs; runtime allocation, heap,
@@ -77,7 +93,15 @@ Local CPU Vulkan passes all six workloads (6144 words). The original test
 incorrectly dispatched root address zero and faulted reading address4 in the
 CPU shader; the core placed the caller in round3/fence4 after the first three
 CBV readbacks succeeded. The updated test uses a valid allocation for that
-round and checks zero-root rejection. Three-architecture CBV CI is pending.
+round and checks zero-root rejection. Three-architecture CBV CI34598879880
+and paired parent f2bd055/CI34599103361 passed.
+
+The SRV continuation adds eight independently reset 1024-word readbacks:
+typed tables and null replacement, preservation after rejected swizzle,
+raw tables/root offsets with two independent bindings, and structured
+tables/root/null views. All fourteen workloads (14336 words) pass local CPU
+Vulkan. This includes the null-range repair; its first negative run returned
+the old size64 instead of0. Actual WDK and target SRV validation are pending.
 
 `vkd3d-umd-gpu-probe --adapter LUID_LOW_HEX LUID_HIGH_HEX VENDOR_HEX DEVICE_HEX`
 executes the same compute/readback workloads through the production backend.
@@ -88,7 +112,8 @@ loading. This test diagnoses real hardware backend integration without changing
 system registration. It is not a Windows runtime DDI/Present acceptance test;
 The earlier09146e1 two-workload checkpoint passed on the real ARM64 VIOGPU
 in1005ms with process-local Mesa56bd30c and the exact matched OS/Vulkan identity.
-Target execution of the new CBV extension remains pending.
+The84d6bba CBV checkpoint also passed the ARM64 target in806ms with6144
+correct GPU readbacks; this does not validate the later SRV extension.
 
 Driver-parent packaging must build from `external/vkd3d-proton`, retain Mesa4ace
 and KMD7648b72f or explicit validated successors, copy this candidate before PE

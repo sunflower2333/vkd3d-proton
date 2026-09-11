@@ -147,6 +147,26 @@ void APIENTRY create_uav(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATE_UNORDERED_
     ReleaseSRWLockShared(&ctx->resources_lock);
     error(ctx, hr);
 }
+void APIENTRY create_srv(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATE_SHADER_RESOURCE_VIEW_0002 *args, D3D12DDI_CPU_DESCRIPTOR_HANDLE destination) {
+    auto *ctx = context(h);
+    if (!ctx) return;
+    if (!args) { error(ctx, E_INVALIDARG); return; }
+    if (args->ResourceDimension != D3D12DDI_RD_BUFFER) { error(ctx, E_NOTIMPL); return; }
+    uint32_t index = 0; HRESULT hr = E_INVALIDARG;
+    AcquireSRWLockShared(&ctx->resources_lock);
+    auto *heap = find_heap(ctx, destination.ptr, false, &index);
+    // Resolve only live owned resources. An unknown non-null handle must not
+    // become a valid null descriptor or require dereferencing foreign memory.
+    Object *resource = nullptr;
+    for (auto *p = ctx->resources; p; p = p->next)
+        if (p == args->hDrvResource.pDrvPrivate) { resource = p; break; }
+    if (heap && (!args->hDrvResource.pDrvPrivate || resource))
+        hr = vkdu_buffer_srv(heap->backend, index, resource ? resource->backend : nullptr,
+                args->Format, args->Buffer.FirstElement, args->Buffer.NumElements,
+                args->Buffer.StructureByteStride, args->Buffer.Flags, args->Shader4ComponentMapping);
+    ReleaseSRWLockShared(&ctx->resources_lock);
+    error(ctx, hr);
+}
 void APIENTRY create_cbv(D3D12DDI_HDEVICE h, const D3D12DDI_CONSTANT_BUFFER_VIEW_DESC *args, D3D12DDI_CPU_DESCRIPTOR_HANDLE destination) {
     auto *ctx = context(h);
     if (!ctx) return;
@@ -300,6 +320,20 @@ void APIENTRY root_cbv(D3D12DDI_HCOMMANDLIST c, UINT index, D3D12DDI_GPU_VIRTUAL
     ReleaseSRWLockShared(&ctx->resources_lock);
     error(cmd, hr);
 }
+void APIENTRY root_srv(D3D12DDI_HCOMMANDLIST c, UINT index, D3D12DDI_GPU_VIRTUAL_ADDRESS address) {
+    auto *cmd = object(c.pDrvPrivate);
+    if (!cmd) return;
+    if (!address) { error(cmd, E_INVALIDARG); return; }
+    auto *ctx = cmd->context; HRESULT hr = E_INVALIDARG;
+    AcquireSRWLockShared(&ctx->resources_lock);
+    for (auto *p = ctx->resources; p; p = p->next) {
+        if (address >= p->address && address - p->address < p->bytes) {
+            hr = vkdu_command_srv(cmd->backend, index, p->backend, address - p->address); break;
+        }
+    }
+    ReleaseSRWLockShared(&ctx->resources_lock);
+    error(cmd, hr);
+}
 void APIENTRY execute(D3D12DDI_HCOMMANDQUEUE q, UINT count, const D3D12DDI_HCOMMANDLIST *commands) {
     auto *queue = object(q.pDrvPrivate); vkdu_object *native[64];
     if (!queue) return;
@@ -432,12 +466,14 @@ extern "C" HRESULT APIENTRY VioGpuD3D12BridgeGetTables(D3D12DDI_DEVICE_FUNCS_COR
     device->pfnGetDescriptorSizeInBytes = descriptor_size; device->pfnGetCPUDescriptorHandleForHeapStart = heap_cpu;
     device->pfnGetGPUDescriptorHandleForHeapStart = heap_gpu; device->pfnCreateUnorderedAccessView = create_uav;
     device->pfnCreateConstantBufferView = create_cbv;
+    device->pfnCreateShaderResourceView = create_srv;
     device->pfnCopyDescriptorsSimple = copy_descriptors_simple;
     commands->pfnCloseCommandList = command_close; commands->pfnResetCommandList = command_reset;
     commands->pfnCopyBufferRegion = copy; commands->pfnResourceBarrier = barriers; commands->pfnDispatch = dispatch;
     commands->pfnSetComputeRootSignature = root_set; commands->pfnSetPipelineState = pipeline_set;
     commands->pfnSetComputeRootUnorderedAccessView = root_uav;
     commands->pfnSetComputeRootConstantBufferView = root_cbv;
+    commands->pfnSetComputeRootShaderResourceView = root_srv;
     commands->pfnSetDescriptorHeaps = set_heaps; commands->pfnSetComputeRootDescriptorTable = set_table;
     queue->pfnExecuteCommandLists = execute;
     // Native monitored-fence, allocation/residency, runtime GPUVA, graphics and

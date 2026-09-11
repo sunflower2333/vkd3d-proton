@@ -44,6 +44,8 @@ int32_t vkdu_buffer_uav(vkdu_object *heap, uint32_t index, vkdu_object *buffer,
         uint32_t format, uint64_t first, uint32_t count, uint32_t stride, uint32_t flags,
         vkdu_object *counter, uint64_t counter_offset);
 int32_t vkdu_buffer_cbv(vkdu_object *heap, uint32_t index, vkdu_object *buffer, uint64_t offset, uint32_t bytes);
+int32_t vkdu_buffer_srv(vkdu_object *heap, uint32_t index, vkdu_object *buffer,
+        uint32_t format, uint64_t first, uint32_t count, uint32_t stride, uint32_t flags, uint32_t mapping);
 int32_t vkdu_descriptor_copy(vkdu_object *dst, uint32_t dst_index, vkdu_object *src, uint32_t src_index, uint32_t count);
 int32_t vkdu_command_heaps(vkdu_object *command, uint32_t count, vkdu_object *const *heaps);
 int32_t vkdu_command_table(vkdu_object *command, uint32_t index, vkdu_object *heap, uint32_t first);
@@ -62,6 +64,7 @@ int32_t vkdu_command_root(vkdu_object *command, vkdu_object *root);
 int32_t vkdu_command_pipeline(vkdu_object *command, vkdu_object *pipeline);
 int32_t vkdu_command_uav(vkdu_object *command, uint32_t index, vkdu_object *buffer, uint64_t offset);
 int32_t vkdu_command_cbv(vkdu_object *command, uint32_t index, vkdu_object *buffer, uint64_t offset);
+int32_t vkdu_command_srv(vkdu_object *command, uint32_t index, vkdu_object *buffer, uint64_t offset);
 int32_t vkdu_command_dispatch(vkdu_object *command, uint32_t x, uint32_t y, uint32_t z);
 int32_t vkdu_queue_execute(vkdu_object *queue, uint32_t count, vkdu_object *const *commands);
 int32_t vkdu_fence_create(vkdu_device *device, uint64_t initial, vkdu_object **out);

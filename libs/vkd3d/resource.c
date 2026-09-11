@@ -5892,6 +5892,7 @@ static void d3d12_descriptor_heap_write_null_descriptor_template(vkd3d_cpu_descr
     VkWriteDescriptorSet writes[VKD3D_MAX_BINDLESS_DESCRIPTOR_SETS];
     const struct vkd3d_vk_device_procs *vk_procs;
     struct vkd3d_bindless_state *bindless_state;
+    struct vkd3d_bound_buffer_range *buffer_ranges;
     struct d3d12_desc_split desc;
     unsigned int num_writes, i;
     unsigned int offset;
@@ -5908,6 +5909,16 @@ static void d3d12_descriptor_heap_write_null_descriptor_template(vkd3d_cpu_descr
        null writes. */
     if (!null_descriptor_template->has_mutable_descriptors)
         vk_mutable_descriptor_type = 0;
+
+    /* Null views must also replace auxiliary range metadata. Otherwise a
+     * reused slot keeps the previous buffer size/offset, and copying the null
+     * descriptor can retain that stale range in the destination heap too. */
+    buffer_ranges = desc.heap->buffer_ranges.host_ptr;
+    if (buffer_ranges)
+    {
+        memset(&buffer_ranges[desc.offset], 0, sizeof(*buffer_ranges));
+        desc.view->info.flags |= VKD3D_DESCRIPTOR_FLAG_BUFFER_OFFSET;
+    }
 
     /* Skip writes with the same null type that are already null. */
     if (!(desc.view->info.flags & VKD3D_DESCRIPTOR_FLAG_NON_NULL)
@@ -5951,6 +5962,9 @@ static void d3d12_descriptor_heap_write_null_descriptor_template(vkd3d_cpu_descr
     desc.types->set_info_mask = null_descriptor_template->set_info_mask;
     desc.types->current_null_type = vk_mutable_descriptor_type;
     memset(desc.view, 0, sizeof(*desc.view));
+
+    if (buffer_ranges)
+        desc.view->info.flags |= VKD3D_DESCRIPTOR_FLAG_BUFFER_OFFSET;
 
     if (num_writes == 1)
     {

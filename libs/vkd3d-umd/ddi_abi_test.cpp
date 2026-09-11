@@ -30,6 +30,8 @@ int main(int argc, char **argv) {
     REQUIRE(device.value.pfnCreateDescriptorHeap && device.value.pfnDestroyDescriptorHeap && device.value.pfnGetDescriptorSizeInBytes);
     REQUIRE(device.value.pfnGetCPUDescriptorHandleForHeapStart && device.value.pfnGetGPUDescriptorHandleForHeapStart);
     REQUIRE(device.value.pfnCreateUnorderedAccessView && device.value.pfnCopyDescriptorsSimple);
+    REQUIRE(device.value.pfnCreateConstantBufferView && device.value.pfnCreateShaderResourceView);
+    REQUIRE(commands.value.pfnSetComputeRootConstantBufferView && commands.value.pfnSetComputeRootShaderResourceView);
     REQUIRE(commands.value.pfnSetDescriptorHeaps && commands.value.pfnSetComputeRootDescriptorTable);
     REQUIRE(!device.value.pfnCreateHeapAndResource && !device.value.pfnCreateFence && !device.value.pfnMakeResident);
     REQUIRE(!queue.value.pfnSignalFence && !queue.value.pfnWaitForFence);
@@ -48,6 +50,8 @@ int main(int argc, char **argv) {
     REQUIRE(device.value.pfnGetGPUDescriptorHandleForHeapStart(h, heap).ptr == 0);
     device.value.pfnCopyDescriptorsSimple(h, 1, {}, {}, D3D12DDI_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     device.value.pfnCreateUnorderedAccessView(h, nullptr, {});
+    device.value.pfnCreateShaderResourceView(h, nullptr, {});
+    commands.value.pfnSetComputeRootShaderResourceView({}, 0, 0);
     commands.value.pfnSetDescriptorHeaps({}, 0, nullptr);
     commands.value.pfnSetComputeRootDescriptorTable({}, 0, {});
     REQUIRE(create(nullptr, nullptr, report, nullptr, &h) == E_INVALIDARG);

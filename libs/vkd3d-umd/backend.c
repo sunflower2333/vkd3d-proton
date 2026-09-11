@@ -247,6 +247,48 @@ int32_t vkdu_buffer_cbv(vkdu_object *heap, uint32_t index, vkdu_object *buffer, 
     ID3D12Device_CreateConstantBufferView(heap->owner, &desc, destination);
     return ID3D12Device_GetDeviceRemovedReason(heap->owner);
 }
+int32_t vkdu_buffer_srv(vkdu_object *heap, uint32_t index, vkdu_object *buffer,
+        uint32_t format, uint64_t first, uint32_t count, uint32_t stride, uint32_t flags, uint32_t mapping)
+{
+    D3D12_SHADER_RESOURCE_VIEW_DESC desc = {0};
+    D3D12_CPU_DESCRIPTOR_HANDLE destination;
+    uint32_t element_size, component;
+    if (!VALID(heap, VKDU_DESCRIPTOR_HEAP) || heap->heap_type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV ||
+        index >= heap->descriptor_count || !count || flags > D3D12_BUFFER_SRV_FLAG_RAW ||
+        (mapping & ~0x1fffu) || !(mapping & D3D12_SHADER_COMPONENT_MAPPING_ALWAYS_SET_BIT_AVOIDING_ZEROMEM_MISTAKES))
+        return E_INVALIDARG;
+    for (component = 0; component < 4; ++component)
+        if (D3D12_DECODE_SHADER_4_COMPONENT_MAPPING(component, mapping) > D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1)
+            return E_INVALIDARG;
+    /* The embedded engine applies component mappings to textures only.
+     * Do not silently accept a buffer swizzle that it would discard. */
+    if (mapping != D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING) return E_NOTIMPL;
+    if (flags == D3D12_BUFFER_SRV_FLAG_RAW) {
+        if (format != DXGI_FORMAT_R32_TYPELESS || stride) return E_INVALIDARG;
+        element_size = 4;
+    } else if (stride) {
+        if (format != DXGI_FORMAT_UNKNOWN || (stride & 3) || stride > 2048) return E_INVALIDARG;
+        element_size = stride;
+    } else {
+        switch (format) {
+            case DXGI_FORMAT_R32_UINT: case DXGI_FORMAT_R32_SINT: case DXGI_FORMAT_R32_FLOAT: element_size = 4; break;
+            default: return E_NOTIMPL;
+        }
+    }
+    if (first > UINT64_MAX / element_size || count > UINT64_MAX / element_size - first) return E_INVALIDARG;
+    if (buffer && (!VALID(buffer, VKDU_BUFFER) || !vkdu_same_device(heap, buffer) ||
+        (buffer->resource_flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) ||
+        first > buffer->bytes / element_size || count > buffer->bytes / element_size - first)) return E_INVALIDARG;
+    /* A null resource plus a valid description is a real null table SRV.
+     * Invalid non-null resources must not be silently converted to null. */
+    desc.Format = format; desc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    desc.Shader4ComponentMapping = mapping;
+    desc.Buffer.FirstElement = first; desc.Buffer.NumElements = count;
+    desc.Buffer.StructureByteStride = stride; desc.Buffer.Flags = flags;
+    destination.ptr = (SIZE_T)(vkdu_heap_start(heap, 0) + (uint64_t)index * heap->descriptor_stride);
+    ID3D12Device_CreateShaderResourceView(heap->owner, buffer ? OBJ(ID3D12Resource, buffer) : NULL, &desc, destination);
+    return ID3D12Device_GetDeviceRemovedReason(heap->owner);
+}
 int32_t vkdu_descriptor_copy(vkdu_object *dst, uint32_t dst_index, vkdu_object *src, uint32_t src_index, uint32_t count)
 {
     D3D12_CPU_DESCRIPTOR_HANDLE destination, source;
@@ -483,6 +525,18 @@ int32_t vkdu_command_cbv(vkdu_object *command, uint32_t index, vkdu_object *buff
     address = vkdu_buffer_address(buffer) + offset;
     if (!address || (address & 255)) return E_INVALIDARG;
     ID3D12GraphicsCommandList_SetComputeRootConstantBufferView(OBJ(ID3D12GraphicsCommandList, command), index, address);
+    return S_OK;
+}
+int32_t vkdu_command_srv(vkdu_object *command, uint32_t index, vkdu_object *buffer, uint64_t offset)
+{
+    uint64_t address;
+    if (!RECORDING(command) || command->command_type == 3 || index >= command->slot_count ||
+        command->slots[index].type != D3D12_ROOT_PARAMETER_TYPE_SRV || (offset & 3) ||
+        !VALID(buffer, VKDU_BUFFER) || !vkdu_same_device(command, buffer) || offset >= buffer->bytes ||
+        (buffer->resource_flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)) return E_INVALIDARG;
+    address = vkdu_buffer_address(buffer);
+    if (!address || offset > UINT64_MAX - address || ((address + offset) & 3)) return E_INVALIDARG;
+    ID3D12GraphicsCommandList_SetComputeRootShaderResourceView(OBJ(ID3D12GraphicsCommandList, command), index, address + offset);
     return S_OK;
 }
 int32_t vkdu_command_dispatch(vkdu_object *command, uint32_t x, uint32_t y, uint32_t z)

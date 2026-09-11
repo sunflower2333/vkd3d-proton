@@ -21,6 +21,9 @@ static uint32_t uav_index, table_index, table_first, root_offset, root_space;
 static uint32_t cbv_index, cbv_bytes, root_cbv_index;
 static uint64_t cbv_offset;
 static vkdu_object *cbv_buffer;
+static uint32_t srv_index, srv_format, srv_count, srv_stride, srv_flags, srv_mapping, root_srv_index;
+static uint64_t srv_first, srv_offset;
+static vkdu_object *srv_buffer;
 static vkdu_object *make_peer(vkdu_device *owner, vkdu_kind kind, uint32_t type = 0, uint32_t count = 8, bool visible = false) {
     next_base += 0x10000;
     return reinterpret_cast<vkdu_object *>(new Peer{kind, owner, type, count, visible, next_base, next_base + 0x10000000});
@@ -57,6 +60,15 @@ static int32_t test_root_cbv(vkdu_object *, uint32_t index, vkdu_object *buffer,
     ++calls; root_cbv_index = index; cbv_buffer = buffer; cbv_offset = offset; return next_result;
 }
 static int32_t test_heaps(vkdu_object *, uint32_t, vkdu_object *const *) { ++calls; return next_result; }
+static int32_t test_srv(vkdu_object *, uint32_t index, vkdu_object *buffer, uint32_t format,
+        uint64_t first, uint32_t count, uint32_t stride, uint32_t flags, uint32_t mapping) {
+    ++calls; srv_index = index; srv_buffer = buffer; srv_format = format; srv_first = first;
+    srv_count = count; srv_stride = stride; srv_flags = flags; srv_mapping = mapping;
+    return next_result;
+}
+static int32_t test_root_srv(vkdu_object *, uint32_t index, vkdu_object *buffer, uint64_t offset) {
+    ++calls; root_srv_index = index; srv_buffer = buffer; srv_offset = offset; return next_result;
+}
 static int32_t test_table(vkdu_object *, uint32_t index, vkdu_object *, uint32_t first) {
     ++tables_seen; table_index = index; table_first = first; return next_result;
 }
@@ -78,6 +90,8 @@ static int32_t test_root(vkdu_device *d, const vkdu_root_parameter *p, uint32_t 
 #define vkdu_buffer_uav test_uav
 #define vkdu_buffer_cbv test_cbv
 #define vkdu_command_cbv test_root_cbv
+#define vkdu_buffer_srv test_srv
+#define vkdu_command_srv test_root_srv
 #define vkdu_descriptor_copy test_copy
 #define vkdu_command_heaps test_heaps
 #define vkdu_command_table test_table
@@ -124,6 +138,53 @@ int main() {
     REQUIRE(calls == before && reported == E_INVALIDARG);
     --destination.ptr;
     reported = S_OK;
+    D3D12DDIARG_CREATE_SHADER_RESOURCE_VIEW_0002 srv{};
+    srv.hDrvResource = {&buffer}; srv.ResourceDimension = D3D12DDI_RD_BUFFER;
+    srv.Format = DXGI_FORMAT_R32_TYPELESS; srv.Shader4ComponentMapping = 5768;
+    srv.Buffer.FirstElement = 17; srv.Buffer.NumElements = 101;
+    srv.Buffer.Flags = D3D12DDI_BUFFER_SRV_FLAG_RAW;
+    device.pfnCreateShaderResourceView(h, &srv, destination);
+    REQUIRE(reported == S_OK && srv_index == 3 && srv_buffer == b && srv_format == DXGI_FORMAT_R32_TYPELESS &&
+        srv_first == 17 && srv_count == 101 && srv_stride == 0 && srv_flags == 1 && srv_mapping == 5768);
+    srv.hDrvResource = {};
+    device.pfnCreateShaderResourceView(h, &srv, destination);
+    REQUIRE(!srv_buffer);
+    before = calls; srv.hDrvResource = {reinterpret_cast<void *>(1)};
+    device.pfnCreateShaderResourceView(h, &srv, destination);
+    REQUIRE(calls == before && reported == E_INVALIDARG);
+    srv.hDrvResource = {&command};
+    device.pfnCreateShaderResourceView(h, &srv, destination);
+    REQUIRE(calls == before && reported == E_INVALIDARG);
+    srv.hDrvResource = {&buffer};
+    auto *saved_resources = ctx.resources; ctx.resources = nullptr;
+    device.pfnCreateShaderResourceView(h, &srv, destination);
+    REQUIRE(calls == before && reported == E_INVALIDARG);
+    ctx.resources = saved_resources;
+    device.pfnCreateShaderResourceView(h, nullptr, destination);
+    REQUIRE(calls == before && reported == E_INVALIDARG);
+    srv.ResourceDimension = D3D12DDI_RD_TEXTURE2D;
+    device.pfnCreateShaderResourceView(h, &srv, destination);
+    REQUIRE(calls == before && reported == E_NOTIMPL);
+    srv.ResourceDimension = D3D12DDI_RD_BUFFER;
+    ++destination.ptr;
+    device.pfnCreateShaderResourceView(h, &srv, destination);
+    REQUIRE(calls == before && reported == E_INVALIDARG);
+    --destination.ptr;
+    next_result = DXGI_ERROR_DEVICE_REMOVED;
+    device.pfnCreateShaderResourceView(h, &srv, destination);
+    REQUIRE(reported == DXGI_ERROR_DEVICE_REMOVED);
+    next_result = S_OK; reported = S_OK;
+    commands.pfnSetComputeRootShaderResourceView({&command}, 6, buffer.address + 12);
+    REQUIRE(root_srv_index == 6 && srv_buffer == b && srv_offset == 12);
+    before = calls;
+    commands.pfnSetComputeRootShaderResourceView({&command}, 6, 0);
+    REQUIRE(calls == before && reported == E_INVALIDARG);
+    commands.pfnSetComputeRootShaderResourceView({&command}, 6, buffer.address + buffer.bytes);
+    REQUIRE(calls == before && reported == E_INVALIDARG);
+    next_result = E_INVALIDARG;
+    commands.pfnSetComputeRootShaderResourceView({&command}, 6, buffer.address + 1);
+    REQUIRE(calls == before + 1 && srv_offset == 1 && reported == E_INVALIDARG);
+    next_result = S_OK; reported = S_OK;
     D3D12DDI_CONSTANT_BUFFER_VIEW_DESC cbv{buffer.address + 256, 512, 0};
     device.pfnCreateConstantBufferView(h, &cbv, destination);
     REQUIRE(reported == S_OK && cbv_index == 3 && cbv_buffer == b && cbv_offset == 256 && cbv_bytes == 512);
@@ -176,6 +237,6 @@ int main() {
     device.pfnDestroyDescriptorHeap(h, hc); device.pfnDestroyDescriptorHeap(h, hg);
     REQUIRE(!ctx.descriptor_heaps && !ctx.resources && ctx.references == 1 && destroys == 5);
     REQUIRE(!cpu.magic && !gpu.magic && !root.magic);
-    std::puts("PASS actual WDK descriptor DDIs: flags, handles, UAV/CBV/copy/table/root translation, null CBV, failed create, device loss and balanced ownership; backend peers only");
+    std::puts("PASS actual WDK descriptor DDIs: flags, handles, UAV/CBV/SRV/copy/table/root translation, null descriptors, rejected unknown SRV handles, failed create, device loss and balanced ownership; backend peers only");
     return 0;
 }
