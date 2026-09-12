@@ -153,7 +153,6 @@ fences used by the test are not the runtime's monitored-fence contract.
 Caller must keep resources, shaders and command allocators alive until submitted
 work has retired and reset allocators only after completion, as required by D3D12.
 
-The CPU-Vulkan test compiles and executes a real SM5 compute shader, compares all
 Native ResourceBarrier now supports complete buffer transitions and both
 resource-specific and global UAV ordering. Opaque resource handles resolve
 through the live owned registry, and the complete native/backend batch is
@@ -162,6 +161,9 @@ buffers without unordered-access support. Two dependent four-dispatch
 readbacks and a WDK recorded-call negative control cover this boundary; see
 `docs/vkd3d-native-uav-barriers-20260912.md`. Split, alias/ranged and texture
 barriers remain unsupported. Native version admission remains closed.
+R0 default-buffer placement now keeps UAV-capable embedded usage and accepts
+initial UAV state; readback buffers remain COPY_DEST-only without UAV usage.
+No later-version native flag is treated as an R0 resource flag.
 
 The CPU-Vulkan test compiles and executes a real SM5 compute shader, compares all
 1024 readbacks after copy/barrier operations, checks fence signal/wait, timeout,

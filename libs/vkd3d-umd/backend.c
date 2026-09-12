@@ -167,15 +167,22 @@ int32_t vkdu_buffer_place(vkdu_device *device, vkdu_object *heap, uint64_t offse
     if (!device || !VALID(heap, VKDU_MEMORY_HEAP) || heap->owner != device->object || !bytes ||
             offset % 65536 || offset > heap->bytes || bytes > heap->bytes - offset ||
             (state != D3D12_RESOURCE_STATE_COMMON && state != D3D12_RESOURCE_STATE_COPY_SOURCE &&
-             state != D3D12_RESOURCE_STATE_COPY_DEST) ||
+             state != D3D12_RESOURCE_STATE_COPY_DEST && state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) ||
             (heap->heap_type == D3D12_HEAP_TYPE_READBACK && state != D3D12_RESOURCE_STATE_COPY_DEST)) return E_INVALIDARG;
     desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; desc.Width = bytes;
     desc.Height = desc.DepthOrArraySize = desc.MipLevels = desc.SampleDesc.Count = 1;
     desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    /* R0 has no unordered-access resource flag. Its supported default buffers
+     * must remain usable by the native UAV/view/command DDIs. Do not confuse
+     * later DDI flag 0x80 with embedded ALLOW_UNORDERED_ACCESS (0x4). */
+    desc.Flags = heap->heap_type == D3D12_HEAP_TYPE_DEFAULT ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : 0;
     hr = ID3D12Device_CreatePlacedResource(device->object, OBJ(ID3D12Heap, heap), offset, &desc, state, NULL,
                                             &IID_ID3D12Resource, (void **)&resource);
     hr = wrap(device, VKDU_BUFFER, hr, (IUnknown *)resource, out);
-    if (SUCCEEDED(hr)) { (*out)->bytes = bytes; (*out)->heap_type = heap->heap_type; }
+    if (SUCCEEDED(hr)) {
+        (*out)->bytes = bytes; (*out)->heap_type = heap->heap_type;
+        (*out)->resource_flags = desc.Flags;
+    }
     return hr;
 }
 

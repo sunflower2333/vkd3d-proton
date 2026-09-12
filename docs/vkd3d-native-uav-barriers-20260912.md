@@ -26,6 +26,15 @@ invalid kinds/foreign resources are rejected by the backend. Split barriers,
 alias/ranged barriers and texture subresources remain unsupported; this change
 does not expand feature-level or version admission.
 
+The required buffer-placement companion is included. The R0 resource flags
+have no UAV bit (the later _0022 bit is 0x80, whereas the embedded D3D12 API
+bit is 0x4 and native R0 0x4 means CROSS_ADAPTER). Supported native default
+buffers therefore receive UAV-capable embedded usage; no native flag is
+blindly forwarded or invented. The backend retains this flag for view/barrier
+validation. Initial UAV state is accepted on these default heaps. Readback
+heaps keep COPY_DEST-only state and no UAV usage. Native size/create fixtures
+check default/readback differences and reject the later-version flag.
+
 The exact native layout is the WDK's
 `D3D12DDIARG_RESOURCE_BARRIER_0003` and its `D3D12DDI_RESOURCE_UAV_BARRIER`
 union member. Microsoft's local DDI enum documentation describes completion

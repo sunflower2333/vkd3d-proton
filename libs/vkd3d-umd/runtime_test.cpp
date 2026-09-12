@@ -162,8 +162,11 @@ struct ImportPeer {
 };
 static bool import_failure, placement_failure, retire_during_import;
 static unsigned imports, placements;
+static bool last_import_cpu_visible;
+static uint32_t last_placement_state;
 static void retire_import_with_map(Context *, const mwd_allocation &);
-static int32_t test_import_heap(vkdu_device *device, void *owner, void *token, uint64_t size, int, vkdu_object **out) {
+static int32_t test_import_heap(vkdu_device *device, void *owner, void *token, uint64_t size, int cpu_visible, vkdu_object **out) {
+    last_import_cpu_visible = cpu_visible != 0;
     *out = nullptr; ++imports;
     wait_backend_worker(&native_runtime_callbacks, owner);
     if (import_failure) return E_OUTOFMEMORY;
@@ -177,7 +180,8 @@ static int32_t test_import_heap(vkdu_device *device, void *owner, void *token, u
     if (retire_during_import) retire_import_with_map(backing->context, allocation);
     return S_OK;
 }
-static int32_t test_place_buffer(vkdu_device *device, vkdu_object *memory, uint64_t offset, uint64_t size, uint32_t, vkdu_object **out) {
+static int32_t test_place_buffer(vkdu_device *device, vkdu_object *memory, uint64_t offset, uint64_t size, uint32_t state, vkdu_object **out) {
+    last_placement_state = state;
     *out = nullptr; ++placements;
     if (placement_failure) return E_INVALIDARG;
     auto *peer = reinterpret_cast<ImportPeer *>(memory);
@@ -586,6 +590,27 @@ static int test_native_heaps() {
     REQUIRE(native_token(ctx, paired_heap) && paired_heap->users == 1 && kernel_heaps.size() == 1);
     table.pfnDestroyHeapAndResource(create.hDrvDevice, {}, resource_handle);
     REQUIRE(kernel_heaps.empty() && !ctx->native_heaps);
+    // R0 has no explicit UAV resource flag. Native default buffers retain
+    // UAV-capable backend usage; READBACK still permits COPY_DEST only.
+    resource.InitialResourceState = D3D12DDI_RESOURCE_STATE_UNORDERED_ACCESS;
+    before_pair = allocations;
+    REQUIRE(table.pfnCalcPrivateHeapAndResourceSizes(create.hDrvDevice, &desc, &resource).Heap == 0);
+    REQUIRE(paired() == DXGI_ERROR_UNSUPPORTED && allocations == before_pair);
+    desc.CPUPageProperty = D3D12DDI_CPU_PAGE_PROPERTY_NOT_AVAILABLE;
+    sizes = table.pfnCalcPrivateHeapAndResourceSizes(create.hDrvDevice, &desc, &resource);
+    REQUIRE(sizes.Heap == sizeof(NativeHeapSlot) && sizes.Resource == sizeof(Object));
+    REQUIRE(paired() == S_OK && allocations == before_pair + 1 && !last_import_cpu_visible &&
+        last_placement_state == D3D12DDI_RESOURCE_STATE_UNORDERED_ACCESS);
+    REQUIRE(object(resource_handle.pDrvPrivate)->native_heap &&
+        object(resource_handle.pDrvPrivate)->address == native_heap_find(ctx, ha.pDrvPrivate)->address);
+    table.pfnDestroyHeapAndResource(create.hDrvDevice, ha, resource_handle);
+    REQUIRE(kernel_heaps.empty() && !ctx->native_heaps);
+    resource.Flags = D3D12DDI_RESOURCE_FLAG_0022_UNORDERED_ACCESS;
+    before_pair = allocations;
+    REQUIRE(paired() == DXGI_ERROR_UNSUPPORTED && allocations == before_pair);
+    resource.Flags = D3D12DDI_RESOURCE_FLAG_0003_NONE;
+    desc.CPUPageProperty = D3D12DDI_CPU_PAGE_PROPERTY_WRITE_BACK;
+    resource.InitialResourceState = D3D12DDI_RESOURCE_STATE_COPY_DEST;
     REQUIRE(paired() == S_OK);
     table.pfnDestroyHeapAndResource(create.hDrvDevice, ha, resource_handle);
     REQUIRE(kernel_heaps.empty() && !ctx->native_heaps);

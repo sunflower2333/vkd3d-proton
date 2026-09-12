@@ -109,7 +109,8 @@ HRESULT native_heap_desc(const D3D12DDIARG_CREATEHEAP_0001 *heap,
                 resource->Layout != D3D12DDI_TL_ROW_MAJOR || resource->Flags || resource->pRowMajorLayout ||
                 std::memcmp(&resource->ReuseBufferGPUVA, &no_reuse, sizeof(no_reuse))) return DXGI_ERROR_UNSUPPORTED;
         const uint32_t state = static_cast<uint32_t>(resource->InitialResourceState);
-        if (state != 0 && state != 0x400 && state != 0x800) return DXGI_ERROR_UNSUPPORTED;
+        if (state != 0 && state != 0x400 && state != 0x800 && state != D3D12DDI_RESOURCE_STATE_UNORDERED_ACCESS)
+            return DXGI_ERROR_UNSUPPORTED;
         if (heap->CPUPageProperty == D3D12DDI_CPU_PAGE_PROPERTY_WRITE_BACK && state != 0x400)
             return DXGI_ERROR_UNSUPPORTED;
     }
