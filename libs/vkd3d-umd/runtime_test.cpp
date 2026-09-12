@@ -44,6 +44,7 @@ static std::function<void()> backend_queue_create_callback, backend_queue_destro
 static std::set<vkdu_object *> executing_objects;
 static std::vector<vkdu_object *> submitted_commands;
 static bool force_queue_unowned, queue_negative_active;
+static bool force_early_completion, completion_negative_active;
 static uint64_t generation = 7;
 static D3D12DDI_HRTDEVICE last_runtime{};
 static const HANDLE expected_adapter = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(0x13570));
@@ -137,6 +138,10 @@ static int32_t test_command_close(vkdu_object *);
 static int32_t test_command_barriers(vkdu_object *, uint32_t, const vkdu_resource_barrier *);
 static int32_t test_queue_create(vkdu_device *, uint32_t, vkdu_object **);
 static int32_t test_queue_execute(vkdu_object *, uint32_t, vkdu_object *const *);
+static DWORD WINAPI test_event_wait(HANDLE event, DWORD timeout) {
+    if (force_early_completion && completion_negative_active && timeout == 0) return WAIT_OBJECT_0;
+    return WaitForSingleObject(event, timeout);
+}
 
 #define LoadLibraryExW test_load
 #define GetProcAddress test_symbol
@@ -157,7 +162,9 @@ static int32_t test_queue_execute(vkdu_object *, uint32_t, vkdu_object *const *)
 #define vkdu_command_barriers test_command_barriers
 #define vkdu_queue_create test_queue_create
 #define vkdu_queue_execute test_queue_execute
+#define WaitForSingleObject test_event_wait
 #include "ddi.cpp"
+#undef WaitForSingleObject
 
 #define REQUIRE(x) do { if (!(x)) { std::fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #x); return 1; } } while (0)
 
@@ -316,6 +323,11 @@ static std::array<D3DDDI_PATCHLOCATIONLIST, 1024> patch_lists[2];
 static unsigned renders;
 static HRESULT render_result = S_OK;
 static bool retire_render;
+static bool defer_completion;
+static HRESULT signal_result = S_OK;
+static unsigned signals;
+static std::vector<HANDLE> pending_events;
+static std::function<void()> nested_render, nested_signal;
 static void valid_kernel_callback(HANDLE runtime) {
     if (runtime != expected_device || heap_callbacks_retired) fixture_abort(__LINE__);
 }
@@ -455,8 +467,34 @@ static HRESULT APIENTRY heap_render(HANDLE runtime, D3DDDICB_RENDER *args) {
     args->pNewCommandBuffer = dma_commands[1].data(); args->NewCommandBufferSize = 65536;
     args->pNewAllocationList = allocation_lists[1].data(); args->NewAllocationListSize = 1024;
     args->pNewPatchLocationList = patch_lists[1].data(); args->NewPatchLocationListSize = 1024;
+    if (nested_render) nested_render();
     if (retire_render) { native_destroy_device(error_device); heap_callbacks_retired = true; }
     return render_result;
+}
+
+static HRESULT APIENTRY heap_signal(HANDLE runtime, const D3DDDICB_SIGNALSYNCHRONIZATIONOBJECT2 *args) {
+    valid_kernel_callback(runtime);
+    if (args->hContext != expected_context || args->ObjectCount || args->BroadcastContextCount ||
+            args->Flags.Value != 2 || !args->CpuEventHandle || !renders) fixture_abort(__LINE__);
+    for (auto handle : args->ObjectHandleArray) if (handle) fixture_abort(__LINE__);
+    for (auto handle : args->BroadcastContext) if (handle) fixture_abort(__LINE__);
+    ++signals;
+    if (nested_signal) nested_signal();
+    if (FAILED(signal_result)) return signal_result;
+    if (defer_completion) {
+        HANDLE kernel_event = nullptr;
+        if (!DuplicateHandle(GetCurrentProcess(), args->CpuEventHandle, GetCurrentProcess(),
+                &kernel_event, 0, FALSE, DUPLICATE_SAME_ACCESS)) fixture_abort(__LINE__);
+        pending_events.push_back(kernel_event);
+    } else if (!SetEvent(args->CpuEventHandle)) fixture_abort(__LINE__);
+    return S_OK;
+}
+static void complete_events(bool signal = true) {
+    for (auto event : pending_events) {
+        if (signal && !SetEvent(event)) fixture_abort(__LINE__);
+        CloseHandle(event);
+    }
+    pending_events.clear();
 }
 
 static void retire_import_with_map(Context *ctx, const mwd_allocation &allocation) {
@@ -491,6 +529,7 @@ static int test_native_heaps() {
     kt.pfnCreateContextCb = heap_context_create; kt.pfnDestroyContextCb = heap_context_destroy;
     kt.pfnEscapeCb = heap_escape; kt.pfnAllocateCb = heap_allocate; kt.pfnDeallocateCb = heap_deallocate;
     kt.pfnLockCb = heap_lock; kt.pfnUnlockCb = heap_unlock; kt.pfnRenderCb = heap_render;
+    kt.pfnSignalSynchronizationObject2Cb = heap_signal;
     D3D12DDI_CORELAYER_DEVICECALLBACKS_0003 um{}; um.pfnSetErrorCb = test_error;
     alignas(NativeDevice) std::array<unsigned char, sizeof(NativeDevice)> memory{};
     D3D12DDIARG_CREATEDEVICE_0003 create{};
@@ -1181,12 +1220,140 @@ static int test_native_queue_lifetime() {
     return 0;
 }
 
+static int test_native_completion() {
+    D3DDDI_ADAPTERCALLBACKS ac{}; ac.pfnQueryAdapterInfoCb = test_query;
+    D3D12DDI_ADAPTERFUNCS adapter{};
+    D3D12DDIARG_OPENADAPTER open{};
+    open.hRTAdapter.handle = expected_adapter; open.pAdapterCallbacks = &ac; open.pAdapterFuncs = &adapter;
+    REQUIRE(OpenAdapter12(&open) == S_OK);
+    D3DDDI_DEVICECALLBACKS kt{};
+    kt.pfnCreateContextCb = heap_context_create; kt.pfnDestroyContextCb = heap_context_destroy;
+    kt.pfnEscapeCb = heap_escape; kt.pfnAllocateCb = heap_allocate; kt.pfnDeallocateCb = heap_deallocate;
+    kt.pfnLockCb = heap_lock; kt.pfnUnlockCb = heap_unlock; kt.pfnRenderCb = heap_render;
+    kt.pfnSignalSynchronizationObject2Cb = heap_signal;
+    D3D12DDI_CORELAYER_DEVICECALLBACKS_0003 um{}; um.pfnSetErrorCb = test_error;
+    alignas(NativeDevice) std::array<unsigned char, sizeof(NativeDevice)> memory{};
+    D3D12DDIARG_CREATEDEVICE_0003 create{};
+    create.hDrvDevice.pDrvPrivate = memory.data(); create.hRTDevice.handle = expected_device;
+    create.Interface = D3D12DDI_INTERFACE_VERSION_R0; create.Version = D3D12DDI_BUILD_VERSION << 16;
+    create.pKTCallbacks = &kt; create.p12UMCallbacks = &um;
+    REQUIRE(adapter.pfnCreateDevice(open.hAdapter, &create) == S_OK);
+    auto *ctx = context(create.hDrvDevice);
+    mwd_allocation allocation{};
+    std::array<unsigned char, 16> stream{};
+    mwd_reference reference{};
+    auto allocate = [&]() {
+        HRESULT hr = native_runtime_allocate(ctx, 4096, 4096, 0, 6, &allocation);
+        reference = {allocation.token, 0, 4096, 3, 0};
+        return hr;
+    };
+    auto submit = [&]() { return native_runtime_submit(ctx, stream.data(), stream.size(), &reference, 1); };
+    uint32_t completed = 0;
+    REQUIRE(allocate() == S_OK);
+    const auto initial_renders = renders;
+    ctx->kernel_callbacks.pfnSignalSynchronizationObject2Cb = nullptr;
+    REQUIRE(submit() == DXGI_ERROR_UNSUPPORTED && renders == initial_renders);
+    ctx->kernel_callbacks.pfnSignalSynchronizationObject2Cb = heap_signal;
+    const auto handle = allocation.handle;
+    auto *token = static_cast<NativeHeap *>(allocation.token);
+    defer_completion = completion_negative_active = true;
+    nested_render = [&]() {
+        if (!token->submitted || token->users != 2) fixture_abort(__LINE__);
+        if (native_runtime_release(ctx, token) != S_OK || !kernel_heaps.count(handle)) fixture_abort(__LINE__);
+        // The caller may discard both the reference array and stream in a callback.
+        reference = {}; stream.fill(0xa5);
+    };
+    REQUIRE(submit() == S_OK);
+    nested_render = {};
+    if (!kernel_heaps.count(handle) || ctx->native_submission_count != 1) {
+        std::fputs("FAIL native DMA ownership retired before OS completion event\n", stderr);
+        return 1;
+    }
+    REQUIRE(token->users == 1 && token->submitted == 1 && pending_events.size() == 1);
+    void *mapping = nullptr; uint32_t mapped = 0;
+    REQUIRE(native_runtime_map(ctx, token, &mapping, &mapped) == DXGI_ERROR_WAS_STILL_DRAWING && !mapping && !mapped);
+    REQUIRE(native_runtime_completed(ctx, &completed) == S_OK && kernel_heaps.count(handle));
+    complete_events();
+    // Cleanup failure retains both the accepted event and its final resource owner.
+    fail_deallocate = 1;
+    REQUIRE(native_runtime_completed(ctx, &completed) == DXGI_ERROR_WAS_STILL_DRAWING && !completed);
+    REQUIRE(kernel_heaps.count(handle) && ctx->native_submission_count == 1);
+    REQUIRE(native_runtime_completed(ctx, &completed) == S_OK && !kernel_heaps.count(handle));
+    REQUIRE(!ctx->native_submissions && !ctx->native_heaps);
+    completion_negative_active = false;
+
+    // At most64 outstanding packets. A completed prefix is retired in order;
+    // later event registrations can conservatively include subsequent work.
+    REQUIRE(allocate() == S_OK);
+    token = static_cast<NativeHeap *>(allocation.token);
+    const auto before_signals = signals, before_renders = renders;
+    for (unsigned i = 0; i < native_submission_limit; ++i) REQUIRE(submit() == S_OK);
+    REQUIRE(ctx->native_submission_count == native_submission_limit && token->users == 65 && token->submitted == 64);
+    REQUIRE(signals == before_signals + 1 && renders == before_renders + 64);
+    REQUIRE(submit() == DXGI_ERROR_WAS_STILL_DRAWING && renders == before_renders + 64);
+    REQUIRE(native_runtime_release(ctx, token) == S_OK && kernel_heaps.count(allocation.handle));
+    defer_completion = false; complete_events();
+    REQUIRE(native_runtime_completed(ctx, &completed) == S_OK && !ctx->native_submissions && kernel_heaps.empty());
+    REQUIRE(signals == before_signals + 64);
+
+    // Failed event registration after an accepted Render cannot drop references.
+    REQUIRE(allocate() == S_OK);
+    signal_result = E_ACCESSDENIED;
+    REQUIRE(submit() == E_ACCESSDENIED && ctx->native_submission_count == 1);
+    REQUIRE(native_runtime_release(ctx, allocation.token) == S_OK && kernel_heaps.count(allocation.handle));
+    REQUIRE(native_runtime_completed(ctx, &completed) == E_ACCESSDENIED && kernel_heaps.count(allocation.handle));
+    signal_result = S_OK;
+    REQUIRE(native_runtime_completed(ctx, &completed) == S_OK && kernel_heaps.empty());
+
+    // Failed Render still consumes replacement buffers and retains conservative
+    // ownership until the context event confirms prior work has completed.
+    REQUIRE(allocate() == S_OK);
+    defer_completion = true; render_result = E_OUTOFMEMORY;
+    REQUIRE(submit() == E_OUTOFMEMORY && ctx->native_submission_count == 1);
+    REQUIRE(ctx->native_commands == dma_commands[1].data());
+    REQUIRE(native_runtime_release(ctx, allocation.token) == S_OK && kernel_heaps.count(allocation.handle));
+    render_result = S_OK; defer_completion = false; complete_events();
+    REQUIRE(native_runtime_completed(ctx, &completed) == S_OK && kernel_heaps.empty());
+
+    // An event callback can query completion recursively, but cannot interleave
+    // a new Render into the retirement transaction or release its active owner.
+    REQUIRE(allocate() == S_OK);
+    nested_signal = [&]() {
+        if (native_runtime_status(ctx) != S_OK || submit() != DXGI_ERROR_WAS_STILL_DRAWING ||
+                native_runtime_release(ctx, allocation.token) != S_OK) fixture_abort(__LINE__);
+    };
+    REQUIRE(submit() == S_OK && kernel_heaps.empty());
+    nested_signal = {};
+
+    // Signal callback retirement cancels publication. Residual allocations are
+    // owned by runtime device teardown, never cleaned with detached callbacks.
+    REQUIRE(allocate() == S_OK);
+    ++ctx->references;
+    error_device = create.hDrvDevice; defer_completion = true;
+    const auto old_deallocations = deallocations, old_context_destroys = heap_context_destroys;
+    nested_signal = [&]() {
+        native_destroy_device(error_device); heap_callbacks_retired = true;
+        memory.fill(0xa5);
+    };
+    REQUIRE(submit() == DXGI_ERROR_DEVICE_REMOVED);
+    REQUIRE(deallocations == old_deallocations && heap_context_destroys == old_context_destroys);
+    REQUIRE(ctx->native_retiring && ctx->native_submission_count == 1 && kernel_heaps.count(allocation.handle));
+    nested_signal = {}; complete_events();
+    REQUIRE(native_runtime_completed(ctx, &completed) == DXGI_ERROR_DEVICE_REMOVED);
+    release(ctx); // Backend cleanup and event handles retire without KMT callbacks.
+    kernel_heaps.clear(); kernel_resources.clear(); heap_callbacks_retired = defer_completion = false;
+    REQUIRE(adapter.pfnCloseAdapter(open.hAdapter) == S_OK);
+    std::puts("PASS native OS completion events, ordered DMA ownership, bounded pending retirement and callback cancellation");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc == 2 && !std::strcmp(argv[1], "--negative-control-deferred-backend")) force_deferred_cleanup = true;
     else if (argc == 2 && !std::strcmp(argv[1], "--negative-control-command-error-owner")) force_device_command_error = true;
     else if (argc == 2 && !std::strcmp(argv[1], "--negative-control-global-uav-barrier")) force_drop_global_barrier = true;
     else if (argc == 2 && !std::strcmp(argv[1], "--negative-control-queue-ownership")) force_queue_unowned = true;
+    else if (argc == 2 && !std::strcmp(argv[1], "--negative-control-os-completion")) force_early_completion = true;
     else if (argc != 1) return 2;
     REQUIRE(test_finalization_borrow() == 0);
     REQUIRE(OpenAdapter12(nullptr) == E_INVALIDARG);
@@ -1291,6 +1458,7 @@ int main(int argc, char **argv) {
     REQUIRE(test_native_heaps() == 0);
     REQUIRE(test_native_command_errors() == 0);
     REQUIRE(test_native_queue_lifetime() == 0);
+    REQUIRE(test_native_completion() == 0);
     std::printf("PASS native OpenAdapter12 WDK identity/negotiation/private memory/callback/lifetime/error cleanup (%zu-bit); no system-runtime or GPU acceptance\n", sizeof(void *) * 8);
     return 0;
 }

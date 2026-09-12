@@ -216,6 +216,16 @@ HRESULT APIENTRY probe_render(HANDLE h, D3DDDICB_RENDER *args) {
     if (SUCCEEDED(hr)) { ++peer(h)->renders; if (target) ++peer(h)->target_references; }
     return hr;
 }
+HRESULT APIENTRY probe_signal(HANDLE h, const D3DDDICB_SIGNALSYNCHRONIZATIONOBJECT2 *args) {
+    if (!h || !args || kmt_handle(args->hContext) != peer(h)->context_handle ||
+            args->ObjectCount || args->BroadcastContextCount || args->Flags.Value != 2 || !args->CpuEventHandle)
+        return E_INVALIDARG;
+    D3DKMT_SIGNALSYNCHRONIZATIONOBJECT2 signal{};
+    signal.hContext = peer(h)->context_handle;
+    signal.Flags = args->Flags;
+    signal.CpuEventHandle = args->CpuEventHandle;
+    return nt_result(D3DKMTSignalSynchronizationObject2(&signal), "SignalSynchronizationObject2(CpuEvent)");
+}
 void APIENTRY probe_error(D3D10DDI_HRTDEVICE, HRESULT hr) {
     std::fprintf(stderr, "native SetErrorCb=%08x\n", static_cast<unsigned>(hr));
 }
@@ -257,6 +267,7 @@ struct NativeSession {
         kt.pfnCreateContextCb = probe_context_create; kt.pfnDestroyContextCb = probe_context_destroy;
         kt.pfnEscapeCb = probe_escape; kt.pfnAllocateCb = probe_allocate; kt.pfnDeallocateCb = probe_deallocate;
         kt.pfnLockCb = probe_lock; kt.pfnUnlockCb = probe_unlock; kt.pfnRenderCb = probe_render;
+        kt.pfnSignalSynchronizationObject2Cb = probe_signal;
         D3D12DDI_CORELAYER_DEVICECALLBACKS_0003 um{}; um.pfnSetErrorCb = probe_error;
         create.hDrvDevice.pDrvPrivate = device_memory.data(); create.hRTDevice.handle = &runtime;
         create.Interface = D3D12DDI_INTERFACE_VERSION_R0; create.Version = D3D12DDI_BUILD_VERSION << 16;

@@ -36,6 +36,7 @@ struct NativeHeap {
     void *mapped = nullptr;
     uint32_t map_count = 0;
     uint32_t users = 1, flags = 4;
+    uint32_t submitted = 0;
     uint64_t alignment = native_heap_alignment;
     bool cpu_visible = false, locked = false, pending = false, resource_created = false;
 };
@@ -341,6 +342,9 @@ HRESULT native_heap_map_record(Context *value, NativeHeap *heap, void **out) {
     if (!op.live()) return DXGI_ERROR_DEVICE_REMOVED;
     auto *ctx = op.ctx;
     if (!heap || !(heap->flags & 2) || heap->pending || !heap->allocation) return E_INVALIDARG;
+    // A new LockCb can rename its allocation handle. Preserve the handle used
+    // by every outstanding DMA packet until its OS completion event retires.
+    if (heap->submitted && !heap->locked) return DXGI_ERROR_WAS_STILL_DRAWING;
     HRESULT hr = native_heap_generation(ctx);
     if (FAILED(hr)) return hr;
     if (heap->map_count == UINT32_MAX) return E_INVALIDARG;
@@ -421,7 +425,7 @@ void native_heap_retire(Context *ctx) {
     // Do not issue driver Unlock/Deallocate/DestroyContext while that call runs.
     // This does not keep KMT backing alive after the runtime's own device
     // teardown: cancellation is rechecked before further backend operations.
-    if (ctx->native_backend_calls) return;
+    if (ctx->native_backend_calls || ctx->native_submissions) return;
     bool pending = ctx->native_context_pending || ctx->native_submitting;
     for (auto *heap = ctx->native_heaps; heap; heap = heap->next) {
         if (heap->pending || ctx->native_submitting) { pending = true; continue; }
@@ -439,6 +443,7 @@ void native_heap_forget(Context *ctx) {
     // No runtime callback is legal after DestroyDevice returns. Any unreleased
     // kernel allocations/context belong to runtime device teardown, not a later
     // stale callback. User-mode residual records no longer retain runtime slots.
+    native_submission_forget(ctx);
     while (ctx->native_heaps) {
         auto *heap = ctx->native_heaps; ctx->native_heaps = heap->next; delete heap;
     }

@@ -13,10 +13,13 @@ constexpr uint32_t context_magic = 0x564b4455, object_magic = 0x564b4f42;
 constexpr uint32_t native_device_magic = 0x564b4e44;
 struct NativeAdapter;
 struct NativeHeap;
+struct NativeSubmission;
 struct Context;
 struct Object;
 void native_heap_forget(Context *);
 void native_heap_retire(Context *);
+void native_submission_forget(Context *);
+HRESULT native_submission_reap(Context *);
 void native_heap_tables(D3D12DDI_DEVICE_FUNCS_CORE_0003 *);
 HRESULT native_command_create(Context *, const D3D12DDIARG_CREATE_COMMAND_LIST_0001 *);
 void native_command_destroy(Context *, Object *);
@@ -74,6 +77,9 @@ struct Context {
     bool native_destroying = false;
     bool native_retiring = false;
     bool native_context_pending = false;
+    NativeSubmission *native_submissions = nullptr;
+    unsigned native_submission_count = 0;
+    bool native_reaping = false;
 };
 struct Object {
     uint32_t magic;
