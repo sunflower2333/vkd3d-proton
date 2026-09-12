@@ -47,6 +47,7 @@ struct Deadline {
 };
 
 struct ProbeRuntime {
+    LUID requested_luid{};
     D3DKMT_HANDLE adapter = 0, device = 0, context_handle = 0;
     uint32_t context_id = 0;
     std::mutex mutex;
@@ -72,6 +73,7 @@ struct ProbeRuntime {
         return S_OK;
     }
     void open(LUID luid) {
+        requested_luid = luid;
         D3DKMT_OPENADAPTERFROMLUID a{}; a.AdapterLuid = luid;
         HRESULT hr = nt_result(D3DKMTOpenAdapterFromLuid(&a), "OpenAdapterFromLuid");
         adapter = a.hAdapter; check(hr, "OpenAdapterFromLuid");
@@ -153,19 +155,20 @@ HRESULT APIENTRY probe_allocate(HANDLE h, D3DDDICB_ALLOCATE *args) {
 }
 HRESULT APIENTRY probe_deallocate(HANDLE h, const D3DDDICB_DEALLOCATE *args) {
     if (!h || !args || args->hResource || !args->NumAllocations || !args->HandleList) return E_INVALIDARG;
-    D3DKMT_DESTROYALLOCATION a{}; a.hDevice = peer(h)->device;
-    a.NumAllocations = args->NumAllocations; a.phAllocationList = args->HandleList;
+    D3DKMT_DESTROYALLOCATION2 a{}; a.hDevice = peer(h)->device;
+    a.AllocationCount = args->NumAllocations; a.phAllocationList = args->HandleList;
     // No AssumeNotInUse claim: VidMm remains responsible for idleness.
-    NTSTATUS status = D3DKMTDestroyAllocation(&a);
+    a.Flags.AssumeNotInUse = 0;
+    NTSTATUS status = D3DKMTDestroyAllocation2(&a);
     for (unsigned attempt = 0; attempt < 100 &&
             (static_cast<uint32_t>(status) == 0x80000011u || static_cast<uint32_t>(status) == 0xc01e0102u); ++attempt) {
-        Sleep(1); status = D3DKMTDestroyAllocation(&a);
+        Sleep(1); status = D3DKMTDestroyAllocation2(&a);
     }
     if (status >= 0) {
         std::lock_guard<std::mutex> lock(peer(h)->mutex);
         for (UINT i = 0; i < args->NumAllocations; ++i) peer(h)->allocations.erase(args->HandleList[i]);
     }
-    return nt_result(status, "DestroyAllocation");
+    return nt_result(status, "DestroyAllocation2");
 }
 HRESULT APIENTRY probe_lock(HANDLE h, D3DDDICB_LOCK *args) {
     if (!h || !args || !peer(h)->has(args->hAllocation)) return E_INVALIDARG;
@@ -241,6 +244,9 @@ struct NativeSession {
         D3DDDI_ADAPTERCALLBACKS ac{}; ac.pfnQueryAdapterInfoCb = probe_query;
         open.hRTAdapter.handle = &runtime; open.pAdapterCallbacks = &ac; open.pAdapterFuncs = &adapter;
         check(OpenAdapter12(&open), "native OpenAdapter12");
+        auto identity = native_adapter(open.hAdapter);
+        require(identity && !std::memcmp(identity->luid.data(), &runtime.requested_luid, sizeof(LUID)),
+                "KMD publication matches explicitly requested adapter LUID");
         UINT count = 123; check(adapter.pfnGetSupportedVersions(open.hAdapter, &count, nullptr), "native versions");
         require(count == 0, "native admission remains disabled");
         D3DDDI_DEVICECALLBACKS kt{};

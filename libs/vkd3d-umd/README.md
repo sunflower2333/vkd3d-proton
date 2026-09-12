@@ -111,8 +111,11 @@ original adapter/device/resource handles, validates the v0 KMD context's reset
 generation and GPUVA range, and reserves non-overlapping 64-KiB heap ranges.
 Only L0 buffers with CPU access unavailable or WRITE_BACK are accepted; current
 KMD native allocations must fit its 32-bit allocation-size field. WRITE_COMBINE,
-L1, textures, primary/coherent-systemwide heaps and all resource creation remain
-unsupported. Runtime-owned heap storage need not be pre-zeroed. Failed cleanup
+L1, textures and primary/coherent-systemwide heaps remain unsupported. Paired
+buffer resources accept offset0, row-major/unknown-format, one mip/sample and
+COMMON/COPY_SOURCE/COPY_DEST; WRITE_BACK paired resources require COPY_DEST.
+Nonzero ReuseBufferGPUVA and other placement semantics are rejected.
+Runtime-owned heap storage need not be pre-zeroed. Failed cleanup
 keeps the allocation and VA reservation until device teardown; no AssumeNotInUse
 flag or synthetic KMT handle is used. Each non-null runtime resource belongs to
 one heap; deallocation releases both its kernel resource and allocation. Null
@@ -122,17 +125,27 @@ including ownership of handles renamed by LockCb. Synchronous device destruction
 detaches callbacks safely and delegates residual kernel handles to runtime device
 teardown, without stale callbacks or touching expired private slots.
 
-This is a KMD heap owner, not a Vulkan resource-import or WDDM2 GPUVA mapping
-implementation. Turnip currently owns a separate KMT device/context and disables
-external-memory import on WDDM. A resource cannot use these heaps until that
-ownership bridge is implemented. Therefore the R0 resource argument is rejected,
-all native DDI versions stay unadvertised, and no system D3D12 acceptance is
+The private shared-runtime protocol now initializes matching Turnip against the
+same actual native context and allocator before its internal BO creation. A
+native heap token is imported into Vulkan without a second allocation, and its
+placed buffer GPUVA must match the heap's IOVA. Separate heap/resource/alias
+owners retain the actual backing. Direct KMT Vulkan clients keep their existing
+path. Public Win32 external memory and WDDM2 GPUVA mapping remain unsupported.
+All native DDI versions stay unadvertised, and no system D3D12 acceptance is
 claimed. The WDK fixture checks heap address alignment/exhaustion, runtime handle
 identity, foreign-device rejection, nested/renamed/null-pointer maps, failed
 context and allocation cleanup, mid-allocation reset and callback reentrancy.
 
+Backend calls release all recursive callback lock levels and retain Context
+metadata. Terminal callbacks cannot resurrect a zero reference count. Device
+retirement skips driver unlock/deallocate/context-close during active backend
+windows, and import cancellation is checked before placement starts. This does
+not guarantee backing survival after the real Microsoft runtime's final KMT
+teardown; its destruction serialization and worker quiescence remain admission
+gates. Controlled retirement fixtures do not access a map after DestroyDevice.
+
 Still required for a native system driver: complete negotiated feature levels;
-full device/core and graphics DDIs; resource/heap import and placement,
+full device/core and graphics DDIs; remaining resource/heap types and placement,
 residency and WDDM2 GPUVA mapping; remaining descriptor views;
 monitored fences referring to the runtime's actual GPU backing; shared surfaces,
 presentation, device-removal/TDR recovery and WDDM KMD integration. The backend
@@ -211,6 +224,25 @@ The earlier09146e1 two-workload checkpoint passed on the real ARM64 VIOGPU
 in1005ms with process-local Mesa56bd30c and the exact matched OS/Vulkan identity.
 The84d6bba CBV checkpoint also passed the ARM64 target in806ms with6144
 correct GPU readbacks; this does not validate the later SRV extension.
+
+`vkd3d-umd-shared-gpu-probe --luid-low HEX --luid-high HEX --run-shared-backing`
+tests the newer shared runtime allocation path. It embeds the production native
+entry/backend and emulates only the Microsoft runtime callbacks, forwarding
+allocations, maps, escapes and RenderCb to real D3DKMT. It requires the exact
+VIOGPU LUID and a matching private-import Turnip selected through the system
+Vulkan loader (for example with a process-local VK_DRIVER_FILES manifest).
+An old Mesa without the exact protocol is rejected; there is no CPU fallback.
+
+The probe verifies duplicate import creates no additional allocation, actual
+native allocation identity in RenderCb, and8 changing copies of1024 words into
+a native READBACK buffer with15360 untouched sentinel words per round. The
+result is read through native MapHeap. Native heap, resource and Vulkan alias
+destruction is checked, and final KMT cleanup must succeed. Each GPU fence wait
+is bounded by10s; an overall90s deadline terminates a hung probe process.
+Exit0 means all probe checks passed,1 failure,2 missing/invalid explicit identity,
+and124 timeout. CI compiles the probe and checks its no-argument gate; target
+GPU execution remains a separate required test. This is emulated-runtime plus
+actual KMT/GPU proof only, never ordinary Microsoft D3D12CreateDevice acceptance.
 
 Driver-parent packaging must build from `external/vkd3d-proton`, retain Mesa4ace
 and KMD7648b72f or explicit validated successors, copy this candidate before PE
