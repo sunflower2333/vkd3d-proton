@@ -14,6 +14,9 @@ if vkd3d_platform == 'windows'
     umd_runtime_test = executable('vkd3d-umd-runtime-test', 'runtime_test.cpp',
       dependencies : [umd_backend_dep, lib_gdi32, lib_dxgi],
       include_directories : vkd3d_private_includes, cpp_args : ['-DNOMINMAX'])
+    umd_shared_gpu_probe = executable('vkd3d-umd-shared-gpu-probe', 'runtime_gpu_probe.cpp',
+      dependencies : [umd_backend_dep, lib_gdi32, lib_dxgi],
+      include_directories : vkd3d_private_includes, cpp_args : ['-DNOMINMAX'])
     # Uses the production backend; the CPU test-device entrypoint is absent.
     umd_gpu_probe = executable('vkd3d-umd-gpu-probe', 'backend_test.c',
       c_args : ['-DVKDU_GPU_PROBE'], dependencies : umd_backend_dep,
