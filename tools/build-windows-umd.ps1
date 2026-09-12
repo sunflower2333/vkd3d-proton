@@ -51,7 +51,11 @@ Copy-Item libs/vkd3d-umd/README.md $output
 dumpbin /headers $dll | Out-File (Join-Path $output 'pe-headers.txt')
 dumpbin /exports $dll | Out-File (Join-Path $output 'exports.txt')
 dumpbin /dependents $dll | Out-File (Join-Path $output 'dependents.txt')
-$stream = [IO.File]::OpenRead($dll)
+$sharedProbe = Join-Path $buildDir 'libs\vkd3d-umd\vkd3d-umd-shared-gpu-probe.exe'
+dumpbin /dependents $sharedProbe | Out-File (Join-Path $output 'shared-probe-dependents.txt')
+dumpbin /headers $sharedProbe | Out-File (Join-Path $output 'shared-probe-pe-headers.txt')
+foreach ($image in @($dll, $sharedProbe)) {
+$stream = [IO.File]::OpenRead($image)
 try {
     $reader = New-Object IO.BinaryReader($stream)
     $stream.Position = 0x3c; $stream.Position = $reader.ReadInt32()
@@ -59,8 +63,10 @@ try {
     $expected = @{arm64=0xaa64;x64=0x8664;x86=0x14c}[$Architecture]
     if ($reader.ReadUInt16() -ne $expected) { throw 'UMD PE architecture mismatch' }
 } finally { $stream.Dispose() }
+}
 [PSCustomObject]@{Source=(& git rev-parse HEAD); Submodules=(& git submodule status --recursive);
     Architecture=$Architecture; WindowsKit=$sdkVersion; NativeRuntimeValidated=$false;
+    SharedBackingProbeRuntime='Emulated callbacks forwarding to real D3DKMT'; SharedBackingProbeTargetValidated=$false;
     Contract='Native lifecycle, shared runtime KMD heaps and private Turnip buffer import; zero advertised feature levels; emulated-runtime GPU probe requires target execution; no native runtime acceptance'} |
     ConvertTo-Json -Depth 4 | Set-Content (Join-Path $output 'source.json')
 $hashes = Get-ChildItem $output -File | Get-FileHash -Algorithm SHA256
