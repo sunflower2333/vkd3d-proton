@@ -46,14 +46,18 @@ struct NativeHeap {
 struct NativeHeapOperation {
     Context *ctx;
     bool retained;
-    explicit NativeHeapOperation(Context *value) : ctx(value) {
+    bool cleanup;
+    explicit NativeHeapOperation(Context *value, bool allow_cleanup = false) : ctx(value), cleanup(allow_cleanup) {
         retained = retain_live(ctx);
         if (ctx) ctx->error_mutex.lock();
     }
     ~NativeHeapOperation() {
         if (ctx) { ctx->error_mutex.unlock(); if (retained) release(ctx); }
     }
-    bool live() const { return ctx && !ctx->native_retiring && ctx->runtime_device.handle && ctx->native_adapter; }
+    bool live() const {
+        return ctx && !ctx->native_retiring && (!ctx->native_destroying || cleanup) &&
+            ctx->runtime_device.handle && ctx->native_adapter;
+    }
 };
 
 // Vulkan can wait for queue workers which enter the runtime callback lock.

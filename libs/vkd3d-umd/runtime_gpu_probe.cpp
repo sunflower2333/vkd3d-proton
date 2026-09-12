@@ -54,6 +54,8 @@ struct ProbeRuntime {
     std::map<D3DKMT_HANDLE, NativeAllocationInfo> allocations;
     std::atomic_uint creates{0}, renders{0}, target_references{0};
     std::atomic_uint target_handle{0};
+    std::atomic_bool native_cleanup{false};
+    std::atomic_uint cleanup_completions{0};
     ~ProbeRuntime() { close(); }
     HRESULT close() {
         // This is the probe's actual final KMT device teardown, performed only
@@ -132,6 +134,8 @@ HRESULT APIENTRY probe_escape(HANDLE h, const D3DDDICB_ESCAPE *args) {
         auto *info = static_cast<NativeContextInfo *>(args->pPrivateDriverData);
         if (info->opcode == 1) peer(h)->context_id = info->context_id;
     }
+    if (SUCCEEDED(hr) && peer(h)->native_cleanup && args->PrivateDriverDataSize == sizeof(NativeFenceInfo))
+        ++peer(h)->cleanup_completions;
     return hr;
 }
 HRESULT APIENTRY probe_allocate(HANDLE h, D3DDDICB_ALLOCATE *args) {
@@ -352,7 +356,15 @@ void run_probe(LUID luid) {
     alias.reset();
     require(!runtime.has(target), "final imported owner releases native allocation");
     check(VioGpuD3D12BridgeStatus(native.create.hDrvDevice), "native teardown status");
+    runtime.native_cleanup = true;
     native.finish();
+    require(runtime.cleanup_completions != 0, "backend completed-fence callback succeeds during native cleanup");
+    require(runtime.context_handle == 0, "native context closed before final runtime device cleanup");
+    {
+        std::lock_guard<std::mutex> lock(runtime.mutex);
+        require(runtime.allocations.empty(), "all native allocations released before final runtime device cleanup");
+    }
+    std::printf("PASS cleanup completed_queries=%u native_context=0 allocations=0\n", runtime.cleanup_completions.load());
     check(runtime.close(), "final real KMT owner cleanup");
     std::printf("PASS shared native heap/private Turnip import/real RenderCb/MapHeap:8x16384 words; renders=%u\n",
         runtime.renders.load());

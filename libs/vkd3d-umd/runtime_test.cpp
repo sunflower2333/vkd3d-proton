@@ -22,17 +22,24 @@ static bool reset_during_create = false;
 static PFND3D12DDI_DESTROYDEVICE retire_in_error = nullptr;
 static D3D12DDI_HDEVICE error_device{};
 static std::function<void()> nested_error_callback;
+static std::function<void(const mwd_callbacks *, void *)> backend_destructor_check;
+static bool force_deferred_cleanup;
 static uint64_t generation = 7;
 static D3D12DDI_HRTDEVICE last_runtime{};
 static const HANDLE expected_adapter = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(0x13570));
 static const std::array<uint8_t, 8> expected_luid{1,2,3,4,5,6,7,8};
-static void wait_backend_worker(const mwd_callbacks *callbacks, void *owner) {
+static void wait_backend_worker(const mwd_callbacks *callbacks, void *owner, bool require_live = false) {
     HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!done) std::abort();
     std::thread worker([=]() {
-        callbacks->status(owner);
+        const auto status = callbacks->status(owner);
         uint32_t fence = 0;
-        callbacks->completed(owner, &fence);
+        const auto completed = callbacks->completed(owner, &fence);
+        if (require_live && (FAILED(status) || FAILED(completed) || fence != 9)) {
+            std::fprintf(stderr, "FAIL ordinary backend completion after premature callback retirement: status=%08x completed=%08x fence=%u\n",
+                static_cast<unsigned>(status), static_cast<unsigned>(completed), fence);
+            std::exit(1);
+        }
         SetEvent(done);
     });
     if (WaitForSingleObject(done, 2000) != WAIT_OBJECT_0) {
@@ -64,7 +71,8 @@ static int32_t test_create(PFN_vkGetInstanceProcAddr loader, const uint8_t luid[
 static void test_destroy(vkdu_device *device) {
     if (device) {
         auto *peer = reinterpret_cast<TestDevice *>(device);
-        wait_backend_worker(peer->callbacks, peer->owner);
+        if (backend_destructor_check) backend_destructor_check(peer->callbacks, peer->owner);
+        else wait_backend_worker(peer->callbacks, peer->owner);
         ++destroys; delete peer;
     }
 }
@@ -588,6 +596,66 @@ static int test_native_heaps() {
     kernel_heaps.clear(); kernel_resources.clear();
     heap_callbacks_retired = retire_during_import = false;
     REQUIRE(adapter.pfnCloseAdapter(open.hAdapter) == S_OK);
+
+    // Ordinary last-owner teardown must keep read/cleanup callbacks legal until
+    // the actual backend destructor releases its internal mapped allocation.
+    REQUIRE(OpenAdapter12(&open) == S_OK);
+    REQUIRE(adapter.pfnCreateDevice(open.hAdapter, &create) == S_OK);
+    auto *ordinary = context(create.hDrvDevice);
+    mwd_allocation cleanup_allocation{};
+    REQUIRE(native_runtime_allocate(ordinary, 4096, 4096, 0, 6, &cleanup_allocation) == S_OK);
+    void *internal_map = nullptr; uint32_t internal_handle = 0;
+    REQUIRE(native_runtime_map(ordinary, cleanup_allocation.token, &internal_map, &internal_handle) == S_OK);
+    const unsigned destroys_before_cleanup = heap_context_destroys;
+    bool destructor_checked = false;
+    backend_destructor_check = [&](const mwd_callbacks *cb, void *owner) {
+        wait_backend_worker(cb, owner, true);
+        mwd_context_info info{}; mwd_allocation forbidden{};
+        void *forbidden_map = nullptr; uint32_t forbidden_handle = 0;
+        if (cb->context(owner, &info) != S_OK || info.context_id != 83 ||
+                cb->allocate(owner, 4096, 4096, 0, 6, &forbidden) != DXGI_ERROR_DEVICE_REMOVED || forbidden.token ||
+                cb->map(owner, cleanup_allocation.token, &forbidden_map, &forbidden_handle) != DXGI_ERROR_DEVICE_REMOVED || forbidden_map ||
+                cb->submit(owner, nullptr, 0, nullptr, 0) != DXGI_ERROR_DEVICE_REMOVED ||
+                cb->unmap(owner, cleanup_allocation.token) != S_OK || cb->release(owner, cleanup_allocation.token) != S_OK ||
+                !kernel_heaps.empty() || heap_context_destroys != destroys_before_cleanup) {
+            std::fputs("FAIL ordinary backend cleanup ownership or new-work gate\n", stderr); std::exit(1);
+        }
+        destructor_checked = true;
+    };
+    // This negative control deliberately selects the real deferred lifetime:
+    // the required ordinary callback checks must reject it after retirement.
+    if (force_deferred_cleanup) ++ordinary->references;
+    adapter.pfnDestroyDevice(create.hDrvDevice);
+    if (force_deferred_cleanup) release(ordinary);
+    backend_destructor_check = {};
+    REQUIRE(destructor_checked && !context(create.hDrvDevice) &&
+        heap_context_destroys == destroys_before_cleanup + 1 && kernel_heaps.empty());
+    REQUIRE(adapter.pfnCloseAdapter(open.hAdapter) == S_OK);
+
+    // Recursive runtime retirement during that backend destructor invalidates
+    // its private slot immediately. The outer call may only retain Context.
+    REQUIRE(OpenAdapter12(&open) == S_OK);
+    REQUIRE(adapter.pfnCreateDevice(open.hAdapter, &create) == S_OK);
+    ordinary = context(create.hDrvDevice);
+    REQUIRE(native_runtime_allocate(ordinary, 4096, 4096, 0, 6, &cleanup_allocation) == S_OK);
+    backend_destructor_check = [&](const mwd_callbacks *cb, void *owner) {
+        wait_backend_worker(cb, owner, true);
+        adapter.pfnDestroyDevice(create.hDrvDevice);
+        heap_callbacks_retired = true;
+        memory.fill(0xa5); // Runtime storage expires at the inner return.
+        uint32_t retired_completed = 123;
+        if (cb->status(owner) != DXGI_ERROR_DEVICE_REMOVED ||
+                cb->completed(owner, &retired_completed) != DXGI_ERROR_DEVICE_REMOVED || retired_completed ||
+                cb->release(owner, cleanup_allocation.token) != S_OK || kernel_heaps.size() != 1) {
+            std::fputs("FAIL recursive backend retirement touched expired runtime\n", stderr); std::exit(1);
+        }
+    };
+    adapter.pfnDestroyDevice(create.hDrvDevice);
+    backend_destructor_check = {};
+    REQUIRE(kernel_heaps.size() == 1);
+    kernel_heaps.clear(); kernel_resources.clear(); heap_callbacks_retired = false;
+    REQUIRE(adapter.pfnCloseAdapter(open.hAdapter) == S_OK);
+    std::puts("PASS ordinary backend completion/unmap/release before runtime retirement; recursive poisoned-slot retirement remains closed");
     std::printf("PASS native buffer heaps/shared runtime allocation tokens/RenderCb replacements/reset/reentrant teardown (%zu-bit); DDI versions remain unsupported\n", sizeof(void *) * 8);
     return 0;
 }
@@ -612,7 +680,9 @@ static int test_finalization_borrow() {
     return 0;
 }
 
-int main() {
+int main(int argc, char **argv) {
+    if (argc == 2 && !std::strcmp(argv[1], "--negative-control-deferred-backend")) force_deferred_cleanup = true;
+    else if (argc != 1) return 2;
     REQUIRE(test_finalization_borrow() == 0);
     REQUIRE(OpenAdapter12(nullptr) == E_INVALIDARG);
     D3DDDI_ADAPTERCALLBACKS callbacks{};

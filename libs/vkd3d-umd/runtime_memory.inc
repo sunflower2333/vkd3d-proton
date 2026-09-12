@@ -34,15 +34,17 @@ void native_export(Context *ctx, NativeHeap *heap, mwd_allocation *out) {
     *out = {heap, heap->address, heap->bytes, ctx->native_adapter->generation, heap->allocation, heap->flags};
 }
 int32_t MWD_CALL native_runtime_status(void *owner) {
-    NativeHeapOperation op(static_cast<Context *>(owner));
+    NativeHeapOperation op(static_cast<Context *>(owner), true);
     return op.live() ? native_heap_generation(op.ctx) : DXGI_ERROR_DEVICE_REMOVED;
 }
 int32_t MWD_CALL native_runtime_context(void *owner, mwd_context_info *out) {
     if (!out) return E_POINTER;
     *out = {};
-    NativeHeapOperation op(static_cast<Context *>(owner));
+    NativeHeapOperation op(static_cast<Context *>(owner), true);
     if (!op.live()) return DXGI_ERROR_DEVICE_REMOVED;
     HRESULT hr = native_heap_generation(op.ctx);
+    if (SUCCEEDED(hr) && op.ctx->native_destroying && !op.ctx->native_heap_context)
+        return DXGI_ERROR_DEVICE_REMOVED;
     if (SUCCEEDED(hr)) hr = native_heap_open_context(op.ctx);
     if (FAILED(hr)) return hr;
     if (!op.ctx->kernel_callbacks.pfnRenderCb) return DXGI_ERROR_UNSUPPORTED;
@@ -104,7 +106,7 @@ int32_t MWD_CALL native_runtime_retain(void *owner, void *token, mwd_allocation 
     return S_OK;
 }
 int32_t MWD_CALL native_runtime_release(void *owner, void *token) {
-    NativeHeapOperation op(static_cast<Context *>(owner));
+    NativeHeapOperation op(static_cast<Context *>(owner), true);
     auto *heap = native_token(op.ctx, token);
     if (!heap || heap->pending || !heap->users) return E_INVALIDARG;
     if (heap->users > 1) { --heap->users; return S_OK; }
@@ -124,7 +126,7 @@ int32_t MWD_CALL native_runtime_map(void *owner, void *token, void **out, uint32
     return hr;
 }
 int32_t MWD_CALL native_runtime_unmap(void *owner, void *token) {
-    NativeHeapOperation op(static_cast<Context *>(owner));
+    NativeHeapOperation op(static_cast<Context *>(owner), true);
     auto *heap = native_token(op.ctx, token);
     if (!heap || heap->pending) return E_INVALIDARG;
     if (!op.live()) return S_OK; // Kernel lock is retired with the device.
@@ -138,7 +140,7 @@ int32_t MWD_CALL native_runtime_unmap(void *owner, void *token) {
 int32_t MWD_CALL native_runtime_completed(void *owner, uint32_t *out) {
     if (!out) return E_POINTER;
     *out = 0;
-    NativeHeapOperation op(static_cast<Context *>(owner));
+    NativeHeapOperation op(static_cast<Context *>(owner), true);
     if (!op.live() || !op.ctx->native_context_id) return DXGI_ERROR_DEVICE_REMOVED;
     auto *ctx = op.ctx;
     NativeFenceInfo info{};

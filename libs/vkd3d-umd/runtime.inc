@@ -183,19 +183,35 @@ void APIENTRY native_destroy_device(D3D12DDI_HDEVICE handle) {
     if (!handle.pDrvPrivate) return;
     auto *slot = static_cast<NativeDevice *>(handle.pDrvPrivate);
     if (slot->magic != native_device_magic) return;
-    auto *ctx = slot->context;
+    NativeHeapOperation op(slot->context);
+    auto *ctx = op.ctx;
+    if (!op.retained || ctx->native_retiring) return;
+    const bool first_destroy = !ctx->native_destroying;
+    ctx->native_destroying = true;
+    // The ordinary last owner drains Vulkan while its completion/unmap/release
+    // callbacks are still legal. New allocation/map/submit work is closed.
+    // This operation retains a separate reference across a possible recursive
+    // DestroyDevice, which may invalidate the runtime slot before we return.
+    if (first_destroy && ctx->references.load() == 2 && !ctx->native_backend_calls &&
+            !ctx->native_context_pending && !ctx->native_submitting) {
+        auto *backend = ctx->backend;
+        ctx->backend = nullptr;
+        {
+            NativeBackendCall backend_call(ctx);
+            vkdu_device_destroy(backend);
+        }
+    }
+    // A recursive destroy has already detached the slot/callbacks and dropped
+    // its owner reference. Do not touch that expired runtime storage again.
+    if (ctx->native_retiring) return;
     // Runtime releases this storage immediately after return. Child objects may
     // keep Context alive, but must never call a retired runtime handle/callback.
-    {
-        std::lock_guard<NativeCallbackMutex> lock(ctx->error_mutex);
-        if (ctx->native_retiring) return;
-        ctx->native_retiring = true;
-        native_heap_retire(ctx);
-        ctx->runtime_device = {};
-        ctx->runtime_callbacks = {};
-        ctx->kernel_callbacks = {};
-        ctx->report = nullptr; ctx->report_context = nullptr;
-    }
+    ctx->native_retiring = true;
+    native_heap_retire(ctx);
+    ctx->runtime_device = {};
+    ctx->runtime_callbacks = {};
+    ctx->kernel_callbacks = {};
+    ctx->report = nullptr; ctx->report_context = nullptr;
     slot->context = nullptr; slot->magic = 0;
     release(ctx);
 }

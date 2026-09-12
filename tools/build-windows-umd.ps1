@@ -29,8 +29,7 @@ if ($LASTEXITCODE) { exit $LASTEXITCODE }
 $dll = Join-Path $buildDir 'libs\vkd3d-umd\viogpud3d12.dll'
 $test = Join-Path $buildDir 'libs\vkd3d-umd\vkd3d-umd-ddi-abi-test.exe'
 if ($Architecture -ne 'arm64') {
-    & (Join-Path $buildDir 'libs\vkd3d-umd\vkd3d-umd-runtime-test.exe')
-    if ($LASTEXITCODE) { exit $LASTEXITCODE }
+    ./tools/test-windows-umd-runtime.ps1 -Executable (Join-Path $buildDir 'libs\vkd3d-umd\vkd3d-umd-runtime-test.exe')
     & $test (Resolve-Path $dll).Path
     if ($LASTEXITCODE) { exit $LASTEXITCODE }
     & (Join-Path $buildDir 'libs\vkd3d-umd\vkd3d-umd-ddi-descriptor-test.exe')
