@@ -139,6 +139,47 @@ HRESULT native_load_vulkan(HMODULE *module, PFN_vkGetInstanceProcAddr *loader) {
 
 #include "native_heap.inc"
 
+HRESULT native_command_create(Context *ctx, const D3D12DDIARG_CREATE_COMMAND_LIST_0001 *args) {
+    NativeHeapOperation op(ctx);
+    if (!op.live()) return DXGI_ERROR_DEVICE_REMOVED;
+    if (!args->hDrvCommandList.pDrvPrivate || !args->hRTCommandList.handle ||
+            !ctx->runtime_callbacks.pfnSetCommandListErrorCb) return E_INVALIDARG;
+    // Copy all runtime-owned input before a backend callback can retire it.
+    void *slot = args->hDrvCommandList.pDrvPrivate;
+    const auto runtime = args->hRTCommandList;
+    auto *allocator = backend(args->hDrvCommandAllocator.pDrvPrivate, VKDU_ALLOCATOR);
+    const auto type = command_type(args->QueueFlags);
+    vkdu_object *value = nullptr;
+    HRESULT hr;
+    {
+        NativeBackendCall call(ctx);
+        hr = vkdu_command_create(ctx->backend, allocator, type, &value);
+    }
+    if (!op.live()) hr = DXGI_ERROR_DEVICE_REMOVED;
+    if (SUCCEEDED(hr)) hr = bind(ctx, slot, value, VKDU_COMMAND_LIST);
+    if (FAILED(hr)) {
+        NativeBackendCall call(ctx);
+        vkdu_object_destroy(value);
+        return hr;
+    }
+    object(slot)->runtime_command = runtime;
+    return S_OK;
+}
+
+void native_command_destroy(Context *ctx, Object *cmd) {
+    NativeHeapOperation op(ctx, true);
+    if (!op.retained) return;
+    auto *value = cmd->backend;
+    // The runtime can destroy this slot recursively from its error callback.
+    // Invalidate it before any backend callback and never revisit it afterward.
+    std::memset(cmd, 0, sizeof(*cmd));
+    {
+        NativeBackendCall call(ctx);
+        vkdu_object_destroy(value);
+    }
+    release(ctx); // Drop the command-list owner; op still retains Context.
+}
+
 HRESULT APIENTRY native_create_device(D3D12DDI_HADAPTER handle, const D3D12DDIARG_CREATEDEVICE_0003 *args) {
     auto adapter = native_adapter(handle);
     if (!adapter || !args || !args->hDrvDevice.pDrvPrivate || !args->hRTDevice.handle ||

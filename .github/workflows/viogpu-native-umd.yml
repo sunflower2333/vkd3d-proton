@@ -77,7 +77,7 @@ jobs:
         with:
           name: vkd3d-native-ddi-arm64
           path: candidate
-      - name: Execute actual ARM64 lifecycle and deferred-backend negative control
+      - name: Execute actual ARM64 lifecycle and both ownership negative controls
         shell: pwsh
         run: ./tools/test-windows-umd-runtime.ps1 -Executable candidate/package/vkd3d-umd-runtime-test.exe
       - uses: actions/upload-artifact@v4

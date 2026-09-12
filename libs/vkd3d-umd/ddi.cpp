@@ -14,12 +14,14 @@ constexpr uint32_t native_device_magic = 0x564b4e44;
 struct NativeAdapter;
 struct NativeHeap;
 struct Context;
+struct Object;
 void native_heap_forget(Context *);
 void native_heap_retire(Context *);
 void native_heap_tables(D3D12DDI_DEVICE_FUNCS_CORE_0003 *);
+HRESULT native_command_create(Context *, const D3D12DDIARG_CREATE_COMMAND_LIST_0001 *);
+void native_command_destroy(Context *, Object *);
 // Runtime owns this slot; child objects hold references to the separate Context.
 struct NativeDevice { uint32_t magic; Context *context; };
-struct Object;
 // Track recursion only while the underlying mutex is owned. A call back into
 // Vulkan must release every nesting level: the runtime may synchronously
 // re-enter resource destruction from an outer error/kernel callback.
@@ -79,6 +81,7 @@ struct Object {
     uint32_t descriptor_flags = 0;
     uint32_t descriptor_type = UINT32_MAX;
     NativeHeap *native_heap = nullptr;
+    D3D12DDI_HRTCOMMANDLIST runtime_command{};
 };
 Context *context(D3D12DDI_HDEVICE handle) {
     if (handle.pDrvPrivate) {
@@ -131,7 +134,28 @@ void error(Context *value, HRESULT result) {
     }
     release(value);
 }
-void error(Object *value, HRESULT result) { if (value) error(value->context, result); }
+void error(Object *value, HRESULT result) {
+    if (!value || SUCCEEDED(result)) return;
+    auto *ctx = value->context;
+    const auto runtime = value->runtime_command;
+    if (value->kind != VKDU_COMMAND_LIST || !runtime.handle) { error(ctx, result); return; }
+    // Runtime owns the command-list slot and may release/overwrite it inside
+    // this callback. Copy its opaque handle first, and retain only Context.
+    if (!retain_live(ctx)) return;
+    {
+        std::lock_guard<NativeCallbackMutex> lock(ctx->error_mutex);
+        if (!ctx->native_retiring && ctx->runtime_device.handle && ctx->runtime_callbacks.pfnSetCommandListErrorCb) {
+            const bool removed = result == DXGI_ERROR_DEVICE_REMOVED || result == DXGI_ERROR_DEVICE_RESET ||
+                result == DXGI_ERROR_DEVICE_HUNG || result == DXGI_ERROR_DRIVER_INTERNAL_ERROR;
+            if (removed) ctx->last_error = result;
+            ctx->runtime_callbacks.pfnSetCommandListErrorCb(runtime, result);
+            // The callback can retire the device as well as the command list.
+            // error(Context) consults the retained, possibly detached report.
+            if (removed) error(ctx, result);
+        }
+    }
+    release(ctx);
+}
 HRESULT bind(Context *ctx, void *memory, vkdu_object *value, vkdu_kind kind) {
     if (!ctx || !memory || !vkdu_object_is(value, kind) || !vkdu_object_belongs(ctx->backend, value) || object(memory)) return E_INVALIDARG;
     auto *entry = new (memory) Object{object_magic, ctx, value, kind, nullptr, 0, nullptr, 0, 0};
@@ -367,12 +391,16 @@ HRESULT APIENTRY command_create(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATE_COM
     auto *ctx = context(h); vkdu_object *value = nullptr;
     if (!ctx || !args || args->Type != D3D12DDI_COMMAND_LIST_TYPE_DIRECT || args->NodeMask > 1 || args->CommandListFlags ||
         !belongs(ctx, args->hDrvCommandAllocator.pDrvPrivate)) return E_INVALIDARG;
+    if (ctx->native_adapter) return native_command_create(ctx, args);
     HRESULT hr = vkdu_command_create(ctx->backend, backend(args->hDrvCommandAllocator.pDrvPrivate, VKDU_ALLOCATOR), command_type(args->QueueFlags), &value);
     return finish(ctx, args->hDrvCommandList.pDrvPrivate, value, VKDU_COMMAND_LIST, hr);
 }
 void APIENTRY command_destroy(D3D12DDI_HDEVICE h, D3D12DDI_HCOMMANDLIST c) {
-    if (belongs(context(h), c.pDrvPrivate)) VioGpuD3D12BridgeUnbindObject(c.pDrvPrivate);
-    else error(context(h), E_INVALIDARG);
+    auto *ctx = context(h);
+    auto *cmd = object(c.pDrvPrivate);
+    if (!cmd || cmd->context != ctx || cmd->kind != VKDU_COMMAND_LIST) { error(ctx, E_INVALIDARG); return; }
+    if (ctx->native_adapter) native_command_destroy(ctx, cmd);
+    else VioGpuD3D12BridgeUnbindObject(c.pDrvPrivate);
 }
 void APIENTRY command_close(D3D12DDI_HCOMMANDLIST c) {
     error(object(c.pDrvPrivate), vkdu_command_close(backend(c.pDrvPrivate, VKDU_COMMAND_LIST)));
@@ -400,8 +428,11 @@ void APIENTRY barriers(D3D12DDI_HCOMMANDLIST c, UINT count, const D3D12DDIARG_RE
             !belongs(cmd->context, args[i].Transition.hResource.pDrvPrivate) ||
             !backend(args[i].Transition.hResource.pDrvPrivate, VKDU_BUFFER)) { error(cmd, E_NOTIMPL); return; }
     }
-    for (UINT i = 0; i < count; ++i) error(cmd, vkdu_command_transition(cmd->backend,
-            backend(args[i].Transition.hResource.pDrvPrivate, VKDU_BUFFER), args[i].Transition.StateBefore, args[i].Transition.StateAfter));
+    for (UINT i = 0; i < count; ++i) {
+        HRESULT hr = vkdu_command_transition(cmd->backend,
+            backend(args[i].Transition.hResource.pDrvPrivate, VKDU_BUFFER), args[i].Transition.StateBefore, args[i].Transition.StateAfter);
+        if (FAILED(hr)) { error(cmd, hr); return; }
+    }
 }
 void APIENTRY dispatch(D3D12DDI_HCOMMANDLIST c, UINT x, UINT y, UINT z) {
     error(object(c.pDrvPrivate), vkdu_command_dispatch(backend(c.pDrvPrivate, VKDU_COMMAND_LIST), x, y, z));

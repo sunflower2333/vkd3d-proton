@@ -29,6 +29,11 @@ static D3D12DDI_HDEVICE error_device{};
 static std::function<void()> nested_error_callback;
 static std::function<void(const mwd_callbacks *, void *)> backend_destructor_check;
 static bool force_deferred_cleanup;
+static bool force_device_command_error;
+static std::vector<std::pair<HANDLE, HRESULT>> command_errors;
+static std::function<void()> nested_command_error, backend_command_create_callback, backend_command_destroy_callback;
+static unsigned command_creates, command_destroys;
+static HRESULT command_create_result = S_OK, command_close_result = S_OK;
 static uint64_t generation = 7;
 static D3D12DDI_HRTDEVICE last_runtime{};
 static const HANDLE expected_adapter = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(0x13570));
@@ -102,6 +107,11 @@ static void APIENTRY test_error(D3D10DDI_HRTDEVICE runtime, HRESULT result) {
     if (retire_in_error) retire_in_error(error_device);
     if (nested_error_callback) nested_error_callback();
 }
+static void APIENTRY test_command_error(D3D12DDI_HRTCOMMANDLIST runtime, HRESULT result) {
+    if (!runtime.handle || SUCCEEDED(result)) fixture_abort(__LINE__);
+    command_errors.emplace_back(runtime.handle, result);
+    if (nested_command_error) nested_command_error();
+}
 
 static int32_t test_import_heap(vkdu_device *, void *, void *, uint64_t, int, vkdu_object **);
 static int32_t test_place_buffer(vkdu_device *, vkdu_object *, uint64_t, uint64_t, uint32_t, vkdu_object **);
@@ -110,6 +120,9 @@ static int test_object_is(vkdu_object *, vkdu_kind);
 static int test_object_belongs(vkdu_device *, vkdu_object *);
 static uint64_t test_buffer_address(vkdu_object *);
 static uint64_t test_buffer_size(vkdu_object *);
+static int32_t test_allocator_create(vkdu_device *, uint32_t, vkdu_object **);
+static int32_t test_command_create(vkdu_device *, vkdu_object *, uint32_t, vkdu_object **);
+static int32_t test_command_close(vkdu_object *);
 
 #define LoadLibraryExW test_load
 #define GetProcAddress test_symbol
@@ -123,6 +136,9 @@ static uint64_t test_buffer_size(vkdu_object *);
 #define vkdu_object_belongs test_object_belongs
 #define vkdu_buffer_address test_buffer_address
 #define vkdu_buffer_size test_buffer_size
+#define vkdu_allocator_create test_allocator_create
+#define vkdu_command_create test_command_create
+#define vkdu_command_close test_command_close
 #include "ddi.cpp"
 
 #define REQUIRE(x) do { if (!(x)) { std::fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #x); return 1; } } while (0)
@@ -166,7 +182,13 @@ static int32_t test_place_buffer(vkdu_device *device, vkdu_object *memory, uint6
 }
 static void test_object_destroy(vkdu_object *object) {
     auto *peer = reinterpret_cast<ImportPeer *>(object);
-    if (peer) wait_backend_worker(&native_runtime_callbacks, peer->owner->context);
+    if (peer && peer->owner) wait_backend_worker(&native_runtime_callbacks, peer->owner->context);
+    if (peer && peer->kind == VKDU_COMMAND_LIST) {
+        ++command_destroys;
+        if (backend_command_destroy_callback) backend_command_destroy_callback();
+        auto *device = reinterpret_cast<TestDevice *>(peer->device);
+        wait_backend_worker(device->callbacks, device->owner);
+    }
     delete peer;
 }
 static int test_object_is(vkdu_object *object, vkdu_kind kind) {
@@ -177,6 +199,24 @@ static int test_object_belongs(vkdu_device *device, vkdu_object *object) {
 }
 static uint64_t test_buffer_address(vkdu_object *object) { return object ? reinterpret_cast<ImportPeer *>(object)->address : 0; }
 static uint64_t test_buffer_size(vkdu_object *object) { return object ? reinterpret_cast<ImportPeer *>(object)->bytes : 0; }
+static int32_t test_allocator_create(vkdu_device *device, uint32_t type, vkdu_object **out) {
+    if (!device || type != 0 || !out) return E_INVALIDARG;
+    *out = reinterpret_cast<vkdu_object *>(new ImportPeer{{}, device, VKDU_ALLOCATOR, 0, 0});
+    return S_OK;
+}
+static int32_t test_command_create(vkdu_device *device, vkdu_object *allocator, uint32_t type, vkdu_object **out) {
+    *out = nullptr; ++command_creates;
+    if (!test_object_is(allocator, VKDU_ALLOCATOR) || !test_object_belongs(device, allocator) || type != 0) return E_INVALIDARG;
+    auto *peer = reinterpret_cast<TestDevice *>(device);
+    wait_backend_worker(peer->callbacks, peer->owner);
+    if (FAILED(command_create_result)) return command_create_result;
+    *out = reinterpret_cast<vkdu_object *>(new ImportPeer{{}, device, VKDU_COMMAND_LIST, 0, 0});
+    if (backend_command_create_callback) backend_command_create_callback();
+    return S_OK;
+}
+static int32_t test_command_close(vkdu_object *object) {
+    return test_object_is(object, VKDU_COMMAND_LIST) ? command_close_result : E_INVALIDARG;
+}
 
 struct KernelHeap { uint64_t address, bytes; bool locked; HANDLE resource; };
 static std::map<D3DKMT_HANDLE, KernelHeap> kernel_heaps;
@@ -672,6 +712,135 @@ static int test_native_heaps() {
     return 0;
 }
 
+static int test_native_command_errors() {
+    D3DDDI_ADAPTERCALLBACKS ac{}; ac.pfnQueryAdapterInfoCb = test_query;
+    D3D12DDI_ADAPTERFUNCS adapter{};
+    D3D12DDIARG_OPENADAPTER open{};
+    open.hRTAdapter.handle = expected_adapter; open.pAdapterCallbacks = &ac; open.pAdapterFuncs = &adapter;
+    REQUIRE(OpenAdapter12(&open) == S_OK);
+    D3DDDI_DEVICECALLBACKS kt{};
+    D3D12DDI_CORELAYER_DEVICECALLBACKS_0003 um{};
+    um.pfnSetErrorCb = test_error; um.pfnSetCommandListErrorCb = test_command_error;
+    alignas(NativeDevice) std::array<unsigned char, sizeof(NativeDevice)> device_memory{};
+    D3D12DDIARG_CREATEDEVICE_0003 create{};
+    create.hDrvDevice.pDrvPrivate = device_memory.data(); create.hRTDevice.handle = expected_device;
+    create.Interface = D3D12DDI_INTERFACE_VERSION_R0; create.Version = D3D12DDI_BUILD_VERSION << 16;
+    create.pKTCallbacks = &kt; create.p12UMCallbacks = &um;
+    REQUIRE(adapter.pfnCreateDevice(open.hAdapter, &create) == S_OK);
+    auto *ctx = context(create.hDrvDevice);
+    D3D12DDI_DEVICE_FUNCS_CORE_0003 table{};
+    D3D12DDI_COMMAND_LIST_FUNCS_3D_0003 commands{};
+    D3D12DDI_COMMAND_QUEUE_FUNCS_CORE_0001 queue{};
+    REQUIRE(VioGpuD3D12BridgeGetTables(&table, &commands, &queue) == S_OK);
+    alignas(Object) std::array<unsigned char, sizeof(Object)> allocator_memory{}, first{}, second{};
+    D3D12DDIARG_CREATECOMMANDALLOCATOR allocator{};
+    allocator.hDrvCommandAllocator.pDrvPrivate = allocator_memory.data();
+    allocator.Type = D3D12DDI_COMMAND_LIST_TYPE_DIRECT; allocator.QueueFlags = D3D12DDI_COMMAND_QUEUE_FLAG_3D;
+    REQUIRE(table.pfnCreateCommandAllocator(create.hDrvDevice, &allocator) == S_OK);
+    D3D12DDIARG_CREATE_COMMAND_LIST_0001 request{};
+    request.hDrvCommandAllocator = allocator.hDrvCommandAllocator;
+    request.Type = D3D12DDI_COMMAND_LIST_TYPE_DIRECT; request.QueueFlags = D3D12DDI_COMMAND_QUEUE_FLAG_3D;
+    request.hDrvCommandList.pDrvPrivate = first.data(); first.fill(0xa5);
+    const unsigned before_create = command_creates;
+    REQUIRE(table.pfnCreateCommandList(create.hDrvDevice, &request) == E_INVALIDARG && command_creates == before_create);
+    for (auto byte : first) REQUIRE(byte == 0xa5);
+    const HANDLE first_runtime = reinterpret_cast<HANDLE>(uintptr_t(0x71820));
+    const HANDLE second_runtime = reinterpret_cast<HANDLE>(uintptr_t(0x71930));
+    request.hRTCommandList.handle = first_runtime;
+    // Model a runtime missing this callback: native creation fails before the
+    // backend or private command slot changes. No device-error fallback.
+    ctx->runtime_callbacks.pfnSetCommandListErrorCb = nullptr;
+    REQUIRE(table.pfnCreateCommandList(create.hDrvDevice, &request) == E_INVALIDARG && command_creates == before_create);
+    ctx->runtime_callbacks.pfnSetCommandListErrorCb = test_command_error;
+    command_create_result = E_OUTOFMEMORY;
+    REQUIRE(table.pfnCreateCommandList(create.hDrvDevice, &request) == E_OUTOFMEMORY);
+    for (auto byte : first) REQUIRE(byte == 0xa5);
+    command_create_result = S_OK;
+    REQUIRE(table.pfnCreateCommandList(create.hDrvDevice, &request) == S_OK);
+    const auto first_handle = request.hDrvCommandList;
+    request.hRTCommandList.handle = second_runtime; request.hDrvCommandList.pDrvPrivate = second.data();
+    second.fill(0xa5);
+    REQUIRE(table.pfnCreateCommandList(create.hDrvDevice, &request) == S_OK);
+    const auto second_handle = request.hDrvCommandList;
+    // The source callback table and request are caller-owned and can change.
+    um.pfnSetCommandListErrorCb = nullptr; request.hRTCommandList = {};
+    const unsigned before_errors = error_calls;
+    command_errors.clear();
+    if (force_device_command_error) object(first.data())->runtime_command = {};
+    commands.pfnResetCommandList(first_handle, nullptr);
+    if (command_errors.size() != 1 || command_errors[0] != std::make_pair(first_runtime, HRESULT(E_INVALIDARG)) ||
+            error_calls != before_errors || ctx->last_error != S_OK) {
+        std::fputs("FAIL native command error escaped its runtime command-list owner\n", stderr);
+        return 1;
+    }
+    commands.pfnSetComputeRootShaderResourceView(second_handle, 0, 0);
+    REQUIRE(command_errors.size() == 2 && command_errors.back() == std::make_pair(second_runtime, HRESULT(E_INVALIDARG)));
+    command_close_result = E_OUTOFMEMORY;
+    commands.pfnCloseCommandList(first_handle);
+    REQUIRE(command_errors.size() == 3 && command_errors.back() == std::make_pair(first_runtime, HRESULT(E_OUTOFMEMORY)));
+    REQUIRE(error_calls == before_errors && ctx->last_error == S_OK);
+    command_close_result = S_OK;
+    commands.pfnCloseCommandList(second_handle);
+    REQUIRE(command_errors.size() == 3); // A successful sibling operation adds no error.
+    command_close_result = DXGI_ERROR_DEVICE_REMOVED;
+    commands.pfnCloseCommandList(second_handle);
+    REQUIRE(command_errors.size() == 4 && command_errors.back() == std::make_pair(second_runtime, HRESULT(DXGI_ERROR_DEVICE_REMOVED)));
+    REQUIRE(error_calls == before_errors + 1 && last_runtime.handle == expected_device && ctx->last_error == DXGI_ERROR_DEVICE_REMOVED);
+    table.pfnDestroyCommandList(create.hDrvDevice, first_handle);
+    table.pfnDestroyCommandList(create.hDrvDevice, second_handle);
+    table.pfnDestroyCommandAllocator(create.hDrvDevice, allocator.hDrvCommandAllocator);
+    adapter.pfnDestroyDevice(create.hDrvDevice);
+
+    // Native recording error can synchronously destroy command, allocator and
+    // device, then invalidate both runtime-private slots before returning.
+    um.pfnSetCommandListErrorCb = test_command_error;
+    REQUIRE(adapter.pfnCreateDevice(open.hAdapter, &create) == S_OK);
+    REQUIRE(table.pfnCreateCommandAllocator(create.hDrvDevice, &allocator) == S_OK);
+    request.hDrvCommandList = first_handle; request.hRTCommandList.handle = first_runtime;
+    REQUIRE(table.pfnCreateCommandList(create.hDrvDevice, &request) == S_OK);
+    ctx = context(create.hDrvDevice);
+    const unsigned before_retire_errors = error_calls, before_destroy = command_destroys;
+    const unsigned before_unload = unloads;
+    backend_command_destroy_callback = [&]() {
+        if (object(first.data()) || !ctx->runtime_device.handle) fixture_abort(__LINE__);
+    };
+    nested_command_error = [&]() {
+        table.pfnDestroyCommandList(create.hDrvDevice, first_handle);
+        first.fill(0xa5);
+        table.pfnDestroyCommandAllocator(create.hDrvDevice, allocator.hDrvCommandAllocator);
+        adapter.pfnDestroyDevice(create.hDrvDevice);
+        device_memory.fill(0xa5);
+        if (unloads != before_unload) fixture_abort(__LINE__);
+    };
+    command_close_result = DXGI_ERROR_DEVICE_RESET;
+    commands.pfnCloseCommandList(first_handle);
+    nested_command_error = {}; backend_command_destroy_callback = {};
+    REQUIRE(command_destroys == before_destroy + 1 && unloads == before_unload + 1 && error_calls == before_retire_errors);
+    for (auto byte : first) REQUIRE(byte == 0xa5);
+    for (auto byte : device_memory) REQUIRE(byte == 0xa5);
+
+    // A backend create callback may retire the device and the input request.
+    // The rejected late object must be destroyed, with no slot publication.
+    REQUIRE(adapter.pfnCreateDevice(open.hAdapter, &create) == S_OK);
+    REQUIRE(table.pfnCreateCommandAllocator(create.hDrvDevice, &allocator) == S_OK);
+    const unsigned before_cancel = command_destroys;
+    backend_command_create_callback = [&]() {
+        adapter.pfnDestroyDevice(create.hDrvDevice);
+        device_memory.fill(0xa5);
+        std::memset(&request, 0xa5, sizeof(request));
+    };
+    REQUIRE(table.pfnCreateCommandList(create.hDrvDevice, &request) == DXGI_ERROR_DEVICE_REMOVED);
+    backend_command_create_callback = {};
+    REQUIRE(command_destroys == before_cancel + 1);
+    for (auto byte : first) REQUIRE(byte == 0xa5);
+    VioGpuD3D12BridgeUnbindObject(allocator_memory.data()); // Drop the surviving fixture child owner.
+    REQUIRE(adapter.pfnCloseAdapter(open.hAdapter) == S_OK);
+    command_close_result = S_OK;
+    REQUIRE(!native_contract_complete());
+    std::printf("PASS native command-list runtime error ownership, device-loss forwarding, rejected creation and reentrant retirement (%zu-bit); admission closed\n", sizeof(void *) * 8);
+    return 0;
+}
+
 static int test_finalization_borrow() {
     // Model the interval immediately after final release wins the 1 -> 0
     // transition. No separate flag or retired runtime slot may be required.
@@ -695,6 +864,7 @@ static int test_finalization_borrow() {
 int main(int argc, char **argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc == 2 && !std::strcmp(argv[1], "--negative-control-deferred-backend")) force_deferred_cleanup = true;
+    else if (argc == 2 && !std::strcmp(argv[1], "--negative-control-command-error-owner")) force_device_command_error = true;
     else if (argc != 1) return 2;
     REQUIRE(test_finalization_borrow() == 0);
     REQUIRE(OpenAdapter12(nullptr) == E_INVALIDARG);
@@ -797,6 +967,7 @@ int main(int argc, char **argv) {
     REQUIRE(destroys == 2 && unloads == 2);
     retire_in_error = nullptr;
     REQUIRE(test_native_heaps() == 0);
+    REQUIRE(test_native_command_errors() == 0);
     std::printf("PASS native OpenAdapter12 WDK identity/negotiation/private memory/callback/lifetime/error cleanup (%zu-bit); no system-runtime or GPU acceptance\n", sizeof(void *) * 8);
     return 0;
 }
