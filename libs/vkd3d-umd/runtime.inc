@@ -139,6 +139,95 @@ HRESULT native_load_vulkan(HMODULE *module, PFN_vkGetInstanceProcAddr *loader) {
 
 #include "native_heap.inc"
 
+// error_mutex owns these lists. Compare opaque slots before dereferencing them.
+Object *native_submission_find(Object *head, void *slot) {
+    for (auto *entry = head; entry; entry = entry->next)
+        if (entry == slot) return entry;
+    return nullptr;
+}
+void native_submission_remove(Object *&head, Object *entry) {
+    Object **link = &head;
+    while (*link && *link != entry) link = &(*link)->next;
+    if (*link) *link = entry->next;
+}
+
+HRESULT native_queue_create(Context *ctx, const D3D12DDIARG_CREATECOMMANDQUEUE_0001 *args) {
+    NativeHeapOperation op(ctx);
+    if (!op.live()) return DXGI_ERROR_DEVICE_REMOVED;
+    // R0 has no priority field. Never reinterpret a later queue revision.
+    const auto request = *args;
+    const auto type = command_type(request.QueueFlags);
+    if (!request.hDrvCommandQueue.pDrvPrivate || !request.hRTCommandQueue.handle || type == UINT32_MAX ||
+        native_submission_find(ctx->native_queue_objects, request.hDrvCommandQueue.pDrvPrivate) ||
+        native_submission_find(ctx->native_command_objects, request.hDrvCommandQueue.pDrvPrivate)) return E_INVALIDARG;
+    vkdu_object *value = nullptr;
+    HRESULT hr;
+    {
+        NativeBackendCall call(ctx);
+        hr = vkdu_queue_create(ctx->backend, type, &value);
+    }
+    if (!op.live()) hr = DXGI_ERROR_DEVICE_REMOVED;
+    if (SUCCEEDED(hr)) hr = bind(ctx, request.hDrvCommandQueue.pDrvPrivate, value, VKDU_QUEUE);
+    if (FAILED(hr)) {
+        NativeBackendCall call(ctx);
+        vkdu_object_destroy(value);
+        return hr;
+    }
+    auto *queue = object(request.hDrvCommandQueue.pDrvPrivate);
+    queue->runtime_queue = request.hRTCommandQueue;
+    queue->next = ctx->native_queue_objects;
+    ctx->native_queue_objects = queue;
+    return S_OK;
+}
+
+void native_queue_destroy(Context *ctx, void *slot) {
+    NativeHeapOperation op(ctx, true);
+    if (!op.retained) return;
+    auto *queue = native_submission_find(ctx->native_queue_objects, slot);
+    if (!queue) { error(ctx, E_INVALIDARG); return; }
+    auto *value = queue->backend;
+    native_submission_remove(ctx->native_queue_objects, queue);
+    // The runtime may release this memory immediately, including reentrantly.
+    std::memset(queue, 0, sizeof(*queue));
+    {
+        NativeBackendCall call(ctx);
+        vkdu_object_destroy(value);
+    }
+    release(ctx);
+}
+
+void native_queue_execute(Object *queue, UINT count, const D3D12DDI_HCOMMANDLIST *commands) {
+    auto *ctx = queue->context;
+    NativeHeapOperation op(ctx);
+    if (!op.live()) { error(ctx, DXGI_ERROR_DEVICE_REMOVED); return; }
+    if (!native_submission_find(ctx->native_queue_objects, queue) || !commands || !count || count > 64) {
+        error(ctx, E_INVALIDARG); return;
+    }
+    vkdu_object *native[64]{};
+    auto *queue_backend = queue->backend;
+    if (!vkdu_object_retain(queue_backend)) { error(ctx, E_OUTOFMEMORY); return; }
+    UINT retained = 0;
+    HRESULT hr = S_OK;
+    for (; retained < count; ++retained) {
+        auto *command = native_submission_find(ctx->native_command_objects, commands[retained].pDrvPrivate);
+        if (!command || command->kind != VKDU_COMMAND_LIST || !vkdu_object_retain(command->backend)) {
+            hr = E_INVALIDARG; break;
+        }
+        native[retained] = command->backend;
+    }
+    {
+        // Copies and independent backend references outlive every runtime slot.
+        // A backend callback may destroy queue/list/device and poison all slots.
+        NativeBackendCall call(ctx);
+        if (SUCCEEDED(hr)) hr = vkdu_queue_execute(queue_backend, count, native);
+        for (UINT index = 0; index < retained; ++index) vkdu_object_destroy(native[index]);
+        vkdu_object_destroy(queue_backend);
+    }
+    // Never report through the queue slot after backend execution/cleanup.
+    // error(Context) respects device callback detachment during retirement.
+    error(ctx, hr);
+}
+
 HRESULT native_command_create(Context *ctx, const D3D12DDIARG_CREATE_COMMAND_LIST_0001 *args) {
     NativeHeapOperation op(ctx);
     if (!op.live()) return DXGI_ERROR_DEVICE_REMOVED;
@@ -163,13 +252,18 @@ HRESULT native_command_create(Context *ctx, const D3D12DDIARG_CREATE_COMMAND_LIS
         return hr;
     }
     object(slot)->runtime_command = runtime;
+    object(slot)->next = ctx->native_command_objects;
+    ctx->native_command_objects = object(slot);
     return S_OK;
 }
 
 void native_command_destroy(Context *ctx, Object *cmd) {
     NativeHeapOperation op(ctx, true);
     if (!op.retained) return;
+    cmd = native_submission_find(ctx->native_command_objects, cmd);
+    if (!cmd) { error(ctx, E_INVALIDARG); return; }
     auto *value = cmd->backend;
+    native_submission_remove(ctx->native_command_objects, cmd);
     // The runtime can destroy this slot recursively from its error callback.
     // Invalidate it before any backend callback and never revisit it afterward.
     std::memset(cmd, 0, sizeof(*cmd));

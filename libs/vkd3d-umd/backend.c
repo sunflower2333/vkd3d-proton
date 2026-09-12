@@ -12,6 +12,7 @@
 struct vkdu_device { ID3D12Device *object; };
 struct vkdu_root_slot { uint32_t type, extent, heap_type, unbounded; };
 struct vkdu_object {
+    LONG references;
     IUnknown *object;
     ID3D12Device *owner;
     enum vkdu_kind kind;
@@ -36,6 +37,7 @@ static int32_t wrap(vkdu_device *device, enum vkdu_kind kind, HRESULT hr, IUnkno
     if (FAILED(hr)) return hr;
     if (!(value = calloc(1, sizeof(*value)))) { IUnknown_Release(object); return E_OUTOFMEMORY; }
     value->object = object;
+    value->references = 1;
     value->owner = device->object;
     ID3D12Device_AddRef(value->owner);
     value->kind = kind;
@@ -131,8 +133,24 @@ void vkdu_device_destroy(vkdu_device *device)
 { if (device) { ID3D12Device_Release(device->object); free(device); } }
 int32_t vkdu_device_status(vkdu_device *device)
 { return device ? ID3D12Device_GetDeviceRemovedReason(device->object) : E_INVALIDARG; }
+int vkdu_object_retain(vkdu_object *object)
+{
+    LONG count, observed;
+    if (!object) return 0;
+    count = InterlockedCompareExchange(&object->references, 0, 0);
+    while (count > 0 && count < INT32_MAX) {
+        observed = InterlockedCompareExchange(&object->references, count + 1, count);
+        if (observed == count) return 1;
+        count = observed;
+    }
+    return 0;
+}
 void vkdu_object_destroy(vkdu_object *object)
-{ if (object) { IUnknown_Release(object->object); ID3D12Device_Release(object->owner); free(object); } }
+{
+    if (object && !InterlockedDecrement(&object->references)) {
+        IUnknown_Release(object->object); ID3D12Device_Release(object->owner); free(object);
+    }
+}
 int vkdu_object_is(vkdu_object *object, enum vkdu_kind kind) { return VALID(object, kind); }
 int vkdu_same_device(vkdu_object *a, vkdu_object *b) { return a && b && a->owner == b->owner; }
 int vkdu_object_belongs(vkdu_device *device, vkdu_object *object) { return device && object && device->object == object->owner; }

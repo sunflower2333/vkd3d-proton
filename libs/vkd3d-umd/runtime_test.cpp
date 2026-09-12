@@ -38,6 +38,12 @@ static std::vector<std::pair<HANDLE, HRESULT>> command_errors;
 static std::function<void()> nested_command_error, backend_command_create_callback, backend_command_destroy_callback;
 static unsigned command_creates, command_destroys;
 static HRESULT command_create_result = S_OK, command_close_result = S_OK;
+static unsigned queue_creates, queue_destroys, queue_executes;
+static HRESULT queue_create_result = S_OK, queue_execute_result = S_OK;
+static std::function<void()> backend_queue_create_callback, backend_queue_destroy_callback, backend_queue_execute_callback;
+static std::set<vkdu_object *> executing_objects;
+static std::vector<vkdu_object *> submitted_commands;
+static bool force_queue_unowned, queue_negative_active;
 static uint64_t generation = 7;
 static D3D12DDI_HRTDEVICE last_runtime{};
 static const HANDLE expected_adapter = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(0x13570));
@@ -120,6 +126,7 @@ static void APIENTRY test_command_error(D3D12DDI_HRTCOMMANDLIST runtime, HRESULT
 static int32_t test_import_heap(vkdu_device *, void *, void *, uint64_t, int, vkdu_object **);
 static int32_t test_place_buffer(vkdu_device *, vkdu_object *, uint64_t, uint64_t, uint32_t, vkdu_object **);
 static void test_object_destroy(vkdu_object *);
+static int test_object_retain(vkdu_object *);
 static int test_object_is(vkdu_object *, vkdu_kind);
 static int test_object_belongs(vkdu_device *, vkdu_object *);
 static uint64_t test_buffer_address(vkdu_object *);
@@ -128,6 +135,8 @@ static int32_t test_allocator_create(vkdu_device *, uint32_t, vkdu_object **);
 static int32_t test_command_create(vkdu_device *, vkdu_object *, uint32_t, vkdu_object **);
 static int32_t test_command_close(vkdu_object *);
 static int32_t test_command_barriers(vkdu_object *, uint32_t, const vkdu_resource_barrier *);
+static int32_t test_queue_create(vkdu_device *, uint32_t, vkdu_object **);
+static int32_t test_queue_execute(vkdu_object *, uint32_t, vkdu_object *const *);
 
 #define LoadLibraryExW test_load
 #define GetProcAddress test_symbol
@@ -137,6 +146,7 @@ static int32_t test_command_barriers(vkdu_object *, uint32_t, const vkdu_resourc
 #define vkdu_memory_heap_import test_import_heap
 #define vkdu_buffer_place test_place_buffer
 #define vkdu_object_destroy test_object_destroy
+#define vkdu_object_retain test_object_retain
 #define vkdu_object_is test_object_is
 #define vkdu_object_belongs test_object_belongs
 #define vkdu_buffer_address test_buffer_address
@@ -145,6 +155,8 @@ static int32_t test_command_barriers(vkdu_object *, uint32_t, const vkdu_resourc
 #define vkdu_command_create test_command_create
 #define vkdu_command_close test_command_close
 #define vkdu_command_barriers test_command_barriers
+#define vkdu_queue_create test_queue_create
+#define vkdu_queue_execute test_queue_execute
 #include "ddi.cpp"
 
 #define REQUIRE(x) do { if (!(x)) { std::fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #x); return 1; } } while (0)
@@ -159,6 +171,7 @@ struct ImportPeer {
     vkdu_device *device;
     vkdu_kind kind;
     uint64_t address, bytes;
+    unsigned references = 1;
 };
 static bool import_failure, placement_failure, retire_during_import;
 static unsigned imports, placements;
@@ -192,6 +205,11 @@ static int32_t test_place_buffer(vkdu_device *device, vkdu_object *memory, uint6
 }
 static void test_object_destroy(vkdu_object *object) {
     auto *peer = reinterpret_cast<ImportPeer *>(object);
+    if (peer && --peer->references) return;
+    if (executing_objects.count(object)) {
+        std::fputs("FAIL native queue execution released a submitted backend owner\n", stderr);
+        std::exit(1);
+    }
     if (peer && peer->owner) wait_backend_worker(&native_runtime_callbacks, peer->owner->context);
     if (peer && peer->kind == VKDU_COMMAND_LIST) {
         ++command_destroys;
@@ -199,7 +217,18 @@ static void test_object_destroy(vkdu_object *object) {
         auto *device = reinterpret_cast<TestDevice *>(peer->device);
         wait_backend_worker(device->callbacks, device->owner);
     }
+    if (peer && peer->kind == VKDU_QUEUE) {
+        ++queue_destroys;
+        if (backend_queue_destroy_callback) backend_queue_destroy_callback();
+        auto *device = reinterpret_cast<TestDevice *>(peer->device);
+        wait_backend_worker(device->callbacks, device->owner);
+    }
     delete peer;
+}
+static int test_object_retain(vkdu_object *object) {
+    if (!object) return 0;
+    if (!queue_negative_active) ++reinterpret_cast<ImportPeer *>(object)->references;
+    return 1;
 }
 static int test_object_is(vkdu_object *object, vkdu_kind kind) {
     return object && reinterpret_cast<ImportPeer *>(object)->kind == kind;
@@ -235,6 +264,35 @@ static int32_t test_command_barriers(vkdu_object *object, uint32_t count, const 
         recorded_barriers.push_back(barriers[i]);
     }
     return barrier_result;
+}
+static int32_t test_queue_create(vkdu_device *device, uint32_t type, vkdu_object **out) {
+    *out = nullptr; ++queue_creates;
+    if (type != 0 && type != 2 && type != 3) return E_INVALIDARG;
+    auto *peer = reinterpret_cast<TestDevice *>(device);
+    wait_backend_worker(peer->callbacks, peer->owner);
+    if (FAILED(queue_create_result)) return queue_create_result;
+    *out = reinterpret_cast<vkdu_object *>(new ImportPeer{{}, device, VKDU_QUEUE, type, 0});
+    if (backend_queue_create_callback) backend_queue_create_callback();
+    return S_OK;
+}
+static int32_t test_queue_execute(vkdu_object *queue, uint32_t count, vkdu_object *const *commands) {
+    if (!test_object_is(queue, VKDU_QUEUE) || !count || count > 64 || !commands) fixture_abort(__LINE__);
+    ++queue_executes;
+    submitted_commands.assign(commands, commands + count);
+    auto *peer = reinterpret_cast<ImportPeer *>(queue);
+    auto *device = reinterpret_cast<TestDevice *>(peer->device);
+    executing_objects.insert(queue);
+    for (auto *command : submitted_commands) {
+        if (!test_object_is(command,VKDU_COMMAND_LIST) || !test_object_belongs(peer->device,command)) fixture_abort(__LINE__);
+        executing_objects.insert(command);
+    }
+    wait_backend_worker(device->callbacks, device->owner);
+    if (backend_queue_execute_callback) backend_queue_execute_callback();
+    if (!test_object_is(queue,VKDU_QUEUE)) fixture_abort(__LINE__);
+    for (auto *command : submitted_commands)
+        if (!test_object_is(command,VKDU_COMMAND_LIST)) fixture_abort(__LINE__);
+    executing_objects.clear();
+    return queue_execute_result;
 }
 
 struct KernelHeap { uint64_t address, bytes; bool locked; HANDLE resource; };
@@ -975,11 +1033,160 @@ static int test_finalization_borrow() {
     return 0;
 }
 
+static int test_native_queue_lifetime() {
+    D3DDDI_ADAPTERCALLBACKS ac{}; ac.pfnQueryAdapterInfoCb = test_query;
+    D3D12DDI_ADAPTERFUNCS adapter{};
+    D3D12DDIARG_OPENADAPTER open{};
+    open.hRTAdapter.handle = expected_adapter; open.pAdapterCallbacks = &ac; open.pAdapterFuncs = &adapter;
+    REQUIRE(OpenAdapter12(&open) == S_OK);
+    D3DDDI_DEVICECALLBACKS kt{};
+    D3D12DDI_CORELAYER_DEVICECALLBACKS_0003 um{};
+    um.pfnSetErrorCb = test_error; um.pfnSetCommandListErrorCb = test_command_error;
+    alignas(NativeDevice) std::array<unsigned char, sizeof(NativeDevice)> device_memory{};
+    D3D12DDIARG_CREATEDEVICE_0003 create{};
+    create.hDrvDevice.pDrvPrivate = device_memory.data(); create.hRTDevice.handle = expected_device;
+    create.Interface = D3D12DDI_INTERFACE_VERSION_R0; create.Version = D3D12DDI_BUILD_VERSION << 16;
+    create.pKTCallbacks = &kt; create.p12UMCallbacks = &um;
+    REQUIRE(adapter.pfnCreateDevice(open.hAdapter, &create) == S_OK);
+    auto *ctx = context(create.hDrvDevice);
+    D3D12DDI_DEVICE_FUNCS_CORE_0003 table{};
+    D3D12DDI_COMMAND_LIST_FUNCS_3D_0003 commands{};
+    D3D12DDI_COMMAND_QUEUE_FUNCS_CORE_0001 queue{};
+    REQUIRE(VioGpuD3D12BridgeGetTables(&table, &commands, &queue) == S_OK);
+    alignas(Object) std::array<unsigned char, sizeof(Object)> queue_memory{}, allocator_memory{}, first{}, second{};
+    D3D12DDIARG_CREATECOMMANDQUEUE_0001 request{};
+    request.hDrvCommandQueue.pDrvPrivate = queue_memory.data();
+    request.QueueFlags = D3D12DDI_COMMAND_QUEUE_FLAG_3D; request.NodeMask = 1;
+    queue_memory.fill(0xa5);
+    const auto before_creates = queue_creates;
+    REQUIRE(table.pfnCreateCommandQueue(create.hDrvDevice,&request) == E_INVALIDARG && queue_creates == before_creates);
+    for (auto byte : queue_memory) REQUIRE(byte == 0xa5);
+    request.hRTCommandQueue.handle = reinterpret_cast<HANDLE>(uintptr_t(0x77110));
+    for (UINT invalid : {0u, 3u, 8u, 0x80000000u}) {
+        request.QueueFlags = static_cast<D3D12DDI_COMMAND_QUEUE_FLAGS>(invalid);
+        REQUIRE(table.pfnCreateCommandQueue(create.hDrvDevice,&request) == E_INVALIDARG && queue_creates == before_creates);
+    }
+    request.QueueFlags = D3D12DDI_COMMAND_QUEUE_FLAG_3D;
+    request.NodeMask = 2;
+    REQUIRE(table.pfnCreateCommandQueue(create.hDrvDevice,&request) == E_INVALIDARG && queue_creates == before_creates);
+    request.NodeMask = 1;
+    queue_create_result = E_OUTOFMEMORY;
+    REQUIRE(table.pfnCreateCommandQueue(create.hDrvDevice,&request) == E_OUTOFMEMORY);
+    for (auto byte : queue_memory) REQUIRE(byte == 0xa5);
+    queue_create_result = S_OK;
+    const auto original_request = request;
+    backend_queue_create_callback = [&] { request = {}; };
+    REQUIRE(table.pfnCreateCommandQueue(create.hDrvDevice,&request) == S_OK);
+    backend_queue_create_callback = {};
+    REQUIRE(object(queue_memory.data())->runtime_queue.handle == original_request.hRTCommandQueue.handle);
+    request = original_request;
+    const auto after_creates = queue_creates;
+    REQUIRE(table.pfnCreateCommandQueue(create.hDrvDevice,&request) == E_INVALIDARG && queue_creates == after_creates);
+    auto *queue_peer = object(queue_memory.data())->backend;
+    D3D12DDIARG_CREATECOMMANDALLOCATOR allocator{};
+    allocator.hDrvCommandAllocator.pDrvPrivate = allocator_memory.data();
+    allocator.Type = D3D12DDI_COMMAND_LIST_TYPE_DIRECT; allocator.QueueFlags = D3D12DDI_COMMAND_QUEUE_FLAG_3D;
+    REQUIRE(table.pfnCreateCommandAllocator(create.hDrvDevice,&allocator) == S_OK);
+    D3D12DDIARG_CREATE_COMMAND_LIST_0001 list{};
+    list.hDrvCommandAllocator = allocator.hDrvCommandAllocator;
+    list.Type = D3D12DDI_COMMAND_LIST_TYPE_DIRECT; list.QueueFlags = D3D12DDI_COMMAND_QUEUE_FLAG_3D;
+    list.hRTCommandList.handle = reinterpret_cast<HANDLE>(uintptr_t(0x77220));
+    list.hDrvCommandList.pDrvPrivate = first.data();
+    REQUIRE(table.pfnCreateCommandList(create.hDrvDevice,&list) == S_OK);
+    list.hRTCommandList.handle = reinterpret_cast<HANDLE>(uintptr_t(0x77330));
+    list.hDrvCommandList.pDrvPrivate = second.data();
+    REQUIRE(table.pfnCreateCommandList(create.hDrvDevice,&list) == S_OK);
+    D3D12DDI_HCOMMANDLIST batch[2] = {{first.data()},{second.data()}};
+    auto *first_peer = object(first.data())->backend;
+    auto *second_peer = object(second.data())->backend;
+    const unsigned before_executes = queue_executes;
+    for (void *invalid : {reinterpret_cast<void *>(uintptr_t(1)), static_cast<void *>(allocator_memory.data()),
+                          static_cast<void *>(queue_memory.data())}) {
+        batch[1] = {invalid};
+        queue.pfnExecuteCommandLists(request.hDrvCommandQueue,2,batch);
+        REQUIRE(queue_executes == before_executes);
+        REQUIRE(reinterpret_cast<ImportPeer *>(first_peer)->references == 1);
+        REQUIRE(reinterpret_cast<ImportPeer *>(queue_peer)->references == 1);
+    }
+    Context foreign_context;
+    Object foreign{object_magic,&foreign_context,second_peer,VKDU_COMMAND_LIST};
+    batch[1] = {&foreign};
+    queue.pfnExecuteCommandLists(request.hDrvCommandQueue,2,batch);
+    REQUIRE(queue_executes == before_executes);
+    batch[1] = {second.data()};
+    queue.pfnExecuteCommandLists(request.hDrvCommandQueue,0,nullptr);
+    queue.pfnExecuteCommandLists(request.hDrvCommandQueue,65,batch);
+    queue.pfnExecuteCommandLists(request.hDrvCommandQueue,1,nullptr);
+    REQUIRE(queue_executes == before_executes);
+    queue.pfnExecuteCommandLists(request.hDrvCommandQueue,2,batch);
+    REQUIRE(queue_executes == before_executes + 1 && submitted_commands == std::vector<vkdu_object *>({first_peer,second_peer}));
+    std::array<D3D12DDI_HCOMMANDLIST,64> maximum{};
+    for (auto &entry : maximum) entry = {first.data()};
+    queue.pfnExecuteCommandLists(request.hDrvCommandQueue,64,maximum.data());
+    REQUIRE(submitted_commands.size() == 64 && reinterpret_cast<ImportPeer *>(first_peer)->references == 1);
+    // Queue errors belong to the live device even if queue/list slots disappear
+    // inside execution; no command-list error or poisoned slot may be consulted.
+    const unsigned before_errors = error_calls, before_queue_destroy = queue_destroys, before_command_destroy = command_destroys;
+    const auto before_command_errors = command_errors.size();
+    queue_execute_result = E_OUTOFMEMORY;
+    backend_queue_execute_callback = [&] {
+        batch[0] = {}; batch[1] = {}; // submitted array is already copied
+        table.pfnDestroyCommandList(create.hDrvDevice,{first.data()});
+        table.pfnDestroyCommandList(create.hDrvDevice,{second.data()});
+        table.pfnDestroyCommandQueue(create.hDrvDevice,request.hDrvCommandQueue);
+        first.fill(0xa5); second.fill(0xa5); queue_memory.fill(0xa5);
+        if (command_destroys != before_command_destroy || queue_destroys != before_queue_destroy) fixture_abort(__LINE__);
+    };
+    queue_negative_active = force_queue_unowned;
+    queue.pfnExecuteCommandLists(request.hDrvCommandQueue,2,batch);
+    queue_negative_active = false; backend_queue_execute_callback = {}; queue_execute_result = S_OK;
+    REQUIRE(error_calls == before_errors + 1 && last_runtime.handle == expected_device && command_errors.size() == before_command_errors);
+    REQUIRE(command_destroys == before_command_destroy + 2 && queue_destroys == before_queue_destroy + 1);
+    REQUIRE(!ctx->native_queue_objects && !ctx->native_command_objects);
+    // Constructing a queue may synchronously retire device/request storage.
+    // The unpublished backend queue is released exactly once with no slot write.
+    const unsigned before_cancel = queue_destroys;
+    backend_queue_create_callback = [&] {
+        table.pfnDestroyCommandAllocator(create.hDrvDevice,allocator.hDrvCommandAllocator);
+        adapter.pfnDestroyDevice(create.hDrvDevice);
+        device_memory.fill(0xa5); queue_memory.fill(0xa5); request = {};
+    };
+    REQUIRE(table.pfnCreateCommandQueue(create.hDrvDevice,&request) == DXGI_ERROR_DEVICE_REMOVED);
+    backend_queue_create_callback = {};
+    REQUIRE(queue_destroys == before_cancel + 1);
+    for (auto byte : queue_memory) REQUIRE(byte == 0xa5);
+    // Retiring the entire runtime device during execution detaches error
+    // callbacks, but backend queue/list ownership still lasts until return.
+    REQUIRE(adapter.pfnCreateDevice(open.hAdapter,&create) == S_OK);
+    request = original_request;
+    REQUIRE(table.pfnCreateCommandQueue(create.hDrvDevice,&request) == S_OK);
+    REQUIRE(table.pfnCreateCommandAllocator(create.hDrvDevice,&allocator) == S_OK);
+    list.hDrvCommandList = {first.data()};
+    REQUIRE(table.pfnCreateCommandList(create.hDrvDevice,&list) == S_OK);
+    batch[0] = list.hDrvCommandList;
+    const unsigned before_retirement_errors = error_calls;
+    queue_execute_result = DXGI_ERROR_DEVICE_REMOVED;
+    backend_queue_execute_callback = [&] {
+        table.pfnDestroyCommandList(create.hDrvDevice,list.hDrvCommandList);
+        table.pfnDestroyCommandQueue(create.hDrvDevice,request.hDrvCommandQueue);
+        table.pfnDestroyCommandAllocator(create.hDrvDevice,allocator.hDrvCommandAllocator);
+        adapter.pfnDestroyDevice(create.hDrvDevice);
+        first.fill(0xa5); queue_memory.fill(0xa5); device_memory.fill(0xa5);
+    };
+    queue.pfnExecuteCommandLists(request.hDrvCommandQueue,1,batch);
+    backend_queue_execute_callback = {}; queue_execute_result = S_OK;
+    REQUIRE(error_calls == before_retirement_errors && executing_objects.empty());
+    REQUIRE(adapter.pfnCloseAdapter(open.hAdapter) == S_OK);
+    std::puts("PASS native queue identity, whole-batch ownership, reentrant execution retirement and constructor cancellation");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc == 2 && !std::strcmp(argv[1], "--negative-control-deferred-backend")) force_deferred_cleanup = true;
     else if (argc == 2 && !std::strcmp(argv[1], "--negative-control-command-error-owner")) force_device_command_error = true;
     else if (argc == 2 && !std::strcmp(argv[1], "--negative-control-global-uav-barrier")) force_drop_global_barrier = true;
+    else if (argc == 2 && !std::strcmp(argv[1], "--negative-control-queue-ownership")) force_queue_unowned = true;
     else if (argc != 1) return 2;
     REQUIRE(test_finalization_borrow() == 0);
     REQUIRE(OpenAdapter12(nullptr) == E_INVALIDARG);
@@ -1083,6 +1290,7 @@ int main(int argc, char **argv) {
     retire_in_error = nullptr;
     REQUIRE(test_native_heaps() == 0);
     REQUIRE(test_native_command_errors() == 0);
+    REQUIRE(test_native_queue_lifetime() == 0);
     std::printf("PASS native OpenAdapter12 WDK identity/negotiation/private memory/callback/lifetime/error cleanup (%zu-bit); no system-runtime or GPU acceptance\n", sizeof(void *) * 8);
     return 0;
 }

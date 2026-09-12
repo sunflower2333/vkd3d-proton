@@ -20,6 +20,10 @@ void native_heap_retire(Context *);
 void native_heap_tables(D3D12DDI_DEVICE_FUNCS_CORE_0003 *);
 HRESULT native_command_create(Context *, const D3D12DDIARG_CREATE_COMMAND_LIST_0001 *);
 void native_command_destroy(Context *, Object *);
+HRESULT native_queue_create(Context *, const D3D12DDIARG_CREATECOMMANDQUEUE_0001 *);
+void native_queue_destroy(Context *, void *);
+void native_queue_execute(Object *, UINT, const D3D12DDI_HCOMMANDLIST *);
+Object *native_submission_find(Object *, void *);
 // Runtime owns this slot; child objects hold references to the separate Context.
 struct NativeDevice { uint32_t magic; Context *context; };
 // Track recursion only while the underlying mutex is owned. A call back into
@@ -48,6 +52,8 @@ struct Context {
     SRWLOCK resources_lock = SRWLOCK_INIT;
     Object *resources = nullptr;
     Object *descriptor_heaps = nullptr;
+    Object *native_queue_objects = nullptr;
+    Object *native_command_objects = nullptr;
     std::shared_ptr<NativeAdapter> native_adapter;
     D3D12DDI_HRTDEVICE runtime_device{};
     D3DDDI_DEVICECALLBACKS kernel_callbacks{};
@@ -82,6 +88,7 @@ struct Object {
     uint32_t descriptor_type = UINT32_MAX;
     NativeHeap *native_heap = nullptr;
     D3D12DDI_HRTCOMMANDLIST runtime_command{};
+    D3D12DDI_HRTCOMMANDQUEUE runtime_queue{};
 };
 Context *context(D3D12DDI_HDEVICE handle) {
     if (handle.pDrvPrivate) {
@@ -365,12 +372,15 @@ SIZE_T APIENTRY queue_size(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATECOMMANDQUEU
 HRESULT APIENTRY queue_create(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATECOMMANDQUEUE_0001 *args) {
     auto *ctx = context(h); vkdu_object *value = nullptr;
     if (!ctx || !args || args->NodeMask > 1) return E_INVALIDARG;
+    if (ctx->native_adapter) return native_queue_create(ctx, args);
     HRESULT hr = vkdu_queue_create(ctx->backend, command_type(args->QueueFlags), &value);
     return finish(ctx, args->hDrvCommandQueue.pDrvPrivate, value, VKDU_QUEUE, hr);
 }
 void APIENTRY queue_destroy(D3D12DDI_HDEVICE h, D3D12DDI_HCOMMANDQUEUE q) {
-    if (belongs(context(h), q.pDrvPrivate)) VioGpuD3D12BridgeUnbindObject(q.pDrvPrivate);
-    else error(context(h), E_INVALIDARG);
+    auto *ctx = context(h);
+    if (ctx && ctx->native_adapter) native_queue_destroy(ctx, q.pDrvPrivate);
+    else if (belongs(ctx, q.pDrvPrivate) && backend(q.pDrvPrivate, VKDU_QUEUE)) VioGpuD3D12BridgeUnbindObject(q.pDrvPrivate);
+    else error(ctx, E_INVALIDARG);
 }
 SIZE_T APIENTRY allocator_size(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATECOMMANDALLOCATOR *) { return sizeof(Object); }
 HRESULT APIENTRY allocator_create(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATECOMMANDALLOCATOR *args) {
@@ -397,10 +407,14 @@ HRESULT APIENTRY command_create(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATE_COM
 }
 void APIENTRY command_destroy(D3D12DDI_HDEVICE h, D3D12DDI_HCOMMANDLIST c) {
     auto *ctx = context(h);
+    if (ctx && ctx->native_adapter) {
+        // Native handles are looked up under the callback lock in the helper.
+        native_command_destroy(ctx, static_cast<Object *>(c.pDrvPrivate));
+        return;
+    }
     auto *cmd = object(c.pDrvPrivate);
     if (!cmd || cmd->context != ctx || cmd->kind != VKDU_COMMAND_LIST) { error(ctx, E_INVALIDARG); return; }
-    if (ctx->native_adapter) native_command_destroy(ctx, cmd);
-    else VioGpuD3D12BridgeUnbindObject(c.pDrvPrivate);
+    VioGpuD3D12BridgeUnbindObject(c.pDrvPrivate);
 }
 void APIENTRY command_close(D3D12DDI_HCOMMANDLIST c) {
     error(object(c.pDrvPrivate), vkdu_command_close(backend(c.pDrvPrivate, VKDU_COMMAND_LIST)));
@@ -512,6 +526,7 @@ void APIENTRY root_srv(D3D12DDI_HCOMMANDLIST c, UINT index, D3D12DDI_GPU_VIRTUAL
 void APIENTRY execute(D3D12DDI_HCOMMANDQUEUE q, UINT count, const D3D12DDI_HCOMMANDLIST *commands) {
     auto *queue = object(q.pDrvPrivate); vkdu_object *native[64];
     if (!queue) return;
+    if (queue->context->native_adapter) { native_queue_execute(queue, count, commands); return; }
     if (!commands || !count || count > 64) { error(queue, E_INVALIDARG); return; }
     for (UINT i = 0; i < count; ++i) native[i] = backend(commands[i].pDrvPrivate, VKDU_COMMAND_LIST);
     error(queue, vkdu_queue_execute(queue->backend, count, native));
@@ -666,7 +681,7 @@ extern "C" HRESULT APIENTRY VioGpuD3D12BridgeGetTables(D3D12DDI_DEVICE_FUNCS_COR
     commands->pfnSetComputeRoot32BitConstants = root_constants;
     commands->pfnSetDescriptorHeaps = set_heaps; commands->pfnSetComputeRootDescriptorTable = set_table;
     queue->pfnExecuteCommandLists = execute;
-    // Native heaps are buffer-only. Vulkan resource import, monitored fences,
+    // Native heaps/import are buffer-only. OS monitored fences,
     // residency, WDDM2 GPUVA, graphics and Present remain absent; no admission.
     return S_OK;
 }

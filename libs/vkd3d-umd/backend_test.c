@@ -50,6 +50,41 @@ static int32_t validation_device_create(PFN_vkGetInstanceProcAddr loader, vkdu_d
 }
 #endif
 
+static void check_retained_queue(vkdu_device *device)
+{
+    vkdu_object *queue = NULL, *allocator = NULL, *command = NULL, *fence = NULL;
+    vkdu_object *upload = NULL, *readback = NULL;
+    uint32_t *mapped, i;
+    CHECK(vkdu_queue_create(device, 0, &queue));
+    CHECK(vkdu_allocator_create(device, 0, &allocator));
+    CHECK(vkdu_command_create(device, allocator, 0, &command));
+    CHECK(vkdu_fence_create(device, 0, &fence));
+    CHECK(vkdu_buffer_create(device, 4096, 2, 0, D3D12_RESOURCE_STATE_GENERIC_READ, &upload));
+    CHECK(vkdu_buffer_create(device, 4096, 3, 0, D3D12_RESOURCE_STATE_COPY_DEST, &readback));
+    if (vkdu_object_retain(NULL) || !vkdu_object_retain(queue) || !vkdu_object_retain(command)) {
+        fprintf(stderr, "backend queue/list temporary ownership failed\n"); exit(1);
+    }
+    /* Destroy the original owners; only the temporary references remain. */
+    vkdu_object_destroy(queue); vkdu_object_destroy(command);
+    CHECK(vkdu_buffer_map(upload, 0, 0, (void **)&mapped));
+    for (i = 0; i < 1024; ++i) mapped[i] = i ^ 0x13579bdf;
+    CHECK(vkdu_buffer_unmap(upload, 0, 4096));
+    CHECK(vkdu_command_copy(command, readback, 0, upload, 0, 4096));
+    CHECK(vkdu_command_close(command));
+    CHECK(vkdu_queue_execute(queue, 1, &command));
+    CHECK(vkdu_queue_signal(queue, fence, 1));
+    CHECK(vkdu_fence_wait(fence, 1, 30000));
+    CHECK(vkdu_buffer_map(readback, 0, 4096, (void **)&mapped));
+    for (i = 0; i < 1024; ++i) if (mapped[i] != (i ^ 0x13579bdf)) {
+        fprintf(stderr, "retained queue readback[%u]=%u\n", i, mapped[i]); exit(1);
+    }
+    CHECK(vkdu_buffer_unmap(readback, 0, 0));
+    vkdu_object_destroy(command); vkdu_object_destroy(queue);
+    vkdu_object_destroy(allocator); vkdu_object_destroy(fence);
+    vkdu_object_destroy(upload); vkdu_object_destroy(readback);
+    puts("PASS retained backend queue/list ownership: 1024 words after original wrapper release");
+}
+
 static void check_constant_buffers(vkdu_device *device, vkdu_device *other)
 {
     vkdu_object *constants = NULL, *foreign = NULL, *upload = NULL, *buffer = NULL, *readback = NULL;
@@ -656,6 +691,7 @@ int main(int argc, char **argv)
     check_root_constants(device);
     check_shader_resources(device, wrong);
     check_uav_barriers(device, wrong);
+    check_retained_queue(device);
     /* Caller follows D3D12 lifetime rules: reset/destroy only after completion. */
     vkdu_object_destroy(command); vkdu_object_destroy(allocator);
     vkdu_object_destroy(table_pipeline); vkdu_object_destroy(table_root);

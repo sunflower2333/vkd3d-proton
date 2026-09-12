@@ -44,6 +44,9 @@ int32_t vkdu_test_device_create(PFN_vkGetInstanceProcAddr loader, vkdu_device **
 #endif
 void vkdu_device_destroy(vkdu_device *device);
 int32_t vkdu_device_status(vkdu_device *device);
+/* Caller already owns a live reference. A successful retain owns the wrapper
+ * and its COM device/object until the matching vkdu_object_destroy. */
+int vkdu_object_retain(vkdu_object *object);
 void vkdu_object_destroy(vkdu_object *object);
 int vkdu_object_is(vkdu_object *object, enum vkdu_kind kind);
 int vkdu_same_device(vkdu_object *a, vkdu_object *b);
