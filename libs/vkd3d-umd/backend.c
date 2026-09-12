@@ -2,6 +2,7 @@
 #define COBJMACROS
 #include "vkd3d.h"
 #include "vkd3d_wddm.h"
+#include "vkd3d_atomic.h"
 #include "backend.h"
 #include <stdlib.h>
 #include <string.h>
@@ -12,7 +13,7 @@
 struct vkdu_device { ID3D12Device *object; };
 struct vkdu_root_slot { uint32_t type, extent, heap_type, unbounded; };
 struct vkdu_object {
-    LONG references;
+    uint32_t references;
     IUnknown *object;
     ID3D12Device *owner;
     enum vkdu_kind kind;
@@ -135,11 +136,12 @@ int32_t vkdu_device_status(vkdu_device *device)
 { return device ? ID3D12Device_GetDeviceRemovedReason(device->object) : E_INVALIDARG; }
 int vkdu_object_retain(vkdu_object *object)
 {
-    LONG count, observed;
+    uint32_t count, observed;
     if (!object) return 0;
-    count = InterlockedCompareExchange(&object->references, 0, 0);
-    while (count > 0 && count < INT32_MAX) {
-        observed = InterlockedCompareExchange(&object->references, count + 1, count);
+    count = vkd3d_atomic_uint32_load_explicit(&object->references, vkd3d_memory_order_acquire);
+    while (count && count < UINT32_MAX) {
+        observed = vkd3d_atomic_uint32_compare_exchange(&object->references, count, count + 1,
+                vkd3d_memory_order_acq_rel, vkd3d_memory_order_acquire);
         if (observed == count) return 1;
         count = observed;
     }
@@ -147,7 +149,7 @@ int vkdu_object_retain(vkdu_object *object)
 }
 void vkdu_object_destroy(vkdu_object *object)
 {
-    if (object && !InterlockedDecrement(&object->references)) {
+    if (object && !vkd3d_atomic_uint32_decrement(&object->references, vkd3d_memory_order_acq_rel)) {
         IUnknown_Release(object->object); ID3D12Device_Release(object->owner); free(object);
     }
 }
