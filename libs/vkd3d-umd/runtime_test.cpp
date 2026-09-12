@@ -188,6 +188,8 @@ static unsigned fail_context_destroy;
 static bool fail_context_create, invalid_context_info, retire_lock;
 static bool fail_allocate, partial_allocate, partial_resource, null_map, reset_allocate, retire_allocate, rename_lock;
 static bool heap_callbacks_retired;
+// Same HRESULT_FROM_NT-style mapping used by the real KMT forwarding probe.
+static constexpr HRESULT stale_fence_status = static_cast<HRESULT>(0xd00000a3u);
 static std::array<unsigned char, 65536> mapped_heap{};
 static const HANDLE expected_device = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(0x456a0));
 static const HANDLE expected_context = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(0xabc50));
@@ -224,7 +226,10 @@ static HRESULT APIENTRY heap_escape(HANDLE adapter, const D3DDDICB_ESCAPE *args)
     if (args->PrivateDriverDataSize == sizeof(NativeFenceInfo)) {
         auto *fence = static_cast<NativeFenceInfo *>(args->pPrivateDriverData);
         if (adapter != expected_adapter || args->hContext != expected_context || fence->opcode != 2 ||
-                fence->expected_generation != generation || fence->completed || fence->context_id) fixture_abort(__LINE__);
+                fence->completed || fence->context_id) fixture_abort(__LINE__);
+        // The real KMD returns STATUS_DEVICE_NOT_READY for a stale generation;
+        // this well-formed query is not a corrupted callback contract.
+        if (fence->expected_generation != generation) return stale_fence_status;
         fence->generation = generation; fence->context_id = 83; fence->completed = 9;
         return S_OK;
     }
@@ -474,6 +479,8 @@ static int test_native_heaps() {
     REQUIRE(allocate(ha) == DXGI_ERROR_DEVICE_REMOVED && kernel_heaps.empty());
     for (auto byte : a) REQUIRE(byte == 0xa5);
     reset_allocate = false;
+    uint32_t stale_completed = 123;
+    REQUIRE(native_runtime_completed(context(create.hDrvDevice), &stale_completed) == stale_fence_status && !stale_completed);
     adapter.pfnDestroyDevice(create.hDrvDevice);
     REQUIRE(adapter.pfnCloseAdapter(open.hAdapter) == S_OK);
 
