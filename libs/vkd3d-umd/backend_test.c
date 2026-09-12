@@ -14,6 +14,7 @@
 #include "../../tests/shaders/descriptors/headers/overlapping_bindings.h"
 #include "../../tests/shaders/sparse/headers/update_tile_mappings_smem.h"
 #include "../../tests/shaders/command/headers/execute_indirect_multi_dispatch_root_constants.h"
+#include "../../tests/shaders/resource/headers/cs_non_zeroed.h"
 
 #define CHECK(expr) do { int32_t r = (expr); if (r < 0) { fprintf(stderr, "%s:%d: %s returned %08x\n", __FILE__, __LINE__, #expr, (unsigned)r); exit(1); } } while (0)
 #define REJECT(expr) do { if ((expr) >= 0) { fprintf(stderr, "unexpected success: %s\n", #expr); exit(1); } } while (0)
@@ -403,6 +404,107 @@ static void check_shader_resources(vkdu_device *device, vkdu_device *other)
     puts("PASS typed/raw/structured SRVs, root/table offsets, copied/null descriptors, unsupported swizzle and ownership/range rejection: 8x1024 readbacks");
 }
 
+static void check_uav_barriers(vkdu_device *device, vkdu_device *other)
+{
+    vkdu_object *upload = NULL, *input = NULL, *feedback = NULL, *readback = NULL, *foreign = NULL;
+    vkdu_object *queue = NULL, *allocator = NULL, *command = NULL, *fence = NULL, *root = NULL, *pipeline = NULL;
+    vkdu_object *copy_allocator = NULL, *copy_command = NULL;
+    struct vkdu_root_parameter parameters[2] = {{D3D12_ROOT_PARAMETER_TYPE_UAV, 0, 0, 0, 0},
+        {D3D12_ROOT_PARAMETER_TYPE_UAV, 0, 1, 0, 0}};
+    struct vkdu_resource_barrier ordered[2], invalid[2], many[17];
+    uint32_t *mapped, round, pass, i;
+    CHECK(vkdu_buffer_create(device, 8192, 2, 0, D3D12_RESOURCE_STATE_GENERIC_READ, &upload));
+    CHECK(vkdu_buffer_create(device, 4096, 1, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST, &input));
+    CHECK(vkdu_buffer_create(device, 4096, 1, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST, &feedback));
+    CHECK(vkdu_buffer_create(device, 8192, 3, 0, D3D12_RESOURCE_STATE_COPY_DEST, &readback));
+    CHECK(vkdu_buffer_create(other, 4096, 1, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON, &foreign));
+    CHECK(vkdu_queue_create(device, D3D12_COMMAND_LIST_TYPE_DIRECT, &queue));
+    CHECK(vkdu_allocator_create(device, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator));
+    CHECK(vkdu_command_create(device, allocator, D3D12_COMMAND_LIST_TYPE_DIRECT, &command));
+    CHECK(vkdu_allocator_create(device, D3D12_COMMAND_LIST_TYPE_COPY, &copy_allocator));
+    CHECK(vkdu_command_create(device, copy_allocator, D3D12_COMMAND_LIST_TYPE_COPY, &copy_command));
+    CHECK(vkdu_fence_create(device, 0, &fence));
+    CHECK(vkdu_root_create(device, parameters, 2, 0, &root));
+    CHECK(vkdu_pipeline_create(device, root, cs_non_zeroed_code_dxbc, sizeof(cs_non_zeroed_code_dxbc), &pipeline));
+    ordered[0] = (struct vkdu_resource_barrier){VKDU_BARRIER_UAV, input, 0, 0};
+    ordered[1] = (struct vkdu_resource_barrier){VKDU_BARRIER_UAV, feedback, 0, 0};
+    CHECK(vkdu_command_barriers(command, 0, NULL));
+    REJECT(vkdu_command_barriers(command, 1, NULL));
+    REJECT(vkdu_command_barriers(command, 65537, ordered));
+    REJECT(vkdu_command_barriers(copy_command, 2, ordered));
+    invalid[0] = ordered[0]; invalid[1] = ordered[1]; invalid[1].resource = NULL;
+    REJECT(vkdu_command_barriers(copy_command, 1, &invalid[1]));
+    for (round = 0; round < 2; ++round) {
+        const uint32_t sentinel = 0xcafe0000u + round;
+        if (round) {
+            CHECK(vkdu_allocator_reset(allocator));
+            CHECK(vkdu_command_reset(command, allocator));
+            CHECK(vkdu_command_transition(command, input, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST));
+            CHECK(vkdu_command_transition(command, feedback, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST));
+        }
+        CHECK(vkdu_buffer_map(upload, 0, 0, (void **)&mapped));
+        for (i = 0; i < 1024; ++i) mapped[i] = round && (i & 1) ? i + 1 : 0;
+        for (i = 1024; i < 2048; ++i) mapped[i] = sentinel;
+        mapped[1024] = 0;
+        CHECK(vkdu_buffer_unmap(upload, 0, 8192));
+        CHECK(vkdu_command_copy(command, input, 0, upload, 0, 4096));
+        CHECK(vkdu_command_copy(command, feedback, 0, upload, 4096, 4096));
+        CHECK(vkdu_command_transition(command, input, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+        CHECK(vkdu_command_transition(command, feedback, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+        CHECK(vkdu_command_root(command, root));
+        CHECK(vkdu_command_pipeline(command, pipeline));
+        CHECK(vkdu_command_uav(command, 0, input, 0));
+        CHECK(vkdu_command_uav(command, 1, feedback, 0));
+        for (pass = 0; pass < 4; ++pass) {
+            CHECK(vkdu_command_dispatch(command, 1, 1, 1));
+            if (pass == 3) break;
+            if (round) {
+                const struct vkdu_resource_barrier global = {VKDU_BARRIER_UAV, NULL, 0, 0};
+                CHECK(vkdu_command_barriers(command, 1, &global));
+            } else CHECK(vkdu_command_barriers(command, 2, ordered));
+        }
+        /* The first transition in each rejected batch must not reach the real
+         * command list. The final valid transition below is still required. */
+        invalid[0] = (struct vkdu_resource_barrier){VKDU_BARRIER_TRANSITION, input,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE};
+        invalid[1] = (struct vkdu_resource_barrier){VKDU_BARRIER_UAV, foreign, 0, 0};
+        REJECT(vkdu_command_barriers(command, 2, invalid));
+        invalid[1].resource = upload; REJECT(vkdu_command_barriers(command, 2, invalid));
+        invalid[1].resource = fence; REJECT(vkdu_command_barriers(command, 2, invalid));
+        invalid[1].resource = feedback; invalid[1].before = 1;
+        REJECT(vkdu_command_barriers(command, 2, invalid));
+        invalid[1].before = 0; invalid[1].type = (enum vkdu_barrier_type)99;
+        REJECT(vkdu_command_barriers(command, 2, invalid));
+        for (i = 0; i < 17; ++i) many[i] = (struct vkdu_resource_barrier){VKDU_BARRIER_UAV, NULL, 0, 0};
+        CHECK(vkdu_command_barriers(command, 17, many));
+        CHECK(vkdu_command_transition(command, input, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE));
+        CHECK(vkdu_command_transition(command, feedback, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE));
+        CHECK(vkdu_command_copy(command, readback, 0, input, 0, 4096));
+        CHECK(vkdu_command_copy(command, readback, 4096, feedback, 0, 4096));
+        CHECK(vkdu_command_close(command));
+        REJECT(vkdu_command_barriers(command, 2, ordered));
+        CHECK(vkdu_queue_execute(queue, 1, &command));
+        CHECK(vkdu_queue_signal(queue, fence, round + 1));
+        CHECK(vkdu_fence_wait(fence, round + 1, 30000));
+        CHECK(vkdu_buffer_map(readback, 0, 8192, (void **)&mapped));
+        for (i = 0; i < 2048; ++i) {
+            const uint32_t expected = i < 1024 ? 0xff : i == 1024 ? 3072 + round * 512 : sentinel;
+            if (mapped[i] != expected) {
+                fprintf(stderr, "UAV ordering round %u word %u: %08x expected %08x\n", round, i, mapped[i], expected); exit(1);
+            }
+        }
+        CHECK(vkdu_buffer_unmap(readback, 0, 0));
+        fprintf(stderr, "PASS UAV %s ordering: four dependent dispatches, 2048 words including sentinels\n",
+            round ? "global" : "resource");
+    }
+    CHECK(vkdu_device_status(device));
+    vkdu_object_destroy(command); vkdu_object_destroy(allocator); vkdu_object_destroy(queue); vkdu_object_destroy(fence);
+    vkdu_object_destroy(copy_command); vkdu_object_destroy(copy_allocator);
+    vkdu_object_destroy(root); vkdu_object_destroy(pipeline); vkdu_object_destroy(foreign);
+    vkdu_object_destroy(input); vkdu_object_destroy(feedback); vkdu_object_destroy(upload); vkdu_object_destroy(readback);
+    puts("PASS UAV resource/global ordering and atomic batch rejection: 2x2048 readbacks; CPU/GPU probe boundary unchanged");
+}
+
 int main(int argc, char **argv)
 {
     PFN_vkGetInstanceProcAddr loader;
@@ -553,6 +655,7 @@ int main(int argc, char **argv)
     check_constant_buffers(device, wrong);
     check_root_constants(device);
     check_shader_resources(device, wrong);
+    check_uav_barriers(device, wrong);
     /* Caller follows D3D12 lifetime rules: reset/destroy only after completion. */
     vkdu_object_destroy(command); vkdu_object_destroy(allocator);
     vkdu_object_destroy(table_pipeline); vkdu_object_destroy(table_root);

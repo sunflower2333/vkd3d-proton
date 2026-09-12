@@ -517,13 +517,44 @@ int32_t vkdu_command_copy(vkdu_object *command, vkdu_object *dst, uint64_t dst_o
 }
 int32_t vkdu_command_transition(vkdu_object *command, vkdu_object *resource, uint32_t before, uint32_t after)
 {
-    D3D12_RESOURCE_BARRIER barrier = {0};
-    if (!RECORDING(command) || !VALID(resource, VKDU_BUFFER) || !vkdu_same_device(command, resource)) return E_INVALIDARG;
-    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition.pResource = OBJ(ID3D12Resource, resource);
-    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    barrier.Transition.StateBefore = before; barrier.Transition.StateAfter = after;
-    ID3D12GraphicsCommandList_ResourceBarrier(OBJ(ID3D12GraphicsCommandList, command), 1, &barrier);
+    const struct vkdu_resource_barrier barrier = {VKDU_BARRIER_TRANSITION, resource, before, after};
+    return vkdu_command_barriers(command, 1, &barrier);
+}
+int32_t vkdu_command_barriers(vkdu_object *command, uint32_t count, const struct vkdu_resource_barrier *barriers)
+{
+    D3D12_RESOURCE_BARRIER stack[16], *native = stack;
+    uint32_t i;
+    if (!RECORDING(command) || count > 65536 || (count && !barriers)) return E_INVALIDARG;
+    /* Validate all resources, command types and UAV flags before issuing even
+     * the first barrier. A rejected late element cannot alter recording. */
+    for (i = 0; i < count; ++i) {
+        vkdu_object *resource = barriers[i].resource;
+        if (resource && (!VALID(resource, VKDU_BUFFER) || !vkdu_same_device(command, resource))) return E_INVALIDARG;
+        if (barriers[i].type == VKDU_BARRIER_TRANSITION) {
+            if (!resource) return E_INVALIDARG;
+        } else if (barriers[i].type == VKDU_BARRIER_UAV) {
+            if (command->command_type == D3D12_COMMAND_LIST_TYPE_COPY ||
+                barriers[i].before || barriers[i].after ||
+                (resource && !(resource->resource_flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))) return E_INVALIDARG;
+        } else return E_INVALIDARG;
+    }
+    if (!count) return S_OK;
+    if (count > sizeof(stack) / sizeof(stack[0]) && !(native = calloc(count, sizeof(*native)))) return E_OUTOFMEMORY;
+    for (i = 0; i < count; ++i) {
+        memset(&native[i], 0, sizeof(native[i]));
+        if (barriers[i].type == VKDU_BARRIER_TRANSITION) {
+            native[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            native[i].Transition.pResource = OBJ(ID3D12Resource, barriers[i].resource);
+            native[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            native[i].Transition.StateBefore = barriers[i].before;
+            native[i].Transition.StateAfter = barriers[i].after;
+        } else {
+            native[i].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            native[i].UAV.pResource = barriers[i].resource ? OBJ(ID3D12Resource, barriers[i].resource) : NULL;
+        }
+    }
+    ID3D12GraphicsCommandList_ResourceBarrier(OBJ(ID3D12GraphicsCommandList, command), count, native);
+    if (native != stack) free(native);
     return S_OK;
 }
 int32_t vkdu_root_create(vkdu_device *device, const struct vkdu_root_parameter *parameters, uint32_t count, uint32_t flags, vkdu_object **out)

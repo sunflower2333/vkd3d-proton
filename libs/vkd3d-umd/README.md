@@ -154,6 +154,16 @@ Caller must keep resources, shaders and command allocators alive until submitted
 work has retired and reset allocators only after completion, as required by D3D12.
 
 The CPU-Vulkan test compiles and executes a real SM5 compute shader, compares all
+Native ResourceBarrier now supports complete buffer transitions and both
+resource-specific and global UAV ordering. Opaque resource handles resolve
+through the live owned registry, and the complete native/backend batch is
+validated before any barrier is recorded. UAV barriers reject copy lists and
+buffers without unordered-access support. Two dependent four-dispatch
+readbacks and a WDK recorded-call negative control cover this boundary; see
+`docs/vkd3d-native-uav-barriers-20260912.md`. Split, alias/ranged and texture
+barriers remain unsupported. Native version admission remains closed.
+
+The CPU-Vulkan test compiles and executes a real SM5 compute shader, compares all
 1024 readbacks after copy/barrier operations, checks fence signal/wait, timeout,
 allocator reuse, and invalid shader/range/state propagation. Its CPU-only device
 entrypoint is built separately and absent from production. This verifies backend

@@ -30,6 +30,10 @@ static std::function<void()> nested_error_callback;
 static std::function<void(const mwd_callbacks *, void *)> backend_destructor_check;
 static bool force_deferred_cleanup;
 static bool force_device_command_error;
+static bool force_drop_global_barrier;
+static unsigned barrier_calls;
+static HRESULT barrier_result = S_OK;
+static std::vector<vkdu_resource_barrier> recorded_barriers;
 static std::vector<std::pair<HANDLE, HRESULT>> command_errors;
 static std::function<void()> nested_command_error, backend_command_create_callback, backend_command_destroy_callback;
 static unsigned command_creates, command_destroys;
@@ -123,6 +127,7 @@ static uint64_t test_buffer_size(vkdu_object *);
 static int32_t test_allocator_create(vkdu_device *, uint32_t, vkdu_object **);
 static int32_t test_command_create(vkdu_device *, vkdu_object *, uint32_t, vkdu_object **);
 static int32_t test_command_close(vkdu_object *);
+static int32_t test_command_barriers(vkdu_object *, uint32_t, const vkdu_resource_barrier *);
 
 #define LoadLibraryExW test_load
 #define GetProcAddress test_symbol
@@ -139,6 +144,7 @@ static int32_t test_command_close(vkdu_object *);
 #define vkdu_allocator_create test_allocator_create
 #define vkdu_command_create test_command_create
 #define vkdu_command_close test_command_close
+#define vkdu_command_barriers test_command_barriers
 #include "ddi.cpp"
 
 #define REQUIRE(x) do { if (!(x)) { std::fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #x); return 1; } } while (0)
@@ -216,6 +222,15 @@ static int32_t test_command_create(vkdu_device *device, vkdu_object *allocator, 
 }
 static int32_t test_command_close(vkdu_object *object) {
     return test_object_is(object, VKDU_COMMAND_LIST) ? command_close_result : E_INVALIDARG;
+}
+static int32_t test_command_barriers(vkdu_object *object, uint32_t count, const vkdu_resource_barrier *barriers) {
+    if (!test_object_is(object, VKDU_COMMAND_LIST) || (count && !barriers)) fixture_abort(__LINE__);
+    ++barrier_calls; recorded_barriers.clear();
+    for (uint32_t i = 0; i < count; ++i) {
+        if (force_drop_global_barrier && barriers[i].type == VKDU_BARRIER_UAV && !barriers[i].resource) continue;
+        recorded_barriers.push_back(barriers[i]);
+    }
+    return barrier_result;
 }
 
 struct KernelHeap { uint64_t address, bytes; bool locked; HANDLE resource; };
@@ -762,6 +777,77 @@ static int test_native_command_errors() {
     second.fill(0xa5);
     REQUIRE(table.pfnCreateCommandList(create.hDrvDevice, &request) == S_OK);
     const auto second_handle = request.hDrvCommandList;
+    // Exercise the actual WDK ResourceBarrier table on a native-created list.
+    // Opaque resources must be resolved before dereferencing, and a late bad
+    // element must not record an earlier transition or UAV barrier.
+    Object buffer{};
+    auto *buffer_peer = reinterpret_cast<vkdu_object *>(new ImportPeer{{}, ctx->backend, VKDU_BUFFER, 0x100000, 4096});
+    REQUIRE(VioGpuD3D12BridgeBindObject(create.hDrvDevice, &buffer, buffer_peer, VKDU_BUFFER) == S_OK);
+    D3D12DDIARG_RESOURCE_BARRIER_0003 batch[3]{};
+    batch[0].Type = D3D12DDI_RESOURCE_BARRIER_TYPE_TRANSITION;
+    batch[0].Transition = {{&buffer}, UINT_MAX, D3D12DDI_RESOURCE_STATE_COPY_DEST, D3D12DDI_RESOURCE_STATE_UNORDERED_ACCESS};
+    batch[1].Type = batch[2].Type = D3D12DDI_RESOURCE_BARRIER_TYPE_UAV;
+    batch[1].UAV.hResource = {&buffer}; // batch[2] is the distinct global barrier.
+    const unsigned barrier_device_errors = error_calls;
+    command_errors.clear(); recorded_barriers.clear(); barrier_calls = 0;
+    commands.pfnResourceBarrier(first_handle, 3, batch);
+    if (barrier_calls != 1 || recorded_barriers.size() != 3 || !command_errors.empty() ||
+        recorded_barriers[0].type != VKDU_BARRIER_TRANSITION || recorded_barriers[0].resource != buffer_peer ||
+        recorded_barriers[0].before != D3D12DDI_RESOURCE_STATE_COPY_DEST ||
+        recorded_barriers[0].after != D3D12DDI_RESOURCE_STATE_UNORDERED_ACCESS ||
+        recorded_barriers[1].type != VKDU_BARRIER_UAV || recorded_barriers[1].resource != buffer_peer ||
+        recorded_barriers[2].type != VKDU_BARRIER_UAV || recorded_barriers[2].resource != nullptr) {
+        std::fputs("FAIL native UAV barrier lost its resource/global ordering\n", stderr); return 1;
+    }
+    // Caller arrays are no longer needed after synchronous recording.
+    batch[1].UAV.hResource = {};
+    REQUIRE(recorded_barriers[1].resource == buffer_peer);
+    batch[1].UAV.hResource = {&buffer};
+    void *invalid_handles[] = {reinterpret_cast<void *>(uintptr_t(1)), first.data(), allocator_memory.data()};
+    for (void *invalid : invalid_handles) {
+        const unsigned prior = barrier_calls;
+        batch[2].UAV.hResource = {invalid};
+        commands.pfnResourceBarrier(second_handle, 3, batch);
+        REQUIRE(barrier_calls == prior && command_errors.back() == std::make_pair(second_runtime, HRESULT(E_INVALIDARG)));
+    }
+    Context foreign_context;
+    Object foreign{object_magic, &foreign_context, buffer_peer, VKDU_BUFFER};
+    batch[2].UAV.hResource = {&foreign};
+    const unsigned prior_invalid = barrier_calls;
+    commands.pfnResourceBarrier(second_handle, 3, batch);
+    REQUIRE(barrier_calls == prior_invalid && command_errors.back().second == E_INVALIDARG);
+    // A valid-shaped stale resource slot is not a global barrier either.
+    ctx->resources = nullptr;
+    batch[2].UAV.hResource = {&buffer};
+    commands.pfnResourceBarrier(second_handle, 3, batch);
+    REQUIRE(barrier_calls == prior_invalid && command_errors.back().second == E_INVALIDARG);
+    ctx->resources = &buffer;
+    batch[2].UAV.hResource = {};
+    batch[2].Flags = D3D12DDI_RESOURCE_BARRIER_FLAG_BEGIN_ONLY;
+    commands.pfnResourceBarrier(second_handle, 3, batch);
+    REQUIRE(barrier_calls == prior_invalid && command_errors.back().second == E_NOTIMPL);
+    batch[2].Flags = D3D12DDI_RESOURCE_BARRIER_FLAG_NONE;
+    batch[2].Type = D3D12DDI_RESOURCE_BARRIER_TYPE_ALIASING;
+    commands.pfnResourceBarrier(second_handle, 3, batch);
+    REQUIRE(barrier_calls == prior_invalid && command_errors.back().second == E_NOTIMPL);
+    batch[2].Type = D3D12DDI_RESOURCE_BARRIER_TYPE_UAV;
+    commands.pfnResourceBarrier(first_handle, 1, nullptr);
+    REQUIRE(barrier_calls == prior_invalid && command_errors.back().second == E_INVALIDARG);
+    commands.pfnResourceBarrier(first_handle, 65537, batch);
+    REQUIRE(barrier_calls == prior_invalid && command_errors.back().second == E_INVALIDARG);
+    commands.pfnResourceBarrier(first_handle, 0, nullptr);
+    REQUIRE(barrier_calls == prior_invalid + 1 && recorded_barriers.empty());
+    std::array<D3D12DDIARG_RESOURCE_BARRIER_0003, 17> large_batch{};
+    for (auto &barrier : large_batch) barrier.Type = D3D12DDI_RESOURCE_BARRIER_TYPE_UAV;
+    commands.pfnResourceBarrier(first_handle, UINT(large_batch.size()), large_batch.data());
+    REQUIRE(recorded_barriers.size() == large_batch.size());
+    barrier_result = E_OUTOFMEMORY;
+    commands.pfnResourceBarrier(first_handle, 3, batch);
+    REQUIRE(command_errors.back() == std::make_pair(first_runtime, HRESULT(E_OUTOFMEMORY)));
+    barrier_result = S_OK;
+    REQUIRE(error_calls == barrier_device_errors && ctx->last_error == S_OK);
+    VioGpuD3D12BridgeUnbindObject(&buffer);
+    std::puts("PASS native UAV resource/global barriers, whole-batch rejection and command error ownership");
     // The source callback table and request are caller-owned and can change.
     um.pfnSetCommandListErrorCb = nullptr; request.hRTCommandList = {};
     const unsigned before_errors = error_calls;
@@ -812,8 +898,11 @@ static int test_native_command_errors() {
         device_memory.fill(0xa5);
         if (unloads != before_unload) fixture_abort(__LINE__);
     };
-    command_close_result = DXGI_ERROR_DEVICE_RESET;
-    commands.pfnCloseCommandList(first_handle);
+    barrier_result = DXGI_ERROR_DEVICE_RESET;
+    D3D12DDIARG_RESOURCE_BARRIER_0003 global_barrier{};
+    global_barrier.Type = D3D12DDI_RESOURCE_BARRIER_TYPE_UAV;
+    commands.pfnResourceBarrier(first_handle, 1, &global_barrier);
+    barrier_result = S_OK;
     nested_command_error = {}; backend_command_destroy_callback = {};
     REQUIRE(command_destroys == before_destroy + 1 && unloads == before_unload + 1 && error_calls == before_retire_errors);
     for (auto byte : first) REQUIRE(byte == 0xa5);
@@ -865,6 +954,7 @@ int main(int argc, char **argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc == 2 && !std::strcmp(argv[1], "--negative-control-deferred-backend")) force_deferred_cleanup = true;
     else if (argc == 2 && !std::strcmp(argv[1], "--negative-control-command-error-owner")) force_device_command_error = true;
+    else if (argc == 2 && !std::strcmp(argv[1], "--negative-control-global-uav-barrier")) force_drop_global_barrier = true;
     else if (argc != 1) return 2;
     REQUIRE(test_finalization_borrow() == 0);
     REQUIRE(OpenAdapter12(nullptr) == E_INVALIDARG);

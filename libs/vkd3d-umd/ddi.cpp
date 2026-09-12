@@ -420,19 +420,44 @@ void APIENTRY copy(D3D12DDI_HCOMMANDLIST c, D3D12DDIARG_BUFFER_PLACEMENT dst, D3
 void APIENTRY barriers(D3D12DDI_HCOMMANDLIST c, UINT count, const D3D12DDIARG_RESOURCE_BARRIER_0003 *args) {
     auto *cmd = object(c.pDrvPrivate);
     if (!cmd) return;
-    if ((count && !args) || count > 65536) { error(cmd, E_INVALIDARG); return; }
-    // Validate the complete batch before recording any transition.
-    for (UINT i = 0; i < count; ++i) {
-        if (args[i].Type != D3D12DDI_RESOURCE_BARRIER_TYPE_TRANSITION || args[i].Flags ||
-            args[i].Transition.Subresource != UINT_MAX ||
-            !belongs(cmd->context, args[i].Transition.hResource.pDrvPrivate) ||
-            !backend(args[i].Transition.hResource.pDrvPrivate, VKDU_BUFFER)) { error(cmd, E_NOTIMPL); return; }
+    if (cmd->kind != VKDU_COMMAND_LIST || (count && !args) || count > 65536) { error(cmd, E_INVALIDARG); return; }
+    vkdu_resource_barrier stack[16]{};
+    std::unique_ptr<vkdu_resource_barrier[]> allocated;
+    auto *translated = stack;
+    if (count > 16) {
+        allocated.reset(new (std::nothrow) vkdu_resource_barrier[count]{});
+        if (!allocated) { error(cmd, E_OUTOFMEMORY); return; }
+        translated = allocated.get();
     }
+    auto *ctx = cmd->context;
+    HRESULT hr = S_OK;
+    AcquireSRWLockShared(&ctx->resources_lock);
+    // Resolve opaque runtime resource handles in the owned live registry,
+    // never by dereferencing arbitrary memory. Keep the resources stable until
+    // the backend has consumed the complete translated batch synchronously.
     for (UINT i = 0; i < count; ++i) {
-        HRESULT hr = vkdu_command_transition(cmd->backend,
-            backend(args[i].Transition.hResource.pDrvPrivate, VKDU_BUFFER), args[i].Transition.StateBefore, args[i].Transition.StateAfter);
-        if (FAILED(hr)) { error(cmd, hr); return; }
+        if (args[i].Flags) { hr = E_NOTIMPL; break; }
+        void *handle;
+        if (args[i].Type == D3D12DDI_RESOURCE_BARRIER_TYPE_TRANSITION) {
+            if (args[i].Transition.Subresource != UINT_MAX) { hr = E_NOTIMPL; break; }
+            handle = args[i].Transition.hResource.pDrvPrivate;
+            if (!handle) { hr = E_INVALIDARG; break; }
+            translated[i].type = VKDU_BARRIER_TRANSITION;
+            translated[i].before = args[i].Transition.StateBefore;
+            translated[i].after = args[i].Transition.StateAfter;
+        } else if (args[i].Type == D3D12DDI_RESOURCE_BARRIER_TYPE_UAV) {
+            handle = args[i].UAV.hResource.pDrvPrivate;
+            translated[i].type = VKDU_BARRIER_UAV;
+        } else { hr = E_NOTIMPL; break; }
+        auto *resource = find_buffer(ctx, handle);
+        if (handle && !resource) { hr = E_INVALIDARG; break; }
+        translated[i].resource = resource ? resource->backend : nullptr;
     }
+    if (SUCCEEDED(hr)) hr = vkdu_command_barriers(cmd->backend, count, translated);
+    ReleaseSRWLockShared(&ctx->resources_lock);
+    // The runtime error callback may destroy this command/device and poison
+    // its private slot. No command or caller-array access follows reporting.
+    error(cmd, hr);
 }
 void APIENTRY dispatch(D3D12DDI_HCOMMANDLIST c, UINT x, UINT y, UINT z) {
     error(object(c.pDrvPrivate), vkdu_command_dispatch(backend(c.pDrvPrivate, VKDU_COMMAND_LIST), x, y, z));

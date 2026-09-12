@@ -16,6 +16,12 @@ enum vkdu_kind { VKDU_BUFFER, VKDU_QUEUE, VKDU_ALLOCATOR, VKDU_COMMAND_LIST, VKD
 struct vkdu_adapter { uint8_t luid[8]; uint32_t vendor_id, device_id; };
 struct vkdu_descriptor_range { uint32_t type, count, shader_register, register_space, offset; };
 struct vkdu_descriptor_span { vkdu_object *heap; uint32_t first, count; };
+enum vkdu_barrier_type { VKDU_BARRIER_TRANSITION, VKDU_BARRIER_UAV };
+struct vkdu_resource_barrier {
+    enum vkdu_barrier_type type;
+    vkdu_object *resource; /* NULL is legal only for a global UAV barrier. */
+    uint32_t before, after;
+};
 struct vkdu_root_parameter {
     uint32_t type, visibility, shader_register, register_space, constant_count;
     const struct vkdu_descriptor_range *ranges;
@@ -71,6 +77,8 @@ int32_t vkdu_command_close(vkdu_object *command);
 int32_t vkdu_command_reset(vkdu_object *command, vkdu_object *allocator);
 int32_t vkdu_command_copy(vkdu_object *command, vkdu_object *dst, uint64_t dst_offset, vkdu_object *src, uint64_t src_offset, uint64_t bytes);
 int32_t vkdu_command_transition(vkdu_object *command, vkdu_object *resource, uint32_t before, uint32_t after);
+/* Validate the entire batch before changing command-list state. */
+int32_t vkdu_command_barriers(vkdu_object *command, uint32_t count, const struct vkdu_resource_barrier *barriers);
 int32_t vkdu_root_create(vkdu_device *device, const struct vkdu_root_parameter *parameters, uint32_t count, uint32_t flags, vkdu_object **out);
 int32_t vkdu_pipeline_create(vkdu_device *device, vkdu_object *root, const void *code, size_t size, vkdu_object **out);
 int32_t vkdu_pipeline_create_tokens(vkdu_device *device, vkdu_object *root, const uint32_t *tokens, uint32_t words, vkdu_object **out);

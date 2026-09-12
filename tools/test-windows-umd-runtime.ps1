@@ -2,7 +2,7 @@ param([Parameter(Mandatory)][string]$Executable)
 $ErrorActionPreference = 'Stop'
 $exe = (Resolve-Path -LiteralPath $Executable).Path
 $directory = Split-Path -Parent $exe
-foreach ($scenario in @('lifecycle', 'deferred-negative', 'command-owner-negative')) {
+foreach ($scenario in @('lifecycle', 'deferred-negative', 'command-owner-negative', 'uav-global-negative')) {
     $negative = $scenario -ne 'lifecycle'
     $name = 'runtime-' + $scenario
     $stdout = Join-Path $directory ($name + '.stdout.txt')
@@ -10,6 +10,7 @@ foreach ($scenario in @('lifecycle', 'deferred-negative', 'command-owner-negativ
     $start = @{ FilePath = $exe; PassThru = $true; RedirectStandardOutput = $stdout; RedirectStandardError = $stderr }
     if ($scenario -eq 'deferred-negative') { $start.ArgumentList = '--negative-control-deferred-backend' }
     if ($scenario -eq 'command-owner-negative') { $start.ArgumentList = '--negative-control-command-error-owner' }
+    if ($scenario -eq 'uav-global-negative') { $start.ArgumentList = '--negative-control-global-uav-barrier' }
     $process = Start-Process @start
     $null = $process.Handle
     if (!$process.WaitForExit(90000)) {
@@ -21,6 +22,8 @@ foreach ($scenario in @('lifecycle', 'deferred-negative', 'command-owner-negativ
     if ($negative) {
         $expected = if ($scenario -eq 'deferred-negative') {
             'FAIL ordinary backend completion after premature callback retirement'
+        } elseif ($scenario -eq 'uav-global-negative') {
+            'FAIL native UAV barrier lost its resource/global ordering'
         } else { 'FAIL native command error escaped its runtime command-list owner' }
         if ($process.ExitCode -ne 1 -or $errors -notmatch $expected) {
             throw "$scenario negative control did not fail semantically: exit=$($process.ExitCode) $errors"
@@ -30,6 +33,7 @@ foreach ($scenario in @('lifecycle', 'deferred-negative', 'command-owner-negativ
         Write-Host $output
         if ($process.ExitCode -ne 0 -or $errors -match 'FAIL' -or
                 $output -notmatch 'PASS ordinary backend completion/unmap/release before runtime retirement' -or
+                $output -notmatch 'PASS native UAV resource/global barriers, whole-batch rejection and command error ownership' -or
                 $output -notmatch 'PASS native command-list runtime error ownership, device-loss forwarding, rejected creation and reentrant retirement') {
             throw "Runtime lifecycle fixture failed: exit=$($process.ExitCode) $errors"
         }
