@@ -64,8 +64,10 @@ jobs:
           path: |
             build-umd-${{ matrix.arch }}/package/
             build-umd-${{ matrix.arch }}/meson-logs/
+            build-umd-${{ matrix.arch }}/libs/vkd3d-umd/runtime-*.txt
   arm64-runtime:
     needs: windows
+    if: ${{ !cancelled() }}
     runs-on: windows-11-arm
     steps:
       - uses: actions/checkout@v4

@@ -15,6 +15,11 @@
 #include <thread>
 #include <functional>
 
+[[noreturn]] static void fixture_abort(int line) {
+    std::fprintf(stderr, "FAIL fixture invariant at runtime_test.cpp:%d\n", line);
+    std::exit(1);
+}
+
 static HRESULT backend_result = S_OK, query_result = S_OK;
 static unsigned loads, unloads, creates, destroys, query_calls, error_calls;
 static bool bad_loader = false, old_reply = false;
@@ -30,7 +35,7 @@ static const HANDLE expected_adapter = reinterpret_cast<HANDLE>(static_cast<uint
 static const std::array<uint8_t, 8> expected_luid{1,2,3,4,5,6,7,8};
 static void wait_backend_worker(const mwd_callbacks *callbacks, void *owner, bool require_live = false) {
     HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!done) std::abort();
+    if (!done) fixture_abort(__LINE__);
     std::thread worker([=]() {
         const auto status = callbacks->status(owner);
         uint32_t fence = 0;
@@ -44,25 +49,25 @@ static void wait_backend_worker(const mwd_callbacks *callbacks, void *owner, boo
     });
     if (WaitForSingleObject(done, 2000) != WAIT_OBJECT_0) {
         std::fprintf(stderr, "FAIL backend worker blocked by native callback lock\n");
-        std::abort();
+        fixture_abort(__LINE__);
     }
     worker.join(); CloseHandle(done);
 }
 struct TestDevice { const mwd_callbacks *callbacks; void *owner; };
 static HMODULE WINAPI test_load(LPCWSTR name, HANDLE, DWORD flags) {
-    if (std::wcscmp(name, L"vulkan-1.dll") || flags != LOAD_LIBRARY_SEARCH_SYSTEM32) std::abort();
+    if (std::wcscmp(name, L"vulkan-1.dll") || flags != LOAD_LIBRARY_SEARCH_SYSTEM32) fixture_abort(__LINE__);
     ++loads;
     if (bad_loader) { SetLastError(ERROR_MOD_NOT_FOUND); return nullptr; }
     return reinterpret_cast<HMODULE>(static_cast<uintptr_t>(0x24680));
 }
 static FARPROC WINAPI test_symbol(HMODULE, LPCSTR name) {
-    if (std::strcmp(name, "vkGetInstanceProcAddr")) std::abort();
+    if (std::strcmp(name, "vkGetInstanceProcAddr")) fixture_abort(__LINE__);
     return reinterpret_cast<FARPROC>(static_cast<uintptr_t>(0x35790));
 }
 static BOOL WINAPI test_unload(HMODULE) { ++unloads; return TRUE; }
 static int32_t test_create(PFN_vkGetInstanceProcAddr loader, const uint8_t luid[8],
         const mwd_callbacks *callbacks, void *owner, vkdu_device **out) {
-    if (!loader || std::memcmp(luid, expected_luid.data(), 8) || !owner || !mwd_callbacks_valid(callbacks)) std::abort();
+    if (!loader || std::memcmp(luid, expected_luid.data(), 8) || !owner || !mwd_callbacks_valid(callbacks)) fixture_abort(__LINE__);
     ++creates; *out = nullptr;
     if (SUCCEEDED(backend_result)) *out = reinterpret_cast<vkdu_device *>(new TestDevice{callbacks, owner});
     if (reset_during_create) ++generation;
@@ -77,9 +82,9 @@ static void test_destroy(vkdu_device *device) {
     }
 }
 static HRESULT APIENTRY test_query(HANDLE runtime, const D3DDDICB_QUERYADAPTERINFO *args) {
-    if (runtime != expected_adapter || args->PrivateDriverDataSize != 160) std::abort();
+    if (runtime != expected_adapter || args->PrivateDriverDataSize != 160) fixture_abort(__LINE__);
     auto *bytes = static_cast<uint8_t *>(args->pPrivateDriverData);
-    for (unsigned i = 0; i < 160; ++i) if (bytes[i]) std::abort();
+    for (unsigned i = 0; i < 160; ++i) if (bytes[i]) fixture_abort(__LINE__);
     ++query_calls;
     if (FAILED(query_result)) return query_result;
     auto put = [&](size_t offset, uint32_t value) { std::memcpy(bytes + offset, &value, 4); };
@@ -92,7 +97,7 @@ static HRESULT APIENTRY test_query(HANDLE runtime, const D3DDDICB_QUERYADAPTERIN
     return S_OK;
 }
 static void APIENTRY test_error(D3D10DDI_HRTDEVICE runtime, HRESULT result) {
-    if (SUCCEEDED(result)) std::abort();
+    if (SUCCEEDED(result)) fixture_abort(__LINE__);
     ++error_calls; last_runtime = runtime;
     if (retire_in_error) retire_in_error(error_device);
     if (nested_error_callback) nested_error_callback();
@@ -143,7 +148,7 @@ static int32_t test_import_heap(vkdu_device *device, void *owner, void *token, u
     mwd_allocation allocation{};
     HRESULT hr = native_runtime_retain(owner, token, &allocation);
     if (FAILED(hr)) return hr;
-    if (allocation.size != size) std::abort();
+    if (allocation.size != size) fixture_abort(__LINE__);
     auto backing = std::make_shared<ImportOwner>();
     backing->context = static_cast<Context *>(owner); backing->allocation = allocation;
     *out = reinterpret_cast<vkdu_object *>(new ImportPeer{backing, device, VKDU_MEMORY_HEAP, allocation.address, size});
@@ -155,7 +160,7 @@ static int32_t test_place_buffer(vkdu_device *device, vkdu_object *memory, uint6
     if (placement_failure) return E_INVALIDARG;
     auto *peer = reinterpret_cast<ImportPeer *>(memory);
     if (FAILED(native_runtime_status(peer->owner->context))) return DXGI_ERROR_DEVICE_REMOVED;
-    if (peer->device != device || peer->kind != VKDU_MEMORY_HEAP || offset || size > peer->bytes) std::abort();
+    if (peer->device != device || peer->kind != VKDU_MEMORY_HEAP || offset || size > peer->bytes) fixture_abort(__LINE__);
     *out = reinterpret_cast<vkdu_object *>(new ImportPeer{peer->owner, device, VKDU_BUFFER, peer->address, size});
     return S_OK;
 }
@@ -193,14 +198,14 @@ static unsigned renders;
 static HRESULT render_result = S_OK;
 static bool retire_render;
 static void valid_kernel_callback(HANDLE runtime) {
-    if (runtime != expected_device || heap_callbacks_retired) std::abort();
+    if (runtime != expected_device || heap_callbacks_retired) fixture_abort(__LINE__);
 }
 static HRESULT APIENTRY heap_context_create(HANDLE runtime, D3DDDICB_CREATECONTEXT *args) {
     valid_kernel_callback(runtime);
     auto *data = static_cast<NativeContextCreate *>(args->pPrivateDriverData);
     if (args->PrivateDriverDataSize != sizeof(*data) || !native_header_valid(data->header, sizeof(*data)) ||
             data->generation != generation || data->flags || data->reserved || args->NodeOrdinal || args->EngineAffinity != 1)
-        std::abort();
+        fixture_abort(__LINE__);
     ++heap_context_creates; args->hContext = expected_context;
     args->pCommandBuffer = dma_commands[0].data(); args->CommandBufferSize = 65536;
     args->pAllocationList = allocation_lists[0].data(); args->AllocationListSize = 1024;
@@ -209,7 +214,7 @@ static HRESULT APIENTRY heap_context_create(HANDLE runtime, D3DDDICB_CREATECONTE
 }
 static HRESULT APIENTRY heap_context_destroy(HANDLE runtime, const D3DDDICB_DESTROYCONTEXT *args) {
     valid_kernel_callback(runtime);
-    if (args->hContext != expected_context || !kernel_heaps.empty() || !kernel_resources.empty()) std::abort();
+    if (args->hContext != expected_context || !kernel_heaps.empty() || !kernel_resources.empty()) fixture_abort(__LINE__);
     ++heap_context_destroys;
     if (fail_context_destroy) { --fail_context_destroy; return E_FAIL; }
     return S_OK;
@@ -219,7 +224,7 @@ static HRESULT APIENTRY heap_escape(HANDLE adapter, const D3DDDICB_ESCAPE *args)
     if (args->PrivateDriverDataSize == sizeof(NativeFenceInfo)) {
         auto *fence = static_cast<NativeFenceInfo *>(args->pPrivateDriverData);
         if (adapter != expected_adapter || args->hContext != expected_context || fence->opcode != 2 ||
-                fence->expected_generation != generation || fence->completed || fence->context_id) std::abort();
+                fence->expected_generation != generation || fence->completed || fence->context_id) fixture_abort(__LINE__);
         fence->generation = generation; fence->context_id = 83; fence->completed = 9;
         return S_OK;
     }
@@ -227,7 +232,7 @@ static HRESULT APIENTRY heap_escape(HANDLE adapter, const D3DDDICB_ESCAPE *args)
     if (adapter != expected_adapter || args->hContext != expected_context || args->PrivateDriverDataSize != sizeof(*info) ||
             !native_header_valid(info->header, sizeof(*info)) || info->opcode != 1 || info->flags ||
             info->expected_generation != generation || info->va_start || info->va_size || info->generation ||
-            info->context_id || info->queue_id) std::abort();
+            info->context_id || info->queue_id) fixture_abort(__LINE__);
     info->va_start = 0x10001000; info->va_size = 0x80000; info->generation = generation;
     info->context_id = 83; info->queue_id = 1;
     if (invalid_context_info) info->va_size = UINT64_MAX;
@@ -236,29 +241,29 @@ static HRESULT APIENTRY heap_escape(HANDLE adapter, const D3DDDICB_ESCAPE *args)
 static HRESULT APIENTRY heap_allocate(HANDLE runtime, D3DDDICB_ALLOCATE *args) {
     valid_kernel_callback(runtime);
     if (args->NumAllocations != 1 || !args->pAllocationInfo || args->pPrivateDriverData || args->PrivateDriverDataSize)
-        std::abort();
+        fixture_abort(__LINE__);
     auto *data = static_cast<NativeAllocationInfo *>(args->pAllocationInfo->pPrivateDriverData);
     if (args->pAllocationInfo->PrivateDriverDataSize != sizeof(*data) || !native_header_valid(data->header, sizeof(*data)) ||
             data->alignment != 4096 || data->context_id != 83 || data->generation != generation ||
             (data->flags != 4 && data->flags != 6 && data->flags != 14) || data->format || data->width || data->height || data->pitch ||
             data->refresh_numerator || data->refresh_denominator || data->iova < 0x10001000 ||
             data->iova % 4096 || data->size % 4096 || data->iova + data->size > 0x10081000)
-        std::abort();
+        fixture_abort(__LINE__);
     for (const auto &item : kernel_heaps) {
         const auto &heap = item.second;
-        if (data->iova < heap.address + heap.bytes && heap.address < data->iova + data->size) std::abort();
+        if (data->iova < heap.address + heap.bytes && heap.address < data->iova + data->size) fixture_abort(__LINE__);
     }
     ++allocations;
     if (!fail_allocate || partial_allocate) {
         args->pAllocationInfo->hAllocation = next_allocation++;
         kernel_heaps.emplace(args->pAllocationInfo->hAllocation, KernelHeap{data->iova, data->size, false, args->hResource});
         if (args->hResource) {
-            if (!kernel_resources.insert(args->hResource).second) std::abort();
+            if (!kernel_resources.insert(args->hResource).second) fixture_abort(__LINE__);
             args->hKMResource = 73;
         }
     }
     if (fail_allocate && partial_resource && args->hResource) {
-        if (!kernel_resources.insert(args->hResource).second) std::abort();
+        if (!kernel_resources.insert(args->hResource).second) fixture_abort(__LINE__);
         args->hKMResource = 73;
     }
     if (reset_allocate) ++generation;
@@ -273,17 +278,17 @@ static HRESULT APIENTRY heap_deallocate(HANDLE runtime, const D3DDDICB_DEALLOCAT
     ++deallocations;
     if (fail_deallocate) { --fail_deallocate; return DXGI_ERROR_WAS_STILL_DRAWING; }
     if (args->hResource) {
-        if (args->NumAllocations || args->HandleList || !kernel_resources.erase(args->hResource)) std::abort();
+        if (args->NumAllocations || args->HandleList || !kernel_resources.erase(args->hResource)) fixture_abort(__LINE__);
         for (auto found = kernel_heaps.begin(); found != kernel_heaps.end();) {
             if (found->second.resource == args->hResource) {
-                if (found->second.locked) std::abort();
+                if (found->second.locked) fixture_abort(__LINE__);
                 found = kernel_heaps.erase(found);
             } else ++found;
         }
     } else {
-        if (args->NumAllocations != 1 || !args->HandleList) std::abort();
+        if (args->NumAllocations != 1 || !args->HandleList) fixture_abort(__LINE__);
         auto found = kernel_heaps.find(*args->HandleList);
-        if (found == kernel_heaps.end() || found->second.locked || found->second.resource) std::abort();
+        if (found == kernel_heaps.end() || found->second.locked || found->second.resource) fixture_abort(__LINE__);
         kernel_heaps.erase(found);
     }
     return S_OK;
@@ -293,7 +298,7 @@ static HRESULT APIENTRY heap_lock(HANDLE runtime, D3DDDICB_LOCK *args) {
     auto found = kernel_heaps.find(args->hAllocation);
     if (found == kernel_heaps.end() || found->second.locked || !args->Flags.LockEntire ||
             args->Flags.Discard || args->Flags.NoExistingReference || args->Flags.ReadOnly || args->NumPages || args->pPages)
-        std::abort();
+        fixture_abort(__LINE__);
     found->second.locked = true;
     if (rename_lock) {
         args->hAllocation = next_allocation++;
@@ -305,9 +310,9 @@ static HRESULT APIENTRY heap_lock(HANDLE runtime, D3DDDICB_LOCK *args) {
 }
 static HRESULT APIENTRY heap_unlock(HANDLE runtime, const D3DDDICB_UNLOCK *args) {
     valid_kernel_callback(runtime);
-    if (args->NumAllocations != 1 || !args->phAllocations) std::abort();
+    if (args->NumAllocations != 1 || !args->phAllocations) fixture_abort(__LINE__);
     auto found = kernel_heaps.find(*args->phAllocations);
-    if (found == kernel_heaps.end() || !found->second.locked) std::abort();
+    if (found == kernel_heaps.end() || !found->second.locked) fixture_abort(__LINE__);
     ++unlocks;
     if (fail_unlock) { --fail_unlock; return E_FAIL; }
     found->second.locked = false;
@@ -317,13 +322,13 @@ static HRESULT APIENTRY heap_unlock(HANDLE runtime, const D3DDDICB_UNLOCK *args)
 static HRESULT APIENTRY heap_render(HANDLE runtime, D3DDDICB_RENDER *args) {
     valid_kernel_callback(runtime);
     if (args->hContext != expected_context || args->NumAllocations != 1 || args->NumPatchLocations != 1 ||
-            args->CommandOffset || args->Flags.Value) std::abort();
+            args->CommandOffset || args->Flags.Value) fixture_abort(__LINE__);
     auto *header = static_cast<NativeRenderInfo *>(args->pNewCommandBuffer);
     auto *refs = reinterpret_cast<NativeRenderReference *>(static_cast<unsigned char *>(args->pNewCommandBuffer) + 64);
     if (!native_header_valid(header->header, args->CommandLength) || header->generation != generation ||
             header->stream_offset != 96 || header->references_count != 1 || refs->length != 4096 ||
             !kernel_heaps.count(args->pNewAllocationList[0].hAllocation) ||
-            args->pNewPatchLocationList[0].PatchOffset != 96) std::abort();
+            args->pNewPatchLocationList[0].PatchOffset != 96) fixture_abort(__LINE__);
     ++renders;
     args->pNewCommandBuffer = dma_commands[1].data(); args->NewCommandBufferSize = 65536;
     args->pNewAllocationList = allocation_lists[1].data(); args->NewAllocationListSize = 1024;
@@ -336,7 +341,7 @@ static void retire_import_with_map(Context *ctx, const mwd_allocation &allocatio
     void *mapped = nullptr;
     uint32_t handle = 0;
     if (FAILED(native_runtime_map(ctx, allocation.token, &mapped, &handle)) ||
-            !mapped || !kernel_heaps.count(handle)) std::abort();
+            !mapped || !kernel_heaps.count(handle)) fixture_abort(__LINE__);
     // Observe mapped backing before retirement. The fake runtime does not
     // implement final KMT device teardown, so never access this pointer after
     // DestroyDevice returns or claim the runtime kept it alive for us.
@@ -346,11 +351,11 @@ static void retire_import_with_map(Context *ctx, const mwd_allocation &allocatio
     native_destroy_device(error_device);
     if (unlocks != old_unlocks || deallocations != old_deallocations ||
             heap_context_destroys != old_context_destroys ||
-            !kernel_heaps.count(handle) || !kernel_heaps.at(handle).locked) std::abort();
+            !kernel_heaps.count(handle) || !kernel_heaps.at(handle).locked) fixture_abort(__LINE__);
     heap_callbacks_retired = true;
     mapped = nullptr;
     if (native_runtime_map(ctx, allocation.token, &mapped, &handle) != DXGI_ERROR_DEVICE_REMOVED || mapped)
-        std::abort();
+        fixture_abort(__LINE__);
 }
 
 static int test_native_heaps() {
@@ -681,6 +686,7 @@ static int test_finalization_borrow() {
 }
 
 int main(int argc, char **argv) {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc == 2 && !std::strcmp(argv[1], "--negative-control-deferred-backend")) force_deferred_cleanup = true;
     else if (argc != 1) return 2;
     REQUIRE(test_finalization_borrow() == 0);
