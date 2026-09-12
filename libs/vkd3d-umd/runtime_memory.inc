@@ -161,7 +161,9 @@ int32_t MWD_CALL native_runtime_completed(void *owner, uint32_t *out) {
     if (!native_header_valid(info.header, sizeof(info)) || info.opcode != 2 || info.flags || info.reserved ||
             info.expected_generation != ctx->native_adapter->generation || info.generation != info.expected_generation ||
             info.context_id != ctx->native_context_id || info.completed > UINT32_MAX) return E_FAIL;
-    *out = static_cast<uint32_t>(info.completed);
+    // Never expose private completion ahead of OS-ordered backing retirement.
+    if (!ctx->native_submissions) ctx->native_os_completed = static_cast<uint32_t>(info.completed);
+    *out = ctx->native_os_completed;
     return native_heap_generation(ctx);
 }
 int32_t MWD_CALL native_runtime_submit(void *owner, const void *stream, uint32_t size,

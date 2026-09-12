@@ -79,6 +79,7 @@ struct Context {
     bool native_context_pending = false;
     NativeSubmission *native_submissions = nullptr;
     unsigned native_submission_count = 0;
+    uint32_t native_os_completed = 0;
     bool native_reaping = false;
 };
 struct Object {

@@ -31,6 +31,8 @@ backend release and reentrant runtime callbacks. Polling completion/status
 retires only the completed prefix. An unavailable event callback rejects work
 before Render; a full FIFO returns WAS_STILL_DRAWING before accepting more work.
 
+The private KMD completion counter never advances beyond OS event retirement;
+while events are pending, queries preserve the last safely reported value.
 Failed Render or event registration keeps conservative pending ownership.
 Registration is retried on the same context; this may delay release but never
 move completion earlier. Failed resource cleanup retains the final owner for

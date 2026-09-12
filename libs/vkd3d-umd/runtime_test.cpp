@@ -1272,7 +1272,7 @@ static int test_native_completion() {
     REQUIRE(token->users == 1 && token->submitted == 1 && pending_events.size() == 1);
     void *mapping = nullptr; uint32_t mapped = 0;
     REQUIRE(native_runtime_map(ctx, token, &mapping, &mapped) == DXGI_ERROR_WAS_STILL_DRAWING && !mapping && !mapped);
-    REQUIRE(native_runtime_completed(ctx, &completed) == S_OK && kernel_heaps.count(handle));
+    REQUIRE(native_runtime_completed(ctx, &completed) == S_OK && !completed && kernel_heaps.count(handle));
     complete_events();
     // Cleanup failure retains both the accepted event and its final resource owner.
     fail_deallocate = 1;
