@@ -24,7 +24,7 @@ $crossArgs = @()
 if ($Architecture -eq 'arm64') { $crossArgs = @('--cross-file', 'tools/umd-arm64-msvc.ini') }
 meson setup $buildDir @crossArgs --buildtype release -Ddebug=true -Denable_umd_bridge=true -Denable_umd_bridge_tests=true
 if ($LASTEXITCODE) { exit $LASTEXITCODE }
-meson compile -C $buildDir -j 3 viogpud3d12 vkd3d-umd-ddi-abi-test vkd3d-umd-ddi-descriptor-test vkd3d-umd-gpu-probe vkd3d-umd-runtime-test vkd3d-umd-shared-gpu-probe
+meson compile -C $buildDir -j 3 viogpud3d12 vkd3d-umd-ddi-abi-test vkd3d-umd-ddi-descriptor-test vkd3d-umd-gpu-probe vkd3d-umd-runtime-test vkd3d-umd-shared-gpu-probe vkd3d-umd-alignment-probe
 if ($LASTEXITCODE) { exit $LASTEXITCODE }
 $dll = Join-Path $buildDir 'libs\vkd3d-umd\viogpud3d12.dll'
 $test = Join-Path $buildDir 'libs\vkd3d-umd\vkd3d-umd-ddi-abi-test.exe'
@@ -38,6 +38,8 @@ if ($Architecture -ne 'arm64') {
     if ($LASTEXITCODE -ne 2) { throw 'GPU probe must require explicit adapter identity before loading Vulkan' }
     & (Join-Path $buildDir 'libs\vkd3d-umd\vkd3d-umd-shared-gpu-probe.exe')
     if ($LASTEXITCODE -ne 2) { throw 'Shared backing probe must require explicit LUID and execution switch' }
+    & (Join-Path $buildDir 'libs\vkd3d-umd\vkd3d-umd-alignment-probe.exe')
+    if ($LASTEXITCODE -ne 2) { throw 'Alignment probe must require explicit adapter identity before loading Vulkan' }
 }
 $output = Join-Path $buildDir 'package'
 New-Item -ItemType Directory -Force $output | Out-Null
@@ -46,6 +48,7 @@ Copy-Item (Join-Path $buildDir 'libs\vkd3d-umd\vkd3d-umd-ddi-descriptor-test.exe
 Copy-Item (Join-Path $buildDir 'libs\vkd3d-umd\vkd3d-umd-gpu-probe.exe') $output
 Copy-Item (Join-Path $buildDir 'libs\vkd3d-umd\vkd3d-umd-runtime-test.exe') $output
 Copy-Item (Join-Path $buildDir 'libs\vkd3d-umd\vkd3d-umd-shared-gpu-probe.exe') $output
+Copy-Item (Join-Path $buildDir 'libs\vkd3d-umd\vkd3d-umd-alignment-probe.exe') $output
 Copy-Item libs/vkd3d-umd/README.md $output
 dumpbin /headers $dll | Out-File (Join-Path $output 'pe-headers.txt')
 dumpbin /exports $dll | Out-File (Join-Path $output 'exports.txt')

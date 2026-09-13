@@ -21,6 +21,9 @@ if vkd3d_platform == 'windows'
     umd_gpu_probe = executable('vkd3d-umd-gpu-probe', 'backend_test.c',
       c_args : ['-DVKDU_GPU_PROBE'], dependencies : umd_backend_dep,
       include_directories : vkd3d_private_includes)
+    umd_alignment_probe = executable('vkd3d-umd-alignment-probe', 'alignment_probe.c', 'debug_policy.c',
+      dependencies : vkd3d_dep,
+      include_directories : [vkd3d_private_includes, include_directories('../..')])
     umd_ddi_abi_test = executable('vkd3d-umd-ddi-abi-test', 'ddi_abi_test.cpp',
       include_directories : vkd3d_public_includes, cpp_args : ['-DNOMINMAX'])
     umd_ddi_descriptor_test = executable('vkd3d-umd-ddi-descriptor-test', 'ddi_descriptor_test.cpp',
@@ -36,4 +39,9 @@ if get_option('enable_umd_bridge_tests')
     dependencies : vkd3d_dep,
     include_directories : vkd3d_private_includes)
   test('vkd3d-umd-backend', umd_backend_test, timeout : 120)
+  if vkd3d_platform != 'windows'
+    umd_alignment_test = executable('vkd3d-umd-alignment-test', 'alignment_probe.c', 'debug_policy.c',
+      c_args : ['-DVKDU_ENABLE_TEST_DEVICE'], dependencies : vkd3d_dep,
+      include_directories : [vkd3d_private_includes, include_directories('../..')])
+  endif
 endif

@@ -270,3 +270,22 @@ and KMD7648b72f or explicit validated successors, copy this candidate before PE
 signing/catalog generation, preserve matching PDB identity, and record parent,
 Mesa and vkd3d source hashes. A signed candidate still does not establish native
 runtime acceptance; no active driver registration is changed by this milestone.
+# GPU address alignment diagnostic
+
+`vkd3d-umd-alignment-probe.exe --adapter LUID_LOW_HEX LUID_HIGH_HEX VENDOR_HEX DEVICE_HEX`
+uses the embedded production backend and independently matches the OS LUID,
+Vulkan vendor/device IDs, and Turnip driver ID. Arguments are hexadecimal;
+the system Vulkan loader is opened only after argument validation.
+
+The diagnostic checks 90 public D3D12 buffer GPU addresses: committed and
+placed, DEFAULT/UPLOAD/READBACK, small and large allocations, two placement
+offsets and four simultaneous committed allocations. Each line records the
+actual pooled/direct allocator classification rather than inferring it from
+size. A contract failure exits 3, setup/allocation/coverage errors exit 1, and
+invalid command lines exit 2. `--audit` records contract failures with exit 0
+and explicitly prints `ALIGNMENT_CONTRACT=FAIL`; it must not be counted as
+alignment acceptance. Linux's `vkd3d-umd-alignment-test` is CPU-Vulkan-only.
+
+This checks real allocation addresses, not native Windows DDI feature-level or
+display acceptance. No production admission, allocator or runtime ABI changes
+are made by adding this standalone diagnostic.
