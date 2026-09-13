@@ -12,7 +12,7 @@ extern "C" {
 /* No Windows SDK or generated COM types cross this internal ABI. */
 typedef struct vkdu_device vkdu_device;
 typedef struct vkdu_object vkdu_object;
-enum vkdu_kind { VKDU_BUFFER, VKDU_QUEUE, VKDU_ALLOCATOR, VKDU_COMMAND_LIST, VKDU_ROOT, VKDU_PIPELINE, VKDU_FENCE, VKDU_DESCRIPTOR_HEAP, VKDU_MEMORY_HEAP, VKDU_COMMAND_SIGNATURE };
+enum vkdu_kind { VKDU_BUFFER, VKDU_QUEUE, VKDU_ALLOCATOR, VKDU_COMMAND_LIST, VKDU_ROOT, VKDU_PIPELINE, VKDU_FENCE, VKDU_DESCRIPTOR_HEAP, VKDU_MEMORY_HEAP, VKDU_COMMAND_SIGNATURE, VKDU_TEXTURE2D };
 struct vkdu_adapter { uint8_t luid[8]; uint32_t vendor_id, device_id; };
 struct vkdu_descriptor_range { uint32_t type, count, shader_register, register_space, offset; };
 struct vkdu_descriptor_span { vkdu_object *heap; uint32_t first, count; };
@@ -26,6 +26,16 @@ struct vkdu_root_parameter {
     uint32_t type, visibility, shader_register, register_space, constant_count;
     const struct vkdu_descriptor_range *ranges;
     uint32_t range_count;
+};
+struct vkdu_sampler_desc {
+    uint32_t filter, address_u, address_v, address_w;
+    float mip_bias;
+    uint32_t max_anisotropy, comparison;
+    float border[4], min_lod, max_lod;
+};
+struct vkdu_static_sampler {
+    struct vkdu_sampler_desc desc;
+    uint32_t border_color, shader_register, register_space, visibility;
 };
 
 int32_t vkdu_device_create(PFN_vkGetInstanceProcAddr loader, const struct vkdu_adapter *adapter, vkdu_device **out);
@@ -56,6 +66,14 @@ int32_t vkdu_buffer_map(vkdu_object *buffer, uint64_t begin, uint64_t end, void 
 int32_t vkdu_buffer_unmap(vkdu_object *buffer, uint64_t begin, uint64_t end);
 uint64_t vkdu_buffer_address(vkdu_object *buffer);
 uint64_t vkdu_buffer_size(vkdu_object *buffer);
+/* Single-mip, single-layer R32_FLOAT / RGBA8_UNORM staging and sampling.
+ * Committed backend resources, not native runtime heap/texture admission. */
+int32_t vkdu_texture2d_create(vkdu_device *device, uint32_t width, uint32_t height,
+        uint32_t format, vkdu_object **out);
+int32_t vkdu_texture2d_srv(vkdu_object *heap, uint32_t index, vkdu_object *texture);
+int32_t vkdu_command_texture_upload(vkdu_object *command, vkdu_object *texture,
+        vkdu_object *upload, uint64_t offset, uint32_t row_pitch);
+int32_t vkdu_sampler_create(vkdu_object *heap, uint32_t index, const struct vkdu_sampler_desc *desc);
 int32_t vkdu_heap_create(vkdu_device *device, uint32_t type, uint32_t count, int shader_visible, vkdu_object **out);
 uint32_t vkdu_descriptor_size(vkdu_device *device, uint32_t type);
 uint64_t vkdu_heap_start(vkdu_object *heap, int gpu);
@@ -83,6 +101,9 @@ int32_t vkdu_command_transition(vkdu_object *command, vkdu_object *resource, uin
 /* Validate the entire batch before changing command-list state. */
 int32_t vkdu_command_barriers(vkdu_object *command, uint32_t count, const struct vkdu_resource_barrier *barriers);
 int32_t vkdu_root_create(vkdu_device *device, const struct vkdu_root_parameter *parameters, uint32_t count, uint32_t flags, vkdu_object **out);
+int32_t vkdu_root_create_samplers(vkdu_device *device, const struct vkdu_root_parameter *parameters,
+        uint32_t count, uint32_t flags, const struct vkdu_static_sampler *samplers,
+        uint32_t sampler_count, vkdu_object **out);
 int32_t vkdu_pipeline_create(vkdu_device *device, vkdu_object *root, const void *code, size_t size, vkdu_object **out);
 int32_t vkdu_pipeline_create_tokens(vkdu_device *device, vkdu_object *root, const uint32_t *tokens, uint32_t words, vkdu_object **out);
 int32_t vkdu_command_root(vkdu_object *command, vkdu_object *root);

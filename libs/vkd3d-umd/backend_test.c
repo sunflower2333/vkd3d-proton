@@ -19,6 +19,8 @@
 #define CHECK(expr) do { int32_t r = (expr); if (r < 0) { fprintf(stderr, "%s:%d: %s returned %08x\n", __FILE__, __LINE__, #expr, (unsigned)r); exit(1); } } while (0)
 #define REJECT(expr) do { if ((expr) >= 0) { fprintf(stderr, "unexpected success: %s\n", #expr); exit(1); } } while (0)
 
+#include "backend_samplers_test.inc"
+
 #ifdef VKDU_GPU_PROBE
 static struct vkdu_adapter requested_adapter;
 
@@ -780,6 +782,7 @@ int main(int argc, char **argv)
     check_uav_barriers(device, wrong);
     check_indirect_dispatch(device, wrong);
     check_retained_queue(device);
+    check_samplers(device, wrong);
     /* Caller follows D3D12 lifetime rules: reset/destroy only after completion. */
     vkdu_object_destroy(command); vkdu_object_destroy(allocator);
     vkdu_object_destroy(table_pipeline); vkdu_object_destroy(table_root);

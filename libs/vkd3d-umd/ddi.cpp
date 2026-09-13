@@ -32,6 +32,9 @@ HRESULT APIENTRY indirect_signature_create(D3D12DDI_HDEVICE, const D3D12DDIARG_C
 void APIENTRY indirect_signature_destroy(D3D12DDI_HDEVICE, D3D12DDI_HCOMMANDSIGNATURE);
 void APIENTRY execute_indirect(D3D12DDI_HCOMMANDLIST, D3D12DDI_HCOMMANDSIGNATURE, UINT,
         D3D12DDIARG_BUFFER_PLACEMENT, D3D12DDIARG_BUFFER_PLACEMENT);
+void APIENTRY create_sampler(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATE_SAMPLER *, D3D12DDI_CPU_DESCRIPTOR_HANDLE);
+HRESULT native_root_backend(Context *, void *, const vkdu_root_parameter *, UINT, UINT,
+        const vkdu_static_sampler *, UINT);
 // Runtime owns this slot; child objects hold references to the separate Context.
 struct NativeDevice { uint32_t magic; Context *context; };
 // Track recursion only while the underlying mutex is owned. A call back into
@@ -557,11 +560,27 @@ void APIENTRY root_constants(D3D12DDI_HCOMMANDLIST c, UINT index, UINT count, co
 }
 SIZE_T APIENTRY root_size(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATE_ROOT_SIGNATURE_0001 *) { return sizeof(Object); }
 HRESULT APIENTRY root_create(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATE_ROOT_SIGNATURE_0001 *args, D3D12DDI_HROOTSIGNATURE root) {
-    auto *ctx = context(h); vkdu_object *value = nullptr; vkdu_root_parameter parameters[64]{};
+    auto *ctx = context(h); vkdu_root_parameter parameters[64]{};
     std::unique_ptr<vkdu_descriptor_range[]> ranges; UINT used = 0;
+    std::unique_ptr<vkdu_static_sampler[]> samplers;
     if (!ctx || !args || !args->pRootSignature || args->NodeMask > 1) return E_INVALIDARG;
     const auto &desc = *args->pRootSignature;
-    if (desc.NumStaticSamplers || desc.NumParameters > 64 || (desc.NumParameters && !desc.pRootParameters)) return E_NOTIMPL;
+    if (desc.NumParameters > 64 || (desc.NumParameters && !desc.pRootParameters) ||
+            desc.NumStaticSamplers > 2032 || (desc.NumStaticSamplers && !desc.pStaticSamplers)) return E_INVALIDARG;
+    if (desc.NumStaticSamplers) {
+        samplers.reset(new (std::nothrow) vkdu_static_sampler[desc.NumStaticSamplers]{});
+        if (!samplers) return E_OUTOFMEMORY;
+        for (UINT i = 0; i < desc.NumStaticSamplers; ++i) {
+            const auto &s = desc.pStaticSamplers[i];
+            auto &out = samplers[i];
+            out.desc.filter = s.Filter; out.desc.address_u = s.AddressU;
+            out.desc.address_v = s.AddressV; out.desc.address_w = s.AddressW;
+            out.desc.mip_bias = s.MipLODBias; out.desc.max_anisotropy = s.MaxAnisotropy;
+            out.desc.comparison = s.ComparisonFunc; out.desc.min_lod = s.MinLOD; out.desc.max_lod = s.MaxLOD;
+            out.border_color = s.BorderColor; out.shader_register = s.ShaderRegister;
+            out.register_space = s.RegisterSpace; out.visibility = s.ShaderVisibility;
+        }
+    }
     for (UINT i = 0; i < desc.NumParameters; ++i) {
         if (desc.pRootParameters[i].ParameterType == D3D12DDI_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
             ranges.reset(new (std::nothrow) vkdu_descriptor_range[4096]);
@@ -588,8 +607,8 @@ HRESULT APIENTRY root_create(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATE_ROOT_S
             parameters[i].shader_register = p.Descriptor.ShaderRegister; parameters[i].register_space = p.Descriptor.RegisterSpace;
         }
     }
-    HRESULT hr = vkdu_root_create(ctx->backend, parameters, desc.NumParameters, desc.Flags, &value);
-    return finish(ctx, root.pDrvPrivate, value, VKDU_ROOT, hr);
+    return native_root_backend(ctx, root.pDrvPrivate, parameters, desc.NumParameters, desc.Flags,
+            samplers.get(), desc.NumStaticSamplers);
 }
 void APIENTRY root_destroy(D3D12DDI_HDEVICE h, D3D12DDI_HROOTSIGNATURE root) {
     if (belongs(context(h), root.pDrvPrivate)) VioGpuD3D12BridgeUnbindObject(root.pDrvPrivate);
@@ -684,6 +703,7 @@ extern "C" HRESULT APIENTRY VioGpuD3D12BridgeGetTables(D3D12DDI_DEVICE_FUNCS_COR
     device->pfnGetGPUDescriptorHandleForHeapStart = heap_gpu; device->pfnCreateUnorderedAccessView = create_uav;
     device->pfnCreateConstantBufferView = create_cbv;
     device->pfnCreateShaderResourceView = create_srv;
+    device->pfnCreateSampler = create_sampler;
     device->pfnCopyDescriptorsSimple = copy_descriptors_simple;
     device->pfnCopyDescriptors = copy_descriptors;
     commands->pfnCloseCommandList = command_close; commands->pfnResetCommandList = command_reset;

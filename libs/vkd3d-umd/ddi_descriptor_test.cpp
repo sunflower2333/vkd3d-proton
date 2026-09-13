@@ -11,6 +11,7 @@ struct Peer {
     uint32_t type, count;
     bool visible;
     uint64_t cpu, gpu;
+    unsigned references = 1;
 };
 static Peer *peer(vkdu_object *p) { return reinterpret_cast<Peer *>(p); }
 static uint64_t next_base = 0x10000;
@@ -36,7 +37,8 @@ static vkdu_object *make_peer(vkdu_device *owner, vkdu_kind kind, uint32_t type 
 }
 static int test_is(vkdu_object *p, vkdu_kind kind) { return p && peer(p)->kind == kind; }
 static int test_belongs(vkdu_device *d, vkdu_object *p) { return p && peer(p)->owner == d; }
-static void test_destroy(vkdu_object *p) { if (p) { ++destroys; delete peer(p); } }
+static void test_destroy(vkdu_object *p) { if (p && !--peer(p)->references) { ++destroys; delete peer(p); } }
+static int test_retain(vkdu_object *p) { if (!p) return 0; ++peer(p)->references; return 1; }
 static uint64_t test_address(vkdu_object *p) { return peer(p)->cpu; }
 static uint64_t test_size(vkdu_object *) { return 4096; }
 static int32_t test_heap_create(vkdu_device *d, uint32_t type, uint32_t count, int visible, vkdu_object **out) {
@@ -99,9 +101,29 @@ static int32_t test_root(vkdu_device *d, const vkdu_root_parameter *p, uint32_t 
     root_offset = p[0].ranges[0].offset; root_space = p[0].ranges[0].register_space;
     *out = make_peer(d, VKDU_ROOT); return S_OK;
 }
+static vkdu_sampler_desc seen_sampler;
+static vkdu_static_sampler seen_static;
+static uint32_t sampler_index, static_count;
+static unsigned sampler_calls;
+static void (*sampler_hook)();
+static int32_t test_sampler(vkdu_object *heap, uint32_t index, const vkdu_sampler_desc *desc) {
+    ++sampler_calls; sampler_index = index;
+    if (sampler_hook) sampler_hook();
+    seen_sampler = *desc;
+    return test_is(heap, VKDU_DESCRIPTOR_HEAP) && peer(heap)->references ? next_result : E_INVALIDARG;
+}
+static int32_t test_static_root(vkdu_device *d, const vkdu_root_parameter *, uint32_t, uint32_t,
+        const vkdu_static_sampler *samplers, uint32_t count, vkdu_object **out) {
+    ++sampler_calls;
+    if (sampler_hook) sampler_hook();
+    static_count = count; seen_static = samplers[0];
+    *out = SUCCEEDED(next_result) ? make_peer(d, VKDU_ROOT) : nullptr;
+    return next_result;
+}
 #define vkdu_object_is test_is
 #define vkdu_object_belongs test_belongs
 #define vkdu_object_destroy test_destroy
+#define vkdu_object_retain test_retain
 #define vkdu_buffer_address test_address
 #define vkdu_buffer_size test_size
 #define vkdu_heap_create test_heap_create
@@ -119,11 +141,16 @@ static int32_t test_root(vkdu_device *d, const vkdu_root_parameter *p, uint32_t 
 #define vkdu_command_heaps test_heaps
 #define vkdu_command_table test_table
 #define vkdu_root_create test_root
+#define vkdu_root_create_samplers test_static_root
+#define vkdu_sampler_create test_sampler
 #include "ddi.cpp"
 
 #define REQUIRE(x) do { if (!(x)) { std::fprintf(stderr, "FAIL native descriptor line %d: %s\n", __LINE__, #x); return 1; } } while (0)
 static void APIENTRY capture(void *, HRESULT hr) { reported = hr; }
+#include "ddi_samplers_test.inc"
 int main() {
+    if (check_native_samplers()) return 1;
+    calls = destroys = sampler_calls = 0; next_result = reported = S_OK;
     Context ctx;
     ctx.backend = reinterpret_cast<vkdu_device *>(&next_base);
     ctx.report = capture;

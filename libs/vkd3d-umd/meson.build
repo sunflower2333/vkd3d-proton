@@ -36,4 +36,9 @@ if get_option('enable_umd_bridge_tests')
     dependencies : vkd3d_dep,
     include_directories : vkd3d_private_includes)
   test('vkd3d-umd-backend', umd_backend_test, timeout : 120)
+  # Deliberately corrupt actual sampler translation in this CPU-only binary.
+  # The real sampling readback must reject it; production has neither define.
+  umd_sampler_negative = executable('vkd3d-umd-sampler-negative', 'backend.c', 'debug_policy.c', 'backend_test.c',
+    c_args : ['-DVKDU_ENABLE_TEST_DEVICE', '-DVKDU_TEST_SAMPLER_DROP_ADDRESS'],
+    dependencies : vkd3d_dep, include_directories : vkd3d_private_includes)
 endif

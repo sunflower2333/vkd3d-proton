@@ -6,6 +6,7 @@
 #include "backend.h"
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #ifndef _WIN32
 #include <time.h>
 #endif
@@ -26,6 +27,7 @@ struct vkdu_object {
     struct vkdu_root_slot slots[64];
     uint32_t slot_count;
     uint64_t bound_heaps[2];
+    uint32_t width, height, format;
 };
 
 #define OBJ(type, o) ((type *)(o)->object)
@@ -283,6 +285,8 @@ int vkdu_heap_resolve(vkdu_object *heap, uint64_t handle, int gpu, uint32_t *ind
     *index = (uint32_t)(offset / heap->descriptor_stride);
     return 1;
 }
+
+#include "backend_samplers.inc"
 int32_t vkdu_buffer_uav(vkdu_object *heap, uint32_t index, vkdu_object *buffer,
         uint32_t format, uint64_t first, uint32_t count, uint32_t stride, uint32_t flags,
         vkdu_object *counter, uint64_t counter_offset)
@@ -556,7 +560,8 @@ int32_t vkdu_command_barriers(vkdu_object *command, uint32_t count, const struct
      * the first barrier. A rejected late element cannot alter recording. */
     for (i = 0; i < count; ++i) {
         vkdu_object *resource = barriers[i].resource;
-        if (resource && (!VALID(resource, VKDU_BUFFER) || !vkdu_same_device(command, resource))) return E_INVALIDARG;
+        if (resource && ((!VALID(resource, VKDU_BUFFER) && !VALID(resource, VKDU_TEXTURE2D)) ||
+                !vkdu_same_device(command, resource))) return E_INVALIDARG;
         if (barriers[i].type == VKDU_BARRIER_TRANSITION) {
             if (!resource) return E_INVALIDARG;
         } else if (barriers[i].type == VKDU_BARRIER_UAV) {
@@ -586,16 +591,24 @@ int32_t vkdu_command_barriers(vkdu_object *command, uint32_t count, const struct
 }
 int32_t vkdu_root_create(vkdu_device *device, const struct vkdu_root_parameter *parameters, uint32_t count, uint32_t flags, vkdu_object **out)
 {
+    return vkdu_root_create_samplers(device, parameters, count, flags, NULL, 0, out);
+}
+int32_t vkdu_root_create_samplers(vkdu_device *device, const struct vkdu_root_parameter *parameters,
+        uint32_t count, uint32_t flags, const struct vkdu_static_sampler *samplers,
+        uint32_t sampler_count, vkdu_object **out)
+{
     D3D12_ROOT_PARAMETER native[64] = {{0}}; D3D12_ROOT_SIGNATURE_DESC desc = {0};
     ID3DBlob *blob = NULL, *error = NULL; ID3D12RootSignature *root = NULL; HRESULT hr; uint32_t i, j, total = 0, used = 0, cost = 0;
     D3D12_DESCRIPTOR_RANGE *ranges = NULL;
+    D3D12_STATIC_SAMPLER_DESC *static_samplers = NULL;
     struct vkdu_root_slot slots[64] = {{0}};
     if (!out) return E_POINTER;
     *out = NULL;
-    if (!device || count > 64 || (count && !parameters)) return E_INVALIDARG;
+    if (!device || count > 64 || (count && !parameters) || sampler_count > 2032 ||
+            (sampler_count && !samplers)) return E_INVALIDARG;
     for (i = 0; i < count; ++i) {
         uint32_t words;
-        if (parameters[i].type > 4) return E_INVALIDARG;
+        if (parameters[i].type > 4 || parameters[i].visibility > 5) return E_INVALIDARG;
         words = parameters[i].type == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE ? 1 :
                 parameters[i].type == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS ? parameters[i].constant_count : 2;
         if (!words || words > 64 - cost) return E_INVALIDARG;
@@ -638,8 +651,17 @@ int32_t vkdu_root_create(vkdu_device *device, const struct vkdu_root_parameter *
             native[i].Descriptor.RegisterSpace = parameters[i].register_space;
         }
     }
+    if (sampler_count) {
+        if (!(static_samplers = calloc(sampler_count, sizeof(*static_samplers)))) {
+            free(ranges); return E_OUTOFMEMORY;
+        }
+        hr = vkdu_static_samplers_translate(parameters, count, samplers, sampler_count, static_samplers);
+        if (FAILED(hr)) { free(static_samplers); free(ranges); return hr; }
+    }
     desc.NumParameters = count; desc.pParameters = native; desc.Flags = flags;
+    desc.NumStaticSamplers = sampler_count; desc.pStaticSamplers = static_samplers;
     hr = vkd3d_serialize_root_signature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error);
+    free(static_samplers);
     free(ranges);
     if (error) ID3D10Blob_Release(error);
     if (FAILED(hr)) return hr;
