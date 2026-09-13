@@ -165,6 +165,15 @@ R0 default-buffer placement now keeps UAV-capable embedded usage and accepts
 initial UAV state; readback buffers remain COPY_DEST-only without UAV usage.
 No later-version native flag is treated as an R0 resource flag.
 
+Native command signatures now support one DISPATCH argument with a DWORD-aligned
+stride of at least12bytes. ExecuteIndirect resolves owned argument/count buffers,
+preserves nonzero offsets and forwards an optional GPU count buffer to the real
+embedded command list. Count clamping happens on GPU. There is no CPU readback
+of indirect arguments. Signatures modifying root arguments and draw signatures
+remain unsupported. Error reporting and backend references survive reentrant
+runtime object/device retirement. See
+`docs/vkd3d-native-indirect-dispatch-20260913.md` for verification and boundaries.
+
 The CPU-Vulkan test compiles and executes a real SM5 compute shader, compares all
 1024 readbacks after copy/barrier operations, checks fence signal/wait, timeout,
 allocator reuse, and invalid shader/range/state propagation. Its CPU-only device

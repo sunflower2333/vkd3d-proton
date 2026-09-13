@@ -151,6 +151,8 @@ void native_submission_remove(Object *&head, Object *entry) {
     if (*link) *link = entry->next;
 }
 
+#include "native_indirect.inc"
+
 HRESULT native_queue_create(Context *ctx, const D3D12DDIARG_CREATECOMMANDQUEUE_0001 *args) {
     NativeHeapOperation op(ctx);
     if (!op.live()) return DXGI_ERROR_DEVICE_REMOVED;

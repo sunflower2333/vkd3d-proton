@@ -12,7 +12,7 @@ extern "C" {
 /* No Windows SDK or generated COM types cross this internal ABI. */
 typedef struct vkdu_device vkdu_device;
 typedef struct vkdu_object vkdu_object;
-enum vkdu_kind { VKDU_BUFFER, VKDU_QUEUE, VKDU_ALLOCATOR, VKDU_COMMAND_LIST, VKDU_ROOT, VKDU_PIPELINE, VKDU_FENCE, VKDU_DESCRIPTOR_HEAP, VKDU_MEMORY_HEAP };
+enum vkdu_kind { VKDU_BUFFER, VKDU_QUEUE, VKDU_ALLOCATOR, VKDU_COMMAND_LIST, VKDU_ROOT, VKDU_PIPELINE, VKDU_FENCE, VKDU_DESCRIPTOR_HEAP, VKDU_MEMORY_HEAP, VKDU_COMMAND_SIGNATURE };
 struct vkdu_adapter { uint8_t luid[8]; uint32_t vendor_id, device_id; };
 struct vkdu_descriptor_range { uint32_t type, count, shader_register, register_space, offset; };
 struct vkdu_descriptor_span { vkdu_object *heap; uint32_t first, count; };
@@ -93,6 +93,11 @@ int32_t vkdu_command_srv(vkdu_object *command, uint32_t index, vkdu_object *buff
 int32_t vkdu_command_constants(vkdu_object *command, uint32_t index, uint32_t offset,
         uint32_t count, const uint32_t *values);
 int32_t vkdu_command_dispatch(vkdu_object *command, uint32_t x, uint32_t y, uint32_t z);
+/* Dispatch-only signature: one 12-byte DISPATCH record, optionally padded.
+ * Arguments and optional count remain GPU buffers; never read them on CPU. */
+int32_t vkdu_dispatch_signature_create(vkdu_device *device, uint32_t stride, vkdu_object **out);
+int32_t vkdu_command_execute_indirect(vkdu_object *command, vkdu_object *signature, uint32_t maximum,
+        vkdu_object *arguments, uint64_t argument_offset, vkdu_object *count, uint64_t count_offset);
 int32_t vkdu_queue_execute(vkdu_object *queue, uint32_t count, vkdu_object *const *commands);
 int32_t vkdu_fence_create(vkdu_device *device, uint64_t initial, vkdu_object **out);
 int32_t vkdu_queue_signal(vkdu_object *queue, vkdu_object *fence, uint64_t value);

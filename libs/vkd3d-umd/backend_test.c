@@ -540,6 +540,93 @@ static void check_uav_barriers(vkdu_device *device, vkdu_device *other)
     puts("PASS UAV resource/global ordering and atomic batch rejection: 2x2048 readbacks; CPU/GPU probe boundary unchanged");
 }
 
+static void check_indirect_dispatch(vkdu_device *device, vkdu_device *other)
+{
+    vkdu_object *upload = NULL, *arguments = NULL, *output = NULL, *readback = NULL, *foreign = NULL;
+    vkdu_object *queue = NULL, *allocator = NULL, *command = NULL, *fence = NULL, *root = NULL, *pipeline = NULL;
+    vkdu_object *signature = NULL, *foreign_signature = NULL, *rejected = NULL, *copy_allocator = NULL, *copy_command = NULL;
+    struct vkdu_root_parameter parameter = {D3D12_ROOT_PARAMETER_TYPE_UAV, 0, 0, 0, 0};
+    const uint32_t gpu_counts[] = {0, 1, 2, 9, 0};
+    const uint32_t expected_words[] = {0, 17, 41, 41, 73};
+    uint32_t *mapped, i, round;
+    CHECK(vkdu_buffer_create(device, 8192, 2, 0, D3D12_RESOURCE_STATE_GENERIC_READ, &upload));
+    CHECK(vkdu_buffer_create(device, 4096, 1, 0, D3D12_RESOURCE_STATE_COPY_DEST, &arguments));
+    CHECK(vkdu_buffer_create(device, 4096, 1, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST, &output));
+    CHECK(vkdu_buffer_create(device, 4096, 3, 0, D3D12_RESOURCE_STATE_COPY_DEST, &readback));
+    CHECK(vkdu_buffer_create(other, 4096, 1, 0, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, &foreign));
+    CHECK(vkdu_dispatch_signature_create(device, 16, &signature));
+    CHECK(vkdu_dispatch_signature_create(other, 16, &foreign_signature));
+    REJECT(vkdu_dispatch_signature_create(device, 0, &rejected));
+    REJECT(vkdu_dispatch_signature_create(device, 8, &rejected));
+    REJECT(vkdu_dispatch_signature_create(device, 13, &rejected));
+    CHECK(vkdu_queue_create(device, 0, &queue));
+    CHECK(vkdu_allocator_create(device, 0, &allocator));
+    CHECK(vkdu_command_create(device, allocator, 0, &command));
+    CHECK(vkdu_allocator_create(device, 3, &copy_allocator));
+    CHECK(vkdu_command_create(device, copy_allocator, 3, &copy_command));
+    CHECK(vkdu_fence_create(device, 0, &fence));
+    CHECK(vkdu_root_create(device, &parameter, 1, 0, &root));
+    CHECK(vkdu_pipeline_create(device, root, execute_indirect_cs_code_dxbc, sizeof(execute_indirect_cs_code_dxbc), &pipeline));
+    for (round = 0; round < 5; ++round) {
+        const uint32_t sentinel = 0xabcd0000u + round;
+        if (round) {
+            CHECK(vkdu_allocator_reset(allocator)); CHECK(vkdu_command_reset(command, allocator));
+            CHECK(vkdu_command_transition(command, arguments, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_DEST));
+            CHECK(vkdu_command_transition(command, output, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST));
+        }
+        CHECK(vkdu_buffer_map(upload, 0, 0, (void **)&mapped));
+        for (i = 0; i < 2048; ++i) mapped[i] = sentinel;
+        // Three padded records at byte64; count at byte20 in the same GPU buffer.
+        mapped[5] = gpu_counts[round];
+        for (i = 0; i < 3; ++i) {
+            mapped[16 + 4 * i] = i == 0 ? 17 : i == 1 ? 41 : 73;
+            mapped[17 + 4 * i] = mapped[18 + 4 * i] = 1;
+        }
+        CHECK(vkdu_buffer_unmap(upload, 0, 8192));
+        CHECK(vkdu_command_copy(command, arguments, 0, upload, 0, 4096));
+        CHECK(vkdu_command_copy(command, output, 0, upload, 4096, 4096));
+        CHECK(vkdu_command_transition(command, arguments, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT));
+        CHECK(vkdu_command_transition(command, output, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+        CHECK(vkdu_command_root(command, root)); CHECK(vkdu_command_pipeline(command, pipeline));
+        CHECK(vkdu_command_uav(command, 0, output, 0));
+        REJECT(vkdu_command_execute_indirect(copy_command, signature, 2, arguments, 64, NULL, 0));
+        REJECT(vkdu_command_execute_indirect(command, foreign_signature, 2, arguments, 64, NULL, 0));
+        REJECT(vkdu_command_execute_indirect(command, signature, 2, foreign, 64, NULL, 0));
+        REJECT(vkdu_command_execute_indirect(command, signature, 2, arguments, 64, foreign, 20));
+        REJECT(vkdu_command_execute_indirect(command, fence, 2, arguments, 64, NULL, 0));
+        REJECT(vkdu_command_execute_indirect(command, signature, 2, arguments, 65, NULL, 0));
+        REJECT(vkdu_command_execute_indirect(command, signature, 2, arguments, UINT64_MAX - 3, NULL, 0));
+        REJECT(vkdu_command_execute_indirect(command, signature, UINT32_MAX, arguments, 64, NULL, 0));
+        REJECT(vkdu_command_execute_indirect(command, signature, 2, arguments, 4096 - 16, NULL, 0));
+        REJECT(vkdu_command_execute_indirect(command, signature, 2, arguments, 64, arguments, 21));
+        REJECT(vkdu_command_execute_indirect(command, signature, 2, arguments, 64, arguments, 4096));
+        REJECT(vkdu_command_execute_indirect(command, signature, 2, arguments, 64, NULL, 20));
+        CHECK(vkdu_command_execute_indirect(command, signature, 0, arguments, 64, NULL, 0));
+        CHECK(vkdu_command_execute_indirect(command, signature, round == 4 ? 3 : 2, arguments, 64,
+                round == 4 ? NULL : arguments, round == 4 ? 0 : 20));
+        CHECK(vkdu_command_transition(command, output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE));
+        CHECK(vkdu_command_copy(command, readback, 0, output, 0, 4096));
+        CHECK(vkdu_command_close(command));
+        REJECT(vkdu_command_execute_indirect(command, signature, 2, arguments, 64, NULL, 0));
+        CHECK(vkdu_queue_execute(queue, 1, &command)); CHECK(vkdu_queue_signal(queue, fence, round + 1));
+        CHECK(vkdu_fence_wait(fence, round + 1, 30000));
+        CHECK(vkdu_buffer_map(readback, 0, 4096, (void **)&mapped));
+        for (i = 0; i < 1024; ++i) {
+            const uint32_t expected = i < expected_words[round] ? i : sentinel;
+            if (mapped[i] != expected) {
+                fprintf(stderr, "FAIL indirect round%u word%u: %08x expected%08x\n", round, i, mapped[i], expected); exit(1);
+            }
+        }
+        CHECK(vkdu_buffer_unmap(readback, 0, 0));
+    }
+    CHECK(vkdu_device_status(device));
+    vkdu_object_destroy(signature); vkdu_object_destroy(foreign_signature);
+    vkdu_object_destroy(command); vkdu_object_destroy(allocator); vkdu_object_destroy(queue); vkdu_object_destroy(fence);
+    vkdu_object_destroy(copy_command); vkdu_object_destroy(copy_allocator); vkdu_object_destroy(root); vkdu_object_destroy(pipeline);
+    vkdu_object_destroy(upload); vkdu_object_destroy(arguments); vkdu_object_destroy(output); vkdu_object_destroy(readback); vkdu_object_destroy(foreign);
+    puts("PASS indirect dispatch GPU count0/1/2/clamp/absent, padded stride, nonzero offsets and rejected inputs: 5x1024 readbacks");
+}
+
 int main(int argc, char **argv)
 {
     PFN_vkGetInstanceProcAddr loader;
@@ -691,6 +778,7 @@ int main(int argc, char **argv)
     check_root_constants(device);
     check_shader_resources(device, wrong);
     check_uav_barriers(device, wrong);
+    check_indirect_dispatch(device, wrong);
     check_retained_queue(device);
     /* Caller follows D3D12 lifetime rules: reset/destroy only after completion. */
     vkdu_object_destroy(command); vkdu_object_destroy(allocator);

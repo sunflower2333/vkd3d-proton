@@ -726,6 +726,40 @@ int32_t vkdu_command_dispatch(vkdu_object *command, uint32_t x, uint32_t y, uint
     if (!RECORDING(command) || command->command_type == 3 || x > 65535 || y > 65535 || z > 65535) return E_INVALIDARG;
     ID3D12GraphicsCommandList_Dispatch(OBJ(ID3D12GraphicsCommandList, command), x, y, z); return S_OK;
 }
+int32_t vkdu_dispatch_signature_create(vkdu_device *device, uint32_t stride, vkdu_object **out)
+{
+    D3D12_INDIRECT_ARGUMENT_DESC argument = {0};
+    D3D12_COMMAND_SIGNATURE_DESC desc = {0};
+    ID3D12CommandSignature *signature = NULL;
+    HRESULT hr;
+    if (!out) return E_INVALIDARG;
+    *out = NULL;
+    if (!device || !device->object || stride < sizeof(D3D12_DISPATCH_ARGUMENTS) || (stride & 3)) return E_INVALIDARG;
+    argument.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+    desc.ByteStride = stride; desc.NumArgumentDescs = 1; desc.pArgumentDescs = &argument;
+    hr = ID3D12Device_CreateCommandSignature(device->object, &desc, NULL, &IID_ID3D12CommandSignature, (void **)&signature);
+    hr = wrap(device, VKDU_COMMAND_SIGNATURE, hr, (IUnknown *)signature, out);
+    if (SUCCEEDED(hr)) (*out)->bytes = stride;
+    return hr;
+}
+int32_t vkdu_command_execute_indirect(vkdu_object *command, vkdu_object *signature, uint32_t maximum,
+        vkdu_object *arguments, uint64_t argument_offset, vkdu_object *count, uint64_t count_offset)
+{
+    if (!RECORDING(command) || command->command_type == D3D12_COMMAND_LIST_TYPE_COPY ||
+            !VALID(signature, VKDU_COMMAND_SIGNATURE) || !vkdu_same_device(command, signature) ||
+            !VALID(arguments, VKDU_BUFFER) || !vkdu_same_device(command, arguments) ||
+            (argument_offset & 3) || argument_offset > arguments->bytes ||
+            (uint64_t)maximum * signature->bytes > arguments->bytes - argument_offset ||
+            (count && (!VALID(count, VKDU_BUFFER) || !vkdu_same_device(command, count) ||
+                (count_offset & 3) || count_offset > count->bytes || sizeof(uint32_t) > count->bytes - count_offset)) ||
+            (!count && count_offset)) return E_INVALIDARG;
+    /* Validation precedes recording. Count is clamped on GPU by the embedded
+     * engine; CPU emulation would break GPU-produced arguments and ordering. */
+    if (maximum) ID3D12GraphicsCommandList_ExecuteIndirect(OBJ(ID3D12GraphicsCommandList, command),
+            OBJ(ID3D12CommandSignature, signature), maximum, OBJ(ID3D12Resource, arguments), argument_offset,
+            count ? OBJ(ID3D12Resource, count) : NULL, count_offset);
+    return S_OK;
+}
 int32_t vkdu_command_constants(vkdu_object *command, uint32_t index, uint32_t offset,
         uint32_t count, const uint32_t *values)
 {

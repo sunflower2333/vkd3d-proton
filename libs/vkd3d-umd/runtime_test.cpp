@@ -31,6 +31,13 @@ static std::function<void(const mwd_callbacks *, void *)> backend_destructor_che
 static bool force_deferred_cleanup;
 static bool force_device_command_error;
 static bool force_drop_global_barrier;
+static bool force_drop_indirect_count;
+static unsigned signature_creates, indirect_calls;
+static uint32_t recorded_indirect_stride, recorded_indirect_maximum;
+static uint64_t recorded_argument_offset, recorded_count_offset;
+static vkdu_object *recorded_arguments, *recorded_count, *recorded_signature;
+static HRESULT signature_result = S_OK, indirect_result = S_OK;
+static std::function<void()> backend_signature_create_callback, backend_indirect_callback;
 static unsigned barrier_calls;
 static HRESULT barrier_result = S_OK;
 static std::vector<vkdu_resource_barrier> recorded_barriers;
@@ -138,6 +145,8 @@ static int32_t test_command_close(vkdu_object *);
 static int32_t test_command_barriers(vkdu_object *, uint32_t, const vkdu_resource_barrier *);
 static int32_t test_queue_create(vkdu_device *, uint32_t, vkdu_object **);
 static int32_t test_queue_execute(vkdu_object *, uint32_t, vkdu_object *const *);
+static int32_t test_signature_create(vkdu_device *, uint32_t, vkdu_object **);
+static int32_t test_execute_indirect(vkdu_object *, vkdu_object *, uint32_t, vkdu_object *, uint64_t, vkdu_object *, uint64_t);
 static DWORD WINAPI test_event_wait(HANDLE event, DWORD timeout) {
     if (force_early_completion && completion_negative_active && timeout == 0) return WAIT_OBJECT_0;
     return WaitForSingleObject(event, timeout);
@@ -162,6 +171,8 @@ static DWORD WINAPI test_event_wait(HANDLE event, DWORD timeout) {
 #define vkdu_command_barriers test_command_barriers
 #define vkdu_queue_create test_queue_create
 #define vkdu_queue_execute test_queue_execute
+#define vkdu_dispatch_signature_create test_signature_create
+#define vkdu_command_execute_indirect test_execute_indirect
 #define WaitForSingleObject test_event_wait
 #include "ddi.cpp"
 #undef WaitForSingleObject
@@ -236,6 +247,33 @@ static int test_object_retain(vkdu_object *object) {
     if (!object) return 0;
     if (!queue_negative_active) ++reinterpret_cast<ImportPeer *>(object)->references;
     return 1;
+}
+static int32_t test_signature_create(vkdu_device *device, uint32_t stride, vkdu_object **out) {
+    *out = nullptr; ++signature_creates;
+    auto *peer = reinterpret_cast<TestDevice *>(device);
+    wait_backend_worker(peer->callbacks, peer->owner);
+    if (FAILED(signature_result)) return signature_result;
+    *out = reinterpret_cast<vkdu_object *>(new ImportPeer{{}, device, VKDU_COMMAND_SIGNATURE, 0, stride});
+    recorded_indirect_stride = stride;
+    if (backend_signature_create_callback) backend_signature_create_callback();
+    return S_OK;
+}
+static int32_t test_execute_indirect(vkdu_object *command, vkdu_object *signature, uint32_t maximum,
+        vkdu_object *arguments, uint64_t argument_offset, vkdu_object *count, uint64_t count_offset) {
+    ++indirect_calls;
+    if (!test_object_is(command, VKDU_COMMAND_LIST) || !test_object_is(signature, VKDU_COMMAND_SIGNATURE) ||
+        !test_object_is(arguments, VKDU_BUFFER) || (count && !test_object_is(count, VKDU_BUFFER))) fixture_abort(__LINE__);
+    recorded_indirect_maximum = maximum; recorded_signature = signature;
+    recorded_arguments = arguments; recorded_count = force_drop_indirect_count ? nullptr : count;
+    recorded_argument_offset = argument_offset; recorded_count_offset = count_offset;
+    for (auto *owner : {command, signature, arguments, count})
+        if (owner && reinterpret_cast<ImportPeer *>(owner)->references < 2) fixture_abort(__LINE__);
+    auto *device = reinterpret_cast<TestDevice *>(reinterpret_cast<ImportPeer *>(command)->device);
+    wait_backend_worker(device->callbacks, device->owner);
+    if (backend_indirect_callback) backend_indirect_callback();
+    for (auto *owner : {command, signature, arguments, count})
+        if (owner && !reinterpret_cast<ImportPeer *>(owner)->references) fixture_abort(__LINE__);
+    return indirect_result;
 }
 static int test_object_is(vkdu_object *object, vkdu_kind kind) {
     return object && reinterpret_cast<ImportPeer *>(object)->kind == kind;
@@ -1347,6 +1385,8 @@ static int test_native_completion() {
     return 0;
 }
 
+#include "runtime_indirect_test.inc"
+
 int main(int argc, char **argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc == 2 && !std::strcmp(argv[1], "--negative-control-deferred-backend")) force_deferred_cleanup = true;
@@ -1354,6 +1394,7 @@ int main(int argc, char **argv) {
     else if (argc == 2 && !std::strcmp(argv[1], "--negative-control-global-uav-barrier")) force_drop_global_barrier = true;
     else if (argc == 2 && !std::strcmp(argv[1], "--negative-control-queue-ownership")) force_queue_unowned = true;
     else if (argc == 2 && !std::strcmp(argv[1], "--negative-control-os-completion")) force_early_completion = true;
+    else if (argc == 2 && !std::strcmp(argv[1], "--negative-control-indirect-count")) force_drop_indirect_count = true;
     else if (argc != 1) return 2;
     REQUIRE(test_finalization_borrow() == 0);
     REQUIRE(OpenAdapter12(nullptr) == E_INVALIDARG);
@@ -1459,6 +1500,7 @@ int main(int argc, char **argv) {
     REQUIRE(test_native_command_errors() == 0);
     REQUIRE(test_native_queue_lifetime() == 0);
     REQUIRE(test_native_completion() == 0);
+    REQUIRE(test_native_indirect() == 0);
     std::printf("PASS native OpenAdapter12 WDK identity/negotiation/private memory/callback/lifetime/error cleanup (%zu-bit); no system-runtime or GPU acceptance\n", sizeof(void *) * 8);
     return 0;
 }

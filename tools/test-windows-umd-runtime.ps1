@@ -2,7 +2,7 @@ param([Parameter(Mandatory)][string]$Executable)
 $ErrorActionPreference = 'Stop'
 $exe = (Resolve-Path -LiteralPath $Executable).Path
 $directory = Split-Path -Parent $exe
-foreach ($scenario in @('lifecycle', 'deferred-negative', 'command-owner-negative', 'uav-global-negative', 'queue-owner-negative', 'completion-negative')) {
+foreach ($scenario in @('lifecycle', 'deferred-negative', 'command-owner-negative', 'uav-global-negative', 'queue-owner-negative', 'completion-negative', 'indirect-count-negative')) {
     $negative = $scenario -ne 'lifecycle'
     $name = 'runtime-' + $scenario
     $stdout = Join-Path $directory ($name + '.stdout.txt')
@@ -13,6 +13,7 @@ foreach ($scenario in @('lifecycle', 'deferred-negative', 'command-owner-negativ
     if ($scenario -eq 'uav-global-negative') { $start.ArgumentList = '--negative-control-global-uav-barrier' }
     if ($scenario -eq 'queue-owner-negative') { $start.ArgumentList = '--negative-control-queue-ownership' }
     if ($scenario -eq 'completion-negative') { $start.ArgumentList = '--negative-control-os-completion' }
+    if ($scenario -eq 'indirect-count-negative') { $start.ArgumentList = '--negative-control-indirect-count' }
     $process = Start-Process @start
     $null = $process.Handle
     if (!$process.WaitForExit(90000)) {
@@ -30,6 +31,8 @@ foreach ($scenario in @('lifecycle', 'deferred-negative', 'command-owner-negativ
             'FAIL native queue execution released a submitted backend owner'
         } elseif ($scenario -eq 'completion-negative') {
             'FAIL native DMA ownership retired before OS completion event'
+        } elseif ($scenario -eq 'indirect-count-negative') {
+            'FAIL native indirect dispatch lost GPU count or buffer placement'
         } else { 'FAIL native command error escaped its runtime command-list owner' }
         if ($process.ExitCode -ne 1 -or $errors -notmatch $expected) {
             throw "$scenario negative control did not fail semantically: exit=$($process.ExitCode) $errors"
@@ -42,6 +45,7 @@ foreach ($scenario in @('lifecycle', 'deferred-negative', 'command-owner-negativ
                 $output -notmatch 'PASS native UAV resource/global barriers, whole-batch rejection and command error ownership' -or
                 $output -notmatch 'PASS native queue identity, whole-batch ownership, reentrant execution retirement and constructor cancellation' -or
                 $output -notmatch 'PASS native OS completion events, ordered DMA ownership, bounded pending retirement and callback cancellation' -or
+                $output -notmatch 'PASS native indirect signatures, GPU argument/count forwarding, rejected handles and reentrant ownership' -or
                 $output -notmatch 'PASS native command-list runtime error ownership, device-loss forwarding, rejected creation and reentrant retirement') {
             throw "Runtime lifecycle fixture failed: exit=$($process.ExitCode) $errors"
         }

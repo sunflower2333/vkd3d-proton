@@ -28,6 +28,8 @@ int main(int argc, char **argv) {
     REQUIRE(tables(nullptr, &commands.value, &queue.value) == E_INVALIDARG);
     REQUIRE(device.value.pfnCreateCommandQueue && device.value.pfnCreateComputeShader && device.value.pfnCreatePipelineState);
     REQUIRE(commands.value.pfnCopyBufferRegion && commands.value.pfnDispatch && queue.value.pfnExecuteCommandLists);
+    REQUIRE(device.value.pfnCalcPrivateCommandSignatureSize && device.value.pfnCreateCommandSignature &&
+            device.value.pfnDestroyCommandSignature && commands.value.pfnExecuteIndirect);
     REQUIRE(device.value.pfnCreateDescriptorHeap && device.value.pfnDestroyDescriptorHeap && device.value.pfnGetDescriptorSizeInBytes);
     REQUIRE(device.value.pfnGetCPUDescriptorHandleForHeapStart && device.value.pfnGetGPUDescriptorHandleForHeapStart);
     REQUIRE(device.value.pfnCreateUnorderedAccessView && device.value.pfnCopyDescriptorsSimple);

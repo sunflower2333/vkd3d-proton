@@ -27,6 +27,11 @@ HRESULT native_queue_create(Context *, const D3D12DDIARG_CREATECOMMANDQUEUE_0001
 void native_queue_destroy(Context *, void *);
 void native_queue_execute(Object *, UINT, const D3D12DDI_HCOMMANDLIST *);
 Object *native_submission_find(Object *, void *);
+SIZE_T APIENTRY indirect_signature_size(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATE_COMMAND_SIGNATURE_0001 *);
+HRESULT APIENTRY indirect_signature_create(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATE_COMMAND_SIGNATURE_0001 *, D3D12DDI_HCOMMANDSIGNATURE);
+void APIENTRY indirect_signature_destroy(D3D12DDI_HDEVICE, D3D12DDI_HCOMMANDSIGNATURE);
+void APIENTRY execute_indirect(D3D12DDI_HCOMMANDLIST, D3D12DDI_HCOMMANDSIGNATURE, UINT,
+        D3D12DDIARG_BUFFER_PLACEMENT, D3D12DDIARG_BUFFER_PLACEMENT);
 // Runtime owns this slot; child objects hold references to the separate Context.
 struct NativeDevice { uint32_t magic; Context *context; };
 // Track recursion only while the underlying mutex is owned. A call back into
@@ -57,6 +62,7 @@ struct Context {
     Object *descriptor_heaps = nullptr;
     Object *native_queue_objects = nullptr;
     Object *native_command_objects = nullptr;
+    Object *indirect_signatures = nullptr; // protected by error_mutex
     std::shared_ptr<NativeAdapter> native_adapter;
     D3D12DDI_HRTDEVICE runtime_device{};
     D3DDDI_DEVICECALLBACKS kernel_callbacks{};
@@ -668,6 +674,8 @@ extern "C" HRESULT APIENTRY VioGpuD3D12BridgeGetTables(D3D12DDI_DEVICE_FUNCS_COR
     device->pfnCalcPrivateCommandAllocatorSize = allocator_size; device->pfnCreateCommandAllocator = allocator_create;
     device->pfnDestroyCommandAllocator = allocator_destroy; device->pfnResetCommandAllocator = allocator_reset;
     device->pfnCalcPrivateCommandListSize = command_size; device->pfnCreateCommandList = command_create; device->pfnDestroyCommandList = command_destroy;
+    device->pfnCalcPrivateCommandSignatureSize = indirect_signature_size;
+    device->pfnCreateCommandSignature = indirect_signature_create; device->pfnDestroyCommandSignature = indirect_signature_destroy;
     device->pfnCalcPrivateRootSignatureSize = root_size; device->pfnCreateRootSignature = root_create; device->pfnDestroyRootSignature = root_destroy;
     device->pfnCalcPrivateShaderSize = shader_size; device->pfnCreateComputeShader = shader_create; device->pfnDestroyShader = shader_destroy;
     device->pfnCalcPrivatePipelineStateSize = pipeline_size; device->pfnCreatePipelineState = pipeline_create; device->pfnDestroyPipelineState = pipeline_destroy;
@@ -680,6 +688,7 @@ extern "C" HRESULT APIENTRY VioGpuD3D12BridgeGetTables(D3D12DDI_DEVICE_FUNCS_COR
     device->pfnCopyDescriptors = copy_descriptors;
     commands->pfnCloseCommandList = command_close; commands->pfnResetCommandList = command_reset;
     commands->pfnCopyBufferRegion = copy; commands->pfnResourceBarrier = barriers; commands->pfnDispatch = dispatch;
+    commands->pfnExecuteIndirect = execute_indirect;
     commands->pfnSetComputeRootSignature = root_set; commands->pfnSetPipelineState = pipeline_set;
     commands->pfnSetComputeRootUnorderedAccessView = root_uav;
     commands->pfnSetComputeRootConstantBufferView = root_cbv;
