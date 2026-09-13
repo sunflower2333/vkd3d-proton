@@ -27,6 +27,15 @@ admission, which remains buffer-only, and they do not prove native shared
 surfaces, Present or system-runtime graphics. Runtime-v1 and Mesa sources are
 unchanged. Root owns the forward integration onto current Mesa and target tests.
 
+The shared-device integration companion suppresses calibrated-timestamp
+extension selection before time-domain discovery, strips both optional extension
+aliases from device creation and rejects an explicitly required clock extension.
+`GetClockCalibration` returns `DXGI_ERROR_UNSUPPORTED` without touching outputs
+for runtime-v1 devices. Direct devices retain their normal clock support. The
+shared-backing probe checks that result and continues GPU work to detect device
+loss. Runtime allocation fixture additionally verifies4KiB followed by64KiB
+alignment and exact address reuse through actual owner allocation callbacks.
+
 The controlled Windows DDI fixture uses actual production callbacks with fake
 backend peers. It verifies field conversion, invalid handle rejection,
 reference balance, failure propagation and source/heap poisoning during unlocked

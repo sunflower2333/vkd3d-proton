@@ -491,6 +491,11 @@ int32_t vkdu_queue_create(vkdu_device *device, uint32_t type, vkdu_object **out)
     if (SUCCEEDED(hr)) (*out)->command_type = type;
     return hr;
 }
+int32_t vkdu_queue_clock(vkdu_object *queue, uint64_t *gpu, uint64_t *cpu)
+{
+    if (!VALID(queue, VKDU_QUEUE) || !gpu || !cpu) return E_INVALIDARG;
+    return ID3D12CommandQueue_GetClockCalibration(OBJ(ID3D12CommandQueue, queue), gpu, cpu);
+}
 int32_t vkdu_allocator_create(vkdu_device *device, uint32_t type, vkdu_object **out)
 {
     ID3D12CommandAllocator *allocator = NULL; HRESULT hr;

@@ -24391,6 +24391,12 @@ VKD3D_METHODENTRY(HRESULT) d3d12_command_queue_GetClockCalibration(ID3D12Command
     TRACE("iface %p, gpu_timestamp %p, cpu_timestamp %p.\n",
             iface, gpu_timestamp, cpu_timestamp);
 
+    /* No runtime-v1 callback can service this query. Do not manufacture a
+     * successful zero calibration or ask the shared VkDevice to use KMT handles
+     * owned by the direct backend. Timestamp queries themselves are separate. */
+    if (device->wddm_runtime_owner)
+        return DXGI_ERROR_UNSUPPORTED;
+
     if (!command_queue->vkd3d_queue->timestamp_bits)
     {
         WARN("Timestamp queries not supported.\n");

@@ -302,6 +302,11 @@ void run_probe(LUID luid) {
     Owned upload, queue, allocator, command, fence, alias;
     check(vkdu_buffer_create(ctx->backend, 8192, 2, 0, 0xac3, &upload.value), "upload buffer");
     check(vkdu_queue_create(ctx->backend, 0, &queue.value), "queue");
+    uint64_t gpu_clock = UINT64_MAX, cpu_clock = UINT64_MAX;
+    if (vkdu_queue_clock(queue.value, &gpu_clock, &cpu_clock) != DXGI_ERROR_UNSUPPORTED ||
+            gpu_clock != UINT64_MAX || cpu_clock != UINT64_MAX)
+        throw std::runtime_error("runtime-v1 clock must reject unsupported calibration without fabricated outputs");
+    check(vkdu_device_status(ctx->backend), "unsupported shared clock preserves device");
     check(vkdu_allocator_create(ctx->backend, 0, &allocator.value), "allocator");
     check(vkdu_command_create(ctx->backend, allocator.value, 0, &command.value), "command");
     check(vkdu_fence_create(ctx->backend, 0, &fence.value), "fence");

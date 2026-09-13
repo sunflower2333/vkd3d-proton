@@ -780,6 +780,17 @@ static int test_native_heaps() {
     REQUIRE(imported.handle == token->allocation && imported.address == token->address);
     REQUIRE(native_runtime_allocate(ctx, 4096, 4096, imported.address, 6, &internal) == E_OUTOFMEMORY);
     REQUIRE(native_runtime_allocate(ctx, 4096, 4096, 0, 6, &internal) == S_OK);
+    // A preceding4KiB allocation must not make the next BDA64KiB request inherit
+    // page alignment. The real owner allocator selects the aligned IOVA; KMT
+    // backing alignment remains4KiB and receives that exact requested address.
+    mwd_allocation aligned{}, exact{};
+    REQUIRE(native_runtime_allocate(ctx, 4096, 65536, 0, 6, &aligned) == S_OK);
+    REQUIRE(aligned.address && !(aligned.address & 65535) && aligned.address != internal.address);
+    REQUIRE(native_runtime_allocate(ctx, 4096, 65536, aligned.address + 4096, 6, &exact) == E_INVALIDARG);
+    const auto aligned_address = aligned.address;
+    REQUIRE(native_runtime_release(ctx, aligned.token) == S_OK);
+    REQUIRE(native_runtime_allocate(ctx, 4096, 65536, aligned_address, 6, &exact) == S_OK && exact.address == aligned_address);
+    REQUIRE(native_runtime_release(ctx, exact.token) == S_OK);
     REQUIRE(internal.address + internal.size <= imported.address || imported.address + imported.size <= internal.address);
     REQUIRE(native_runtime_retain(ctx, reinterpret_cast<void *>(uintptr_t(0x123)), &internal) == E_INVALIDARG);
     // Re-obtain the internal token whose output was deliberately cleared by the invalid retain.

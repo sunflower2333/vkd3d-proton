@@ -4189,6 +4189,15 @@ static HRESULT vkd3d_create_vk_device(struct d3d12_device *device,
 
     TRACE("device %p, create_info %p.\n", device, create_info);
 
+    if (runtime)
+    {
+        uint32_t i;
+        for (i = 0; i < create_info->device_extension_count; ++i)
+            if (!strcmp(create_info->device_extensions[i], "VK_KHR_calibrated_timestamps") ||
+                    !strcmp(create_info->device_extensions[i], "VK_EXT_calibrated_timestamps"))
+                return DXGI_ERROR_UNSUPPORTED;
+    }
+
     physical_device = create_info->vk_physical_device;
     device_index = vkd3d_env_var_as_uint("VKD3D_VULKAN_DEVICE", ~0u);
     if ((!physical_device || device_index != ~0u)
@@ -4221,6 +4230,12 @@ static HRESULT vkd3d_create_vk_device(struct d3d12_device *device,
             create_info->optional_device_extensions,
             create_info->optional_device_extension_count,
             user_extension_supported);
+
+    /* Runtime-v1 shares allocation/submission ownership but has no calibrated
+     * timestamp callback. Physical-device direct-KMT clock support cannot be
+     * inherited by this VkDevice. Clear it before collecting time domains. */
+    if (runtime)
+        device->vk_info.KHR_calibrated_timestamps = false;
 
     vkd3d_physical_device_info_init(&device->device_info, device);
     vkd3d_physical_device_info_apply_workarounds(&device->device_info, device);
@@ -4301,6 +4316,20 @@ static HRESULT vkd3d_create_vk_device(struct d3d12_device *device,
     device_info.ppEnabledExtensionNames = extensions;
     device_info.pEnabledFeatures = &device->device_info.features2.features;
     vkd3d_free(user_extension_supported);
+
+    if (runtime)
+    {
+        uint32_t i, count = 0;
+        for (i = 0; i < device_info.enabledExtensionCount; ++i)
+        {
+            /* User optional-extension lists can name the alias directly. */
+            if (!strcmp(extensions[i], "VK_KHR_calibrated_timestamps") ||
+                    !strcmp(extensions[i], "VK_EXT_calibrated_timestamps"))
+                continue;
+            extensions[count++] = extensions[i];
+        }
+        device_info.enabledExtensionCount = count;
+    }
 
     vr = VK_CALL(vkCreateDevice(physical_device, &device_info, NULL, &vk_device));
     if (vr == VK_ERROR_INITIALIZATION_FAILED &&

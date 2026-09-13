@@ -123,6 +123,7 @@ int32_t vkdu_queue_execute(vkdu_object *queue, uint32_t count, vkdu_object *cons
 int32_t vkdu_fence_create(vkdu_device *device, uint64_t initial, vkdu_object **out);
 int32_t vkdu_queue_signal(vkdu_object *queue, vkdu_object *fence, uint64_t value);
 int32_t vkdu_queue_wait(vkdu_object *queue, vkdu_object *fence, uint64_t value);
+int32_t vkdu_queue_clock(vkdu_object *queue, uint64_t *gpu, uint64_t *cpu);
 int32_t vkdu_fence_completed(vkdu_object *fence, uint64_t *value);
 int32_t vkdu_fence_wait(vkdu_object *fence, uint64_t value, uint32_t timeout_ms);
 #ifdef __cplusplus
