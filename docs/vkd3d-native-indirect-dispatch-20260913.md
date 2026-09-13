@@ -50,6 +50,6 @@ graphics/Present and complete feature-level contracts remain admission gates.
 
 - [ExecuteIndirect](https://learn.microsoft.com/windows/win32/direct3d12/indirect-drawing)
 - [Command signature DDI](https://learn.microsoft.com/windows-hardware/drivers/ddi/d3d12umddi/ns-d3d12umddi-d3d12ddiarg_create_command_signature_0001)
-- [ExecuteIndirect DDI](https://learn.microsoft.com/windows-hardware/drivers/ddi/d3d12umddi/nc-d3d12umddi-pfnd3d12ddi_execute_indirect)
+- [ExecuteIndirect API contract](https://learn.microsoft.com/windows/win32/api/d3d12/nf-d3d12-id3d12graphicscommandlist-executeindirect)
 
 The local Windows Kit26100 d3d12umddi.h is authoritative for the compiled ABI.
