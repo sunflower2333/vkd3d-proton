@@ -1,0 +1,36 @@
+name: Store reviewed root descriptor source
+on:
+  push:
+    branches: [work/source-transfer-offline-safety-20260915]
+permissions:
+  contents: write
+jobs:
+  store:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: d7df8d7de786c71173c7d475bfe216d593f0d2ea
+          persist-credentials: false
+      - name: Store hash-verified source blob without commits or ref updates
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: python
+        run: |
+          import hashlib,json,os,pathlib,urllib.request
+          def blob(data):
+              return hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest()
+          path = pathlib.Path('libs/vkd3d-umd/backend.c')
+          before = path.read_bytes()
+          assert blob(before) == 'd6ecef0011be2ca81767a3ca2d63196756fdde60'
+          source = before.decode()
+          start = source.index('int32_t vkdu_command_uav(')
+          end = source.index('int32_t vkdu_command_dispatch(',start)
+          content = (source[:start]+'#include "backend_root_descriptor.inc"\n\n'+source[end:]).encode()
+          expected = 'def2b97290e014e8143c7abc4d6736dc643d066e'
+          assert blob(content) == expected
+          request = urllib.request.Request('https://api.github.com/repos/'+os.environ['GITHUB_REPOSITORY']+'/git/blobs',data=json.dumps({'content':content.decode(),'encoding':'utf-8'}).encode(),headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Content-Type':'application/json'},method='POST')
+          with urllib.request.urlopen(request) as response: stored = json.load(response)['sha']
+          assert stored == expected
+          print('SOURCE_BLOB='+stored)
