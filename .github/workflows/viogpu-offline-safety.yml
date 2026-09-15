@@ -1,0 +1,36 @@
+name: VIOGPU offline safety
+on:
+  push:
+    branches: [work/native-offline-safety-20260915]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  source-snapshot:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: sunflower2333/dxvk
+          ref: 5eb389c1282a6cb899cea15401a313fd9e1184aa
+          path: source-dxvk
+          persist-credentials: false
+      - name: Archive exact sources without building or accessing a GPU
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir source-snapshot
+          git archive --format=tar.gz HEAD > source-snapshot/vkd3d.tar.gz
+          git -C source-dxvk archive --format=tar.gz HEAD > source-snapshot/dxvk.tar.gz
+          git rev-parse HEAD > source-snapshot/vkd3d.commit
+          git -C source-dxvk rev-parse HEAD > source-snapshot/dxvk.commit
+          sha256sum source-snapshot/*.tar.gz > source-snapshot/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-source-snapshot
+          path: source-snapshot/
+          if-no-files-found: error
+          retention-days: 7
