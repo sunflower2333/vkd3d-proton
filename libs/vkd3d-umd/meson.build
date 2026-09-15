@@ -33,6 +33,9 @@ if vkd3d_platform == 'windows'
 endif
 
 if get_option('enable_umd_bridge_tests')
+  # Real entrypoint bodies with mock COM: no Vulkan loader or hardware required.
+  umd_root_test = executable('vkd3d-umd-root-descriptor-test', 'root_descriptor_test.c')
+  test('vkd3d-umd-root-descriptor', umd_root_test)
   # Separate object build. The CPU-only test entrypoint is not in production.
   umd_backend_test = executable('vkd3d-umd-backend-test', 'backend.c', 'debug_policy.c', 'backend_test.c',
     c_args : ['-DVKDU_ENABLE_TEST_DEVICE'],

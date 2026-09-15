@@ -690,37 +690,8 @@ int32_t vkdu_command_pipeline(vkdu_object *command, vkdu_object *pipeline)
     if (!RECORDING(command) || !VALID(pipeline, VKDU_PIPELINE) || !vkdu_same_device(command, pipeline)) return E_INVALIDARG;
     ID3D12GraphicsCommandList_SetPipelineState(OBJ(ID3D12GraphicsCommandList, command), OBJ(ID3D12PipelineState, pipeline)); return S_OK;
 }
-int32_t vkdu_command_uav(vkdu_object *command, uint32_t index, vkdu_object *buffer, uint64_t offset)
-{
-    if (!RECORDING(command) || index >= command->slot_count || command->slots[index].type != D3D12_ROOT_PARAMETER_TYPE_UAV ||
-        !VALID(buffer, VKDU_BUFFER) || !vkdu_same_device(command, buffer) || offset >= buffer->bytes || (offset & 3)) return E_INVALIDARG;
-    ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(OBJ(ID3D12GraphicsCommandList, command), index, vkdu_buffer_address(buffer) + offset); return S_OK;
-}
-int32_t vkdu_command_cbv(vkdu_object *command, uint32_t index, vkdu_object *buffer, uint64_t offset)
-{
-    uint64_t address;
-    if (!RECORDING(command) || index >= command->slot_count ||
-        command->slots[index].type != D3D12_ROOT_PARAMETER_TYPE_CBV || (offset & 255) ||
-        !VALID(buffer, VKDU_BUFFER) || !vkdu_same_device(command, buffer) || offset >= buffer->bytes) return E_INVALIDARG;
-    /* Root descriptors are raw GPU addresses, with no descriptor bounds or
-     * null-read guarantee. Only forward addresses in a live owned buffer. */
-    address = vkdu_buffer_address(buffer) + offset;
-    if (!address || (address & 255)) return E_INVALIDARG;
-    ID3D12GraphicsCommandList_SetComputeRootConstantBufferView(OBJ(ID3D12GraphicsCommandList, command), index, address);
-    return S_OK;
-}
-int32_t vkdu_command_srv(vkdu_object *command, uint32_t index, vkdu_object *buffer, uint64_t offset)
-{
-    uint64_t address;
-    if (!RECORDING(command) || command->command_type == 3 || index >= command->slot_count ||
-        command->slots[index].type != D3D12_ROOT_PARAMETER_TYPE_SRV || (offset & 3) ||
-        !VALID(buffer, VKDU_BUFFER) || !vkdu_same_device(command, buffer) || offset >= buffer->bytes ||
-        (buffer->resource_flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)) return E_INVALIDARG;
-    address = vkdu_buffer_address(buffer);
-    if (!address || offset > UINT64_MAX - address || ((address + offset) & 3)) return E_INVALIDARG;
-    ID3D12GraphicsCommandList_SetComputeRootShaderResourceView(OBJ(ID3D12GraphicsCommandList, command), index, address + offset);
-    return S_OK;
-}
+#include "backend_root_descriptor.inc"
+
 int32_t vkdu_command_dispatch(vkdu_object *command, uint32_t x, uint32_t y, uint32_t z)
 {
     if (!RECORDING(command) || command->command_type == 3 || x > 65535 || y > 65535 || z > 65535) return E_INVALIDARG;
