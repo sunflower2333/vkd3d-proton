@@ -11682,6 +11682,8 @@ static HRESULT d3d12_device_init(struct d3d12_device *device,
     }
 
     device->wddm_runtime_owner = runtime ? runtime->owner : NULL;
+    if (runtime)
+        device->wddm_runtime_callbacks = *runtime->callbacks;
     if (FAILED(hr = vkd3d_create_vk_device(device, create_info, runtime)))
         goto out_free_fragment_output_lock;
 

@@ -165,20 +165,28 @@ HRESULT native_queue_create(Context *ctx, const D3D12DDIARG_CREATECOMMANDQUEUE_0
         native_submission_find(ctx->native_queue_objects, request.hDrvCommandQueue.pDrvPrivate) ||
         native_submission_find(ctx->native_command_objects, request.hDrvCommandQueue.pDrvPrivate)) return E_INVALIDARG;
     vkdu_object *value = nullptr;
-    HRESULT hr;
+    NativeRuntimeQueue *route = nullptr;
+    HRESULT hr = native_runtime_queue_open(ctx, request.hRTCommandQueue, &route);
+    if (FAILED(hr)) return hr;
     {
         NativeBackendCall call(ctx);
         hr = vkdu_queue_create(ctx->backend, type, &value);
+        if (SUCCEEDED(hr)) hr = vkdu_queue_bind_runtime(value, ctx, route);
     }
     if (!op.live()) hr = DXGI_ERROR_DEVICE_REMOVED;
     if (SUCCEEDED(hr)) hr = bind(ctx, request.hDrvCommandQueue.pDrvPrivate, value, VKDU_QUEUE);
     if (FAILED(hr)) {
-        NativeBackendCall call(ctx);
-        vkdu_object_destroy(value);
+        {
+            NativeBackendCall call(ctx);
+            vkdu_object_destroy(value);
+        }
+        native_runtime_queue_close(ctx, route);
+        native_runtime_queue_release_record(ctx, route);
         return hr;
     }
     auto *queue = object(request.hDrvCommandQueue.pDrvPrivate);
     queue->runtime_queue = request.hRTCommandQueue;
+    queue->runtime_route = route;
     queue->next = ctx->native_queue_objects;
     ctx->native_queue_objects = queue;
     return S_OK;
@@ -190,13 +198,21 @@ void native_queue_destroy(Context *ctx, void *slot) {
     auto *queue = native_submission_find(ctx->native_queue_objects, slot);
     if (!queue) { error(ctx, E_INVALIDARG); return; }
     auto *value = queue->backend;
+    auto *route = queue->runtime_route;
     native_submission_remove(ctx->native_queue_objects, queue);
     // The runtime may release this memory immediately, including reentrantly.
     std::memset(queue, 0, sizeof(*queue));
     {
         NativeBackendCall call(ctx);
+        // All translation/Render callbacks must finish while hRTCommandQueue
+        // is still valid. The embedded queue destructor drains remaining GPU work.
         vkdu_object_destroy(value);
     }
+    HRESULT hr = op.live() ? native_runtime_queue_drain(ctx, route) : DXGI_ERROR_DEVICE_REMOVED;
+    const HRESULT close_hr = native_runtime_queue_close(ctx, route);
+    if (SUCCEEDED(hr)) hr = close_hr;
+    native_runtime_queue_release_record(ctx, route);
+    if (op.live() && FAILED(hr)) error(ctx, hr);
     release(ctx);
 }
 

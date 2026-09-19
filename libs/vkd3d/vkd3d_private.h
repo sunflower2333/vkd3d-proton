@@ -3913,6 +3913,7 @@ struct d3d12_command_queue
     pthread_t submission_thread;
 
     struct d3d12_command_queue_submission *submissions;
+    void *wddm_queue_token;
     size_t submissions_count;
     size_t submissions_size;
     uint64_t drain_count;
@@ -5976,6 +5977,7 @@ struct d3d12_device
 
     bool independent_device;
     void *wddm_runtime_owner;
+    struct mwd_callbacks wddm_runtime_callbacks;
 };
 
 HRESULT d3d12_device_create(struct vkd3d_instance *instance,

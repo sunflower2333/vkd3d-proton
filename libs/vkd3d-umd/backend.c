@@ -502,6 +502,16 @@ int32_t vkdu_queue_clock(vkdu_object *queue, uint64_t *gpu, uint64_t *cpu)
     if (!VALID(queue, VKDU_QUEUE) || !gpu || !cpu) return E_INVALIDARG;
     return ID3D12CommandQueue_GetClockCalibration(OBJ(ID3D12CommandQueue, queue), gpu, cpu);
 }
+int32_t vkdu_queue_bind_runtime(vkdu_object *queue, void *owner, void *token)
+{
+    if (!VALID(queue, VKDU_QUEUE)) return E_INVALIDARG;
+    return vkd3d_wddm_queue_bind(OBJ(ID3D12CommandQueue, queue), owner, token);
+}
+int32_t vkdu_queue_drain_enqueue(vkdu_object *queue)
+{
+    if (!VALID(queue, VKDU_QUEUE)) return E_INVALIDARG;
+    return vkd3d_wddm_queue_drain_enqueue(OBJ(ID3D12CommandQueue, queue));
+}
 int32_t vkdu_allocator_create(vkdu_device *device, uint32_t type, vkdu_object **out)
 {
     ID3D12CommandAllocator *allocator = NULL; HRESULT hr;
@@ -809,6 +819,7 @@ int32_t vkdu_command_constants(vkdu_object *command, uint32_t index, uint32_t of
 int32_t vkdu_queue_execute(vkdu_object *queue, uint32_t count, vkdu_object *const *commands)
 {
     ID3D12CommandList *native[64]; uint32_t i;
+    HRESULT hr;
     if (!VALID(queue, VKDU_QUEUE) || !count || count > 64 || !commands) return E_INVALIDARG;
     for (i = 0; i < count; ++i) {
         if (!VALID(commands[i], VKDU_COMMAND_LIST) || !commands[i]->closed || !vkdu_same_device(queue, commands[i]) ||
@@ -816,6 +827,7 @@ int32_t vkdu_queue_execute(vkdu_object *queue, uint32_t count, vkdu_object *cons
         native[i] = OBJ(ID3D12CommandList, commands[i]);
     }
     ID3D12CommandQueue_ExecuteCommandLists(OBJ(ID3D12CommandQueue, queue), count, native);
+    if (FAILED(hr = vkdu_queue_drain_enqueue(queue))) return hr;
     return ID3D12Device_GetDeviceRemovedReason(queue->owner);
 }
 int32_t vkdu_fence_create(vkdu_device *device, uint64_t initial, vkdu_object **out)

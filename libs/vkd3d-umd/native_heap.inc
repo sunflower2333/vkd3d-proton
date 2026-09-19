@@ -10,6 +10,10 @@ struct NativeContextCreate {
     uint64_t generation;
     uint32_t flags, reserved;
 };
+struct NativeContextCreateShared {
+    NativeContextCreate base;
+    uint32_t allocation_context_id, reserved;
+};
 struct NativeContextInfo {
     NativeAbiHeader header;
     uint32_t opcode, flags;
@@ -23,6 +27,7 @@ struct NativeAllocationInfo {
 };
 #pragma pack(pop)
 static_assert(sizeof(NativeContextCreate) == 32 && sizeof(NativeContextInfo) == 64, "v0 context ABI");
+static_assert(sizeof(NativeContextCreateShared) == 40, "shared domain context ABI");
 static_assert(sizeof(NativeAllocationInfo) == 80 && offsetof(NativeAllocationInfo, context_id) == 76, "v0 allocation ABI");
 constexpr uint64_t native_heap_alignment = 65536;
 struct NativeHeapSlot { uint32_t magic; };
@@ -518,6 +523,7 @@ void native_heap_forget(Context *ctx) {
     // kernel allocations/context belong to runtime device teardown, not a later
     // stale callback. User-mode residual records no longer retain runtime slots.
     native_submission_forget(ctx);
+    native_runtime_queues_forget(ctx);
     while (ctx->native_heaps) {
         auto *heap = ctx->native_heaps; ctx->native_heaps = heap->next; delete heap;
     }

@@ -108,6 +108,8 @@ int32_t vkdu_descriptor_copy_ranges(vkdu_device *device, uint32_t type,
 int32_t vkdu_command_heaps(vkdu_object *command, uint32_t count, vkdu_object *const *heaps);
 int32_t vkdu_command_table(vkdu_object *command, uint32_t index, vkdu_object *heap, uint32_t first);
 int32_t vkdu_queue_create(vkdu_device *device, uint32_t type, vkdu_object **out);
+int32_t vkdu_queue_bind_runtime(vkdu_object *queue, void *owner, void *token);
+int32_t vkdu_queue_drain_enqueue(vkdu_object *queue);
 int32_t vkdu_allocator_create(vkdu_device *device, uint32_t type, vkdu_object **out);
 int32_t vkdu_allocator_reset(vkdu_object *allocator);
 int32_t vkdu_command_create(vkdu_device *device, vkdu_object *allocator, uint32_t type, vkdu_object **out);

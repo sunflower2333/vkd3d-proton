@@ -14,11 +14,13 @@ constexpr uint32_t native_device_magic = 0x564b4e44;
 struct NativeAdapter;
 struct NativeHeap;
 struct NativeSubmission;
+struct NativeRuntimeQueue;
 struct Context;
 struct Object;
 void native_heap_forget(Context *);
 void native_heap_retire(Context *);
 void native_submission_forget(Context *);
+void native_runtime_queues_forget(Context *);
 HRESULT native_submission_reap(Context *);
 void native_heap_tables(D3D12DDI_DEVICE_FUNCS_CORE_0003 *);
 HRESULT native_command_create(Context *, const D3D12DDIARG_CREATE_COMMAND_LIST_0001 *);
@@ -56,7 +58,14 @@ public:
     }
     void resume(unsigned held) { for (unsigned i = 0; i < held; ++i) lock(); }
 };
-struct Context {
+struct NativeContextBuffers {
+    HANDLE native_heap_context = nullptr;
+    void *native_commands = nullptr;
+    D3DDDI_ALLOCATIONLIST *native_allocation_list = nullptr;
+    D3DDDI_PATCHLOCATIONLIST *native_patch_list = nullptr;
+    uint32_t native_command_capacity = 0, native_allocation_capacity = 0, native_patch_capacity = 0;
+};
+struct Context : NativeContextBuffers {
     uint32_t magic = context_magic;
     std::atomic_uint references{1};
     vkdu_device *backend = nullptr;
@@ -67,6 +76,7 @@ struct Context {
     Object *resources = nullptr;
     Object *descriptor_heaps = nullptr;
     Object *native_queue_objects = nullptr;
+    NativeRuntimeQueue *native_runtime_queues = nullptr;
     Object *native_command_objects = nullptr;
     Object *indirect_signatures = nullptr; // protected by error_mutex
     std::shared_ptr<NativeAdapter> native_adapter;
@@ -76,14 +86,9 @@ struct Context {
     HMODULE vulkan_module = nullptr;
     NativeCallbackMutex error_mutex;
     NativeHeap *native_heaps = nullptr;
-    HANDLE native_heap_context = nullptr;
     uint64_t native_va_start = 0, native_va_size = 0;
     uint32_t native_context_id = 0;
     uint32_t native_queue_id = 0;
-    void *native_commands = nullptr;
-    D3DDDI_ALLOCATIONLIST *native_allocation_list = nullptr;
-    D3DDDI_PATCHLOCATIONLIST *native_patch_list = nullptr;
-    uint32_t native_command_capacity = 0, native_allocation_capacity = 0, native_patch_capacity = 0;
     bool native_submitting = false;
     unsigned native_backend_calls = 0;
     bool native_destroying = false;
@@ -92,6 +97,7 @@ struct Context {
     NativeSubmission *native_submissions = nullptr;
     unsigned native_submission_count = 0;
     uint32_t native_os_completed = 0;
+    uint32_t native_last_submitted = 0;
     bool native_reaping = false;
 };
 struct Object {
@@ -108,6 +114,7 @@ struct Object {
     NativeHeap *native_heap = nullptr;
     D3D12DDI_HRTCOMMANDLIST runtime_command{};
     D3D12DDI_HRTCOMMANDQUEUE runtime_queue{};
+    NativeRuntimeQueue *runtime_route = nullptr;
 };
 Context *context(D3D12DDI_HDEVICE handle) {
     if (handle.pDrvPrivate) {

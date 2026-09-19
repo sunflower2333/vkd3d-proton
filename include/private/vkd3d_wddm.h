@@ -8,6 +8,8 @@ HRESULT vkd3d_create_device_wddm(const struct vkd3d_device_create_info *info,
         const struct mwd_device_create_info *runtime, REFIID iid, void **device);
 HRESULT vkd3d_create_heap_wddm(ID3D12Device *device, const D3D12_HEAP_DESC *desc,
         void *owner, void *token, ID3D12Heap **heap);
+HRESULT vkd3d_wddm_queue_bind(ID3D12CommandQueue *queue, void *owner, void *token);
+HRESULT vkd3d_wddm_queue_drain_enqueue(ID3D12CommandQueue *queue);
 /* Private embedded-fence event ownership, not an OS monitored-fence import. */
 struct vkd3d_wddm_fence_event;
 HRESULT vkd3d_wddm_device_lost(ID3D12Device *device, HRESULT reason);

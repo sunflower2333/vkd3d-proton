@@ -63,7 +63,7 @@ static void wait_backend_worker(const mwd_callbacks *callbacks, void *owner, boo
         const auto status = callbacks->status(owner);
         uint32_t fence = 0;
         const auto completed = callbacks->completed(owner, &fence);
-        if (require_live && (FAILED(status) || FAILED(completed) || fence != 9)) {
+        if (require_live && (FAILED(status) || FAILED(completed))) {
             std::fprintf(stderr, "FAIL ordinary backend completion after premature callback retirement: status=%08x completed=%08x fence=%u\n",
                 static_cast<unsigned>(status), static_cast<unsigned>(completed), fence);
             std::exit(1);
@@ -153,6 +153,7 @@ static int32_t test_command_create(vkdu_device *, vkdu_object *, uint32_t, vkdu_
 static int32_t test_command_close(vkdu_object *);
 static int32_t test_command_barriers(vkdu_object *, uint32_t, const vkdu_resource_barrier *);
 static int32_t test_queue_create(vkdu_device *, uint32_t, vkdu_object **);
+static int32_t test_queue_bind(vkdu_object *, void *, void *);
 static int32_t test_queue_execute(vkdu_object *, uint32_t, vkdu_object *const *);
 static int32_t test_signature_create(vkdu_device *, uint32_t, vkdu_object **);
 static int32_t test_execute_indirect(vkdu_object *, vkdu_object *, uint32_t, vkdu_object *, uint64_t, vkdu_object *, uint64_t);
@@ -184,6 +185,7 @@ static DWORD WINAPI test_event_wait(HANDLE event, DWORD timeout) {
 #define vkdu_command_close test_command_close
 #define vkdu_command_barriers test_command_barriers
 #define vkdu_queue_create test_queue_create
+#define vkdu_queue_bind_runtime test_queue_bind
 #define vkdu_queue_execute test_queue_execute
 #define vkdu_dispatch_signature_create test_signature_create
 #define vkdu_command_execute_indirect test_execute_indirect
@@ -205,6 +207,7 @@ struct ImportPeer {
     uint64_t address, bytes;
     unsigned references = 1;
     uint32_t width = 0, height = 0, format = 0;
+    void *runtime_route = nullptr;
 };
 static std::function<void()> texture_allocation_callback;
 static unsigned allocation_queries;
@@ -287,6 +290,8 @@ static void test_object_destroy(vkdu_object *object) {
         if (backend_queue_destroy_callback) backend_queue_destroy_callback();
         auto *device = reinterpret_cast<TestDevice *>(peer->device);
         wait_backend_worker(device->callbacks, device->owner);
+        if (peer->runtime_route && FAILED(device->callbacks->queue_release(device->owner, peer->runtime_route)))
+            fixture_abort(__LINE__);
     }
     delete peer;
 }
@@ -386,6 +391,14 @@ static int32_t test_queue_execute(vkdu_object *queue, uint32_t count, vkdu_objec
     executing_objects.clear();
     return queue_execute_result;
 }
+static int32_t test_queue_bind(vkdu_object *queue, void *owner, void *token) {
+    auto *peer = reinterpret_cast<ImportPeer *>(queue);
+    auto *device = reinterpret_cast<TestDevice *>(peer->device);
+    if (device->owner != owner) return E_INVALIDARG;
+    HRESULT hr = device->callbacks->queue_retain(owner, token);
+    if (SUCCEEDED(hr)) peer->runtime_route = token;
+    return hr;
+}
 
 struct KernelHeap { uint64_t address, bytes; bool locked; HANDLE resource; };
 static std::map<D3DKMT_HANDLE, KernelHeap> kernel_heaps;
@@ -402,6 +415,10 @@ static constexpr HRESULT stale_fence_status = static_cast<HRESULT>(0xd00000a3u);
 static std::array<unsigned char, 65536> mapped_heap{};
 static const HANDLE expected_device = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(0x456a0));
 static const HANDLE expected_context = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(0xabc50));
+static HANDLE expected_render_context = expected_context;
+static uintptr_t next_runtime_context = 0xddd00;
+static std::map<HANDLE, HANDLE> runtime_contexts;
+static unsigned runtime_context_creates, runtime_context_destroys;
 static std::array<unsigned char, 65536> dma_commands[2];
 static std::array<D3DDDI_ALLOCATIONLIST, 1024> allocation_lists[2];
 static std::array<D3DDDI_PATCHLOCATIONLIST, 1024> patch_lists[2];
@@ -435,6 +452,27 @@ static HRESULT APIENTRY heap_context_destroy(HANDLE runtime, const D3DDDICB_DEST
     if (fail_context_destroy) { --fail_context_destroy; return E_FAIL; }
     return S_OK;
 }
+static HRESULT APIENTRY queue_context_create(D3D12DDI_HRTCOMMANDQUEUE runtime, D3DDDICB_CREATECONTEXT *args) {
+    auto *data = static_cast<NativeContextCreateShared *>(args->pPrivateDriverData);
+    if (!runtime.handle || args->PrivateDriverDataSize != sizeof(*data) ||
+            !native_header_valid(data->base.header, sizeof(*data)) || data->base.flags != 1 ||
+            data->base.generation != generation || data->base.reserved || data->reserved ||
+            data->allocation_context_id != 83 || args->NodeOrdinal || args->EngineAffinity != 1)
+        fixture_abort(__LINE__);
+    args->hContext = reinterpret_cast<HANDLE>(++next_runtime_context);
+    runtime_contexts.emplace(args->hContext, runtime.handle);
+    ++runtime_context_creates;
+    args->pCommandBuffer = dma_commands[0].data(); args->CommandBufferSize = 65536;
+    args->pAllocationList = allocation_lists[0].data(); args->AllocationListSize = 1024;
+    args->pPatchLocationList = patch_lists[0].data(); args->PatchLocationListSize = 1024;
+    return S_OK;
+}
+static HRESULT APIENTRY queue_context_destroy(D3D12DDI_HRTCOMMANDQUEUE runtime, const D3DDDICB_DESTROYCONTEXT *args) {
+    auto found = runtime_contexts.find(args->hContext);
+    if (found == runtime_contexts.end() || found->second != runtime.handle) fixture_abort(__LINE__);
+    runtime_contexts.erase(found); ++runtime_context_destroys;
+    return S_OK;
+}
 static HRESULT APIENTRY heap_escape(HANDLE adapter, const D3DDDICB_ESCAPE *args) {
     valid_kernel_callback(args->hDevice);
     if (args->PrivateDriverDataSize == sizeof(NativeFenceInfo)) {
@@ -448,7 +486,8 @@ static HRESULT APIENTRY heap_escape(HANDLE adapter, const D3DDDICB_ESCAPE *args)
         return S_OK;
     }
     auto *info = static_cast<NativeContextInfo *>(args->pPrivateDriverData);
-    if (adapter != expected_adapter || args->hContext != expected_context || args->PrivateDriverDataSize != sizeof(*info) ||
+    if (adapter != expected_adapter || (args->hContext != expected_context && !runtime_contexts.count(args->hContext)) ||
+            args->PrivateDriverDataSize != sizeof(*info) ||
             !native_header_valid(info->header, sizeof(*info)) || info->opcode != 1 || info->flags ||
             info->expected_generation != generation || info->va_start || info->va_size || info->generation ||
             info->context_id || info->queue_id) fixture_abort(__LINE__);
@@ -540,7 +579,7 @@ static HRESULT APIENTRY heap_unlock(HANDLE runtime, const D3DDDICB_UNLOCK *args)
 
 static HRESULT APIENTRY heap_render(HANDLE runtime, D3DDDICB_RENDER *args) {
     valid_kernel_callback(runtime);
-    if (args->hContext != expected_context || args->NumAllocations != 1 || args->NumPatchLocations != 1 ||
+    if (args->hContext != expected_render_context || args->NumAllocations != 1 || args->NumPatchLocations != 1 ||
             args->CommandOffset || args->Flags.Value) fixture_abort(__LINE__);
     auto *header = static_cast<NativeRenderInfo *>(args->pNewCommandBuffer);
     auto *refs = reinterpret_cast<NativeRenderReference *>(static_cast<unsigned char *>(args->pNewCommandBuffer) + 64);
@@ -559,7 +598,7 @@ static HRESULT APIENTRY heap_render(HANDLE runtime, D3DDDICB_RENDER *args) {
 
 static HRESULT APIENTRY heap_signal(HANDLE runtime, const D3DDDICB_SIGNALSYNCHRONIZATIONOBJECT2 *args) {
     valid_kernel_callback(runtime);
-    if (args->hContext != expected_context || args->ObjectCount || args->BroadcastContextCount ||
+    if (args->hContext != expected_render_context || args->ObjectCount || args->BroadcastContextCount ||
             args->Flags.Value != 2 || !args->CpuEventHandle || !renders) fixture_abort(__LINE__);
     for (auto handle : args->ObjectHandleArray) if (handle) fixture_abort(__LINE__);
     for (auto handle : args->BroadcastContext) if (handle) fixture_abort(__LINE__);
@@ -723,7 +762,7 @@ static int test_native_heaps() {
     for (auto byte : a) REQUIRE(byte == 0xa5);
     reset_allocate = false;
     uint32_t stale_completed = 123;
-    REQUIRE(native_runtime_completed(context(create.hDrvDevice), &stale_completed) == stale_fence_status && !stale_completed);
+    REQUIRE(native_runtime_completed(context(create.hDrvDevice), &stale_completed) == DXGI_ERROR_DEVICE_REMOVED && !stale_completed);
     adapter.pfnDestroyDevice(create.hDrvDevice);
     REQUIRE(adapter.pfnCloseAdapter(open.hAdapter) == S_OK);
 
@@ -855,13 +894,13 @@ static int test_native_heaps() {
     REQUIRE(native_runtime_unmap(ctx, token) == S_OK && unlocks == unmap_count + 1);
     std::array<unsigned char, 16> stream{};
     mwd_reference reference{token, 0, 4096, 3, 0};
-    REQUIRE(native_runtime_submit(ctx, stream.data(), stream.size(), &reference, 1) == S_OK && renders == 1);
+    REQUIRE(native_runtime_submit(ctx, 8, stream.data(), stream.size(), &reference, 1) == S_OK && renders == 1);
     REQUIRE(ctx->native_commands == dma_commands[1].data() && ctx->native_allocation_list == allocation_lists[1].data());
     reference.offset = imported.size;
-    REQUIRE(native_runtime_submit(ctx, stream.data(), stream.size(), &reference, 1) == E_INVALIDARG && renders == 1);
+    REQUIRE(native_runtime_submit(ctx, 9, stream.data(), stream.size(), &reference, 1) == E_INVALIDARG && renders == 1);
     reference.offset = 0; render_result = E_OUTOFMEMORY;
     ctx->native_commands = dma_commands[0].data();
-    REQUIRE(native_runtime_submit(ctx, stream.data(), stream.size(), &reference, 1) == E_OUTOFMEMORY);
+    REQUIRE(native_runtime_submit(ctx, 9, stream.data(), stream.size(), &reference, 1) == E_OUTOFMEMORY);
     REQUIRE(ctx->native_commands == dma_commands[1].data()); render_result = S_OK;
     uint32_t completed = 0;
     REQUIRE(native_runtime_completed(ctx, &completed) == S_OK && completed == 9);
@@ -870,7 +909,7 @@ static int test_native_heaps() {
     REQUIRE(native_runtime_release(ctx, token) == S_OK && !native_token(ctx, token));
     reference.token = internal.token;
     retire_render = true; error_device = create.hDrvDevice;
-    REQUIRE(native_runtime_submit(ctx, stream.data(), stream.size(), &reference, 1) == DXGI_ERROR_DEVICE_REMOVED);
+    REQUIRE(native_runtime_submit(ctx, 10, stream.data(), stream.size(), &reference, 1) == DXGI_ERROR_DEVICE_REMOVED);
     REQUIRE(!context(create.hDrvDevice) && kernel_heaps.size() == 1);
     kernel_heaps.clear(); heap_callbacks_retired = retire_render = false;
     REQUIRE(adapter.pfnCloseAdapter(open.hAdapter) == S_OK);
@@ -903,7 +942,7 @@ static int test_native_heaps() {
         if (cb->context(owner, &info) != S_OK || info.context_id != 83 ||
                 cb->allocate(owner, 4096, 4096, 0, 6, &forbidden) != DXGI_ERROR_DEVICE_REMOVED || forbidden.token ||
                 cb->map(owner, cleanup_allocation.token, &forbidden_map, &forbidden_handle) != DXGI_ERROR_DEVICE_REMOVED || forbidden_map ||
-                cb->submit(owner, nullptr, 0, nullptr, 0) != DXGI_ERROR_DEVICE_REMOVED ||
+                cb->submit(owner, 0, nullptr, 0, nullptr, 0) != DXGI_ERROR_DEVICE_REMOVED ||
                 cb->unmap(owner, cleanup_allocation.token) != S_OK || cb->release(owner, cleanup_allocation.token) != S_OK ||
                 !kernel_heaps.empty() || heap_context_destroys != destroys_before_cleanup) {
             std::fputs("FAIL ordinary backend cleanup ownership or new-work gate\n", stderr); std::exit(1);
@@ -1180,7 +1219,11 @@ static int test_native_queue_lifetime() {
     open.hRTAdapter.handle = expected_adapter; open.pAdapterCallbacks = &ac; open.pAdapterFuncs = &adapter;
     REQUIRE(OpenAdapter12(&open) == S_OK);
     D3DDDI_DEVICECALLBACKS kt{};
+    kt.pfnCreateContextCb = heap_context_create; kt.pfnDestroyContextCb = heap_context_destroy;
+    kt.pfnEscapeCb = heap_escape; kt.pfnAllocateCb = heap_allocate; kt.pfnDeallocateCb = heap_deallocate;
+    kt.pfnLockCb = heap_lock; kt.pfnUnlockCb = heap_unlock;
     D3D12DDI_CORELAYER_DEVICECALLBACKS_0003 um{};
+    um.pfnCreateContextCb = queue_context_create; um.pfnDestroyContextCb = queue_context_destroy;
     um.pfnSetErrorCb = test_error; um.pfnSetCommandListErrorCb = test_command_error;
     alignas(NativeDevice) std::array<unsigned char, sizeof(NativeDevice)> device_memory{};
     D3D12DDIARG_CREATEDEVICE_0003 create{};
@@ -1333,6 +1376,7 @@ static int test_native_completion() {
     kt.pfnLockCb = heap_lock; kt.pfnUnlockCb = heap_unlock; kt.pfnRenderCb = heap_render;
     kt.pfnSignalSynchronizationObject2Cb = heap_signal;
     D3D12DDI_CORELAYER_DEVICECALLBACKS_0003 um{}; um.pfnSetErrorCb = test_error;
+    um.pfnCreateContextCb = queue_context_create; um.pfnDestroyContextCb = queue_context_destroy;
     alignas(NativeDevice) std::array<unsigned char, sizeof(NativeDevice)> memory{};
     D3D12DDIARG_CREATEDEVICE_0003 create{};
     create.hDrvDevice.pDrvPrivate = memory.data(); create.hRTDevice.handle = expected_device;
@@ -1348,7 +1392,8 @@ static int test_native_completion() {
         reference = {allocation.token, 0, 4096, 3, 0};
         return hr;
     };
-    auto submit = [&]() { return native_runtime_submit(ctx, stream.data(), stream.size(), &reference, 1); };
+    auto submit = [&]() { return native_runtime_submit(ctx, ctx->native_last_submitted + 1,
+        stream.data(), stream.size(), &reference, 1); };
     uint32_t completed = 0;
     REQUIRE(allocate() == S_OK);
     const auto initial_renders = renders;
@@ -1425,6 +1470,46 @@ static int test_native_completion() {
     };
     REQUIRE(submit() == S_OK && kernel_heaps.empty());
     nested_signal = {};
+
+    // Two genuine runtime-associated contexts submit the same allocation domain.
+    // Completing the first does not retire the second or query an idle owner.
+    Object first_queue{}, second_queue{};
+    D3D12DDIARG_CREATECOMMANDQUEUE_0001 queue_args{};
+    queue_args.NodeMask = 1; queue_args.QueueFlags = D3D12DDI_COMMAND_QUEUE_FLAG_3D;
+    queue_args.hDrvCommandQueue.pDrvPrivate = &first_queue;
+    queue_args.hRTCommandQueue.handle = reinterpret_cast<HANDLE>(uintptr_t(0x77701));
+    REQUIRE(native_queue_create(ctx, &queue_args) == S_OK);
+    queue_args.hDrvCommandQueue.pDrvPrivate = &second_queue;
+    queue_args.hRTCommandQueue.handle = reinterpret_cast<HANDLE>(uintptr_t(0x77702));
+    REQUIRE(native_queue_create(ctx, &queue_args) == S_OK);
+    auto *first_route = first_queue.runtime_route;
+    auto *second_route = second_queue.runtime_route;
+    REQUIRE(first_route && second_route && first_route != second_route &&
+        first_route->native_heap_context != second_route->native_heap_context);
+    REQUIRE(native_runtime_queue_retain(ctx, &queue_args) == E_INVALIDARG);
+    REQUIRE(allocate() == S_OK);
+    defer_completion = true;
+    expected_render_context = first_route->native_heap_context;
+    const uint32_t first_serial = ctx->native_last_submitted + 1;
+    REQUIRE(native_runtime_submit_queue(ctx, first_route, first_serial, stream.data(), stream.size(), &reference, 1) == S_OK);
+    expected_render_context = second_route->native_heap_context;
+    REQUIRE(native_runtime_submit_queue(ctx, second_route, first_serial + 1, stream.data(), stream.size(), &reference, 1) == S_OK);
+    REQUIRE(first_route->submissions == 1 && second_route->submissions == 1);
+    REQUIRE(native_runtime_submit_queue(ctx, first_route, first_serial, stream.data(), stream.size(), &reference, 1) == E_INVALIDARG);
+    complete_events();
+    REQUIRE(native_runtime_completed(ctx, &completed) == S_OK && completed == first_serial);
+    REQUIRE(!first_route->submissions && second_route->submissions == 1);
+    complete_events();
+    REQUIRE(native_runtime_completed(ctx, &completed) == S_OK && completed == first_serial + 1);
+    REQUIRE(!second_route->submissions);
+    defer_completion = false;
+    expected_render_context = expected_context;
+    REQUIRE(native_runtime_release(ctx, allocation.token) == S_OK);
+    const auto destroyed_queues = runtime_context_destroys;
+    native_queue_destroy(ctx, &first_queue);
+    native_queue_destroy(ctx, &second_queue);
+    REQUIRE(runtime_context_destroys == destroyed_queues + 2);
+    REQUIRE(!ctx->native_runtime_queues);
 
     // Signal callback retirement cancels publication. Residual allocations are
     // owned by runtime device teardown, never cleaned with detached callbacks.

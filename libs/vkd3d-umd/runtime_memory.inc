@@ -24,6 +24,7 @@ struct NativeRenderReference {
 static_assert(sizeof(NativeFenceInfo) == 56 && sizeof(NativeRenderInfo) == 64 &&
     sizeof(NativeRenderReference) == 32, "v0 submit ABI");
 
+#include "native_runtime_queue.inc"
 #include "native_completion.inc"
 
 NativeHeap *native_token(Context *ctx, void *token) {
@@ -149,31 +150,31 @@ int32_t MWD_CALL native_runtime_completed(void *owner, uint32_t *out) {
     auto *ctx = op.ctx;
     HRESULT completed_hr = native_submission_reap(ctx);
     if (FAILED(completed_hr)) return completed_hr;
-    NativeFenceInfo info{};
-    info.header = native_header(sizeof(info)); info.opcode = 2;
-    info.expected_generation = ctx->native_adapter->generation;
-    D3DDDICB_ESCAPE args{};
-    args.hDevice = ctx->runtime_device.handle; args.hContext = ctx->native_heap_context;
-    args.pPrivateDriverData = &info; args.PrivateDriverDataSize = sizeof(info);
-    HRESULT hr = ctx->kernel_callbacks.pfnEscapeCb(ctx->native_adapter->runtime.handle, &args);
-    if (!op.live()) return DXGI_ERROR_DEVICE_REMOVED;
-    if (FAILED(hr)) return hr;
-    if (!native_header_valid(info.header, sizeof(info)) || info.opcode != 2 || info.flags || info.reserved ||
-            info.expected_generation != ctx->native_adapter->generation || info.generation != info.expected_generation ||
-            info.context_id != ctx->native_context_id || info.completed > UINT32_MAX) return E_FAIL;
-    // Never expose private completion ahead of OS-ordered backing retirement.
-    if (!ctx->native_submissions) ctx->native_os_completed = static_cast<uint32_t>(info.completed);
-    *out = ctx->native_os_completed;
-    return native_heap_generation(ctx);
+    // Different scheduler contexts share one allocation-domain serial. Only
+    // FIFO retirement of real OS events can advance that domain watermark.
+    HRESULT hr = native_heap_generation(ctx);
+    if (SUCCEEDED(hr)) *out = ctx->native_os_completed;
+    return hr;
 }
-int32_t MWD_CALL native_runtime_submit(void *owner, const void *stream, uint32_t size,
+int32_t native_runtime_submit_on_queue(void *owner, void *queue_token, uint32_t fence, const void *stream, uint32_t size,
         const mwd_reference *refs, uint32_t count) {
     NativeHeapOperation op(static_cast<Context *>(owner));
     if (!op.live()) return DXGI_ERROR_DEVICE_REMOVED;
     auto *ctx = op.ctx;
+    auto *queue = queue_token ? native_runtime_queue_token(ctx, queue_token) : nullptr;
+    if (queue_token && (!queue || queue->pending || queue->closing || !queue->users ||
+            !queue->native_heap_context || queue->users == UINT32_MAX)) return E_INVALIDARG;
+    struct QueueHold {
+        Context *ctx; NativeRuntimeQueue *queue;
+        QueueHold(Context *c, NativeRuntimeQueue *q) : ctx(c), queue(q) { if (queue) ++queue->users; }
+        ~QueueHold() { if (queue) native_runtime_queue_release_record(ctx, queue); }
+    } queue_hold(ctx, queue);
+    NativeContextBuffers *buffers = queue ? static_cast<NativeContextBuffers *>(queue) : ctx;
     if (!stream || size < 8 || size > 65536 || !refs || !count || count > 1024 ||
-            ctx->native_submitting || !ctx->kernel_callbacks.pfnRenderCb) return E_INVALIDARG;
+            !fence || ctx->native_submitting || !ctx->kernel_callbacks.pfnRenderCb) return E_INVALIDARG;
     if (ctx->native_reaping) return DXGI_ERROR_WAS_STILL_DRAWING;
+    if (ctx->native_last_submitted &&
+            static_cast<int32_t>(fence - ctx->native_last_submitted) <= 0) return E_INVALIDARG;
     if (!ctx->kernel_callbacks.pfnSignalSynchronizationObject2Cb) return DXGI_ERROR_UNSUPPORTED;
     // Runtime/kernel callbacks may reenter and release the caller's storage.
     // Copy the complete command and reference request before the first callback.
@@ -188,11 +189,12 @@ int32_t MWD_CALL native_runtime_submit(void *owner, const void *stream, uint32_t
     if (ctx->native_submission_count == native_submission_limit) return DXGI_ERROR_WAS_STILL_DRAWING;
     hr = native_heap_generation(ctx);
     if (FAILED(hr)) return hr;
+    if (queue && queue->closing) return DXGI_ERROR_DEVICE_REMOVED;
     const uint64_t offset = sizeof(NativeRenderInfo) + uint64_t(count) * sizeof(NativeRenderReference);
     const uint64_t bytes = offset + size;
-    if (bytes > 65536 || bytes > ctx->native_command_capacity || count > ctx->native_allocation_capacity ||
-            count > ctx->native_patch_capacity || !ctx->native_commands || !ctx->native_allocation_list ||
-            !ctx->native_patch_list) return E_INVALIDARG;
+    if (bytes > 65536 || bytes > buffers->native_command_capacity || count > buffers->native_allocation_capacity ||
+            count > buffers->native_patch_capacity || !buffers->native_commands || !buffers->native_allocation_list ||
+            !buffers->native_patch_list) return E_INVALIDARG;
     for (uint32_t i = 0; i < count; ++i) {
         auto *heap = native_token(ctx, refs[i].token);
         if (!heap || heap->pending || !heap->allocation || heap->users == UINT32_MAX ||
@@ -212,7 +214,10 @@ int32_t MWD_CALL native_runtime_submit(void *owner, const void *stream, uint32_t
     completion->event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!completion->event) return HRESULT_FROM_WIN32(GetLastError());
     completion->count = count;
-    auto *packet = static_cast<uint8_t *>(ctx->native_commands);
+    completion->context = buffers->native_heap_context;
+    completion->queue = queue;
+    completion->fence = fence;
+    auto *packet = static_cast<uint8_t *>(buffers->native_commands);
     std::memset(packet, 0, static_cast<size_t>(bytes));
     auto *header = reinterpret_cast<NativeRenderInfo *>(packet);
     header->header = native_header(static_cast<uint32_t>(bytes)); header->opcode = 1;
@@ -223,20 +228,20 @@ int32_t MWD_CALL native_runtime_submit(void *owner, const void *stream, uint32_t
     auto *wire = reinterpret_cast<NativeRenderReference *>(packet + sizeof(*header));
     for (uint32_t i = 0; i < count; ++i) {
         wire[i] = {i, refs[i].flags, refs[i].offset, refs[i].length, refs[i].patch_offset, 0};
-        ctx->native_allocation_list[i] = {};
-        ctx->native_allocation_list[i].hAllocation = native_token(ctx, refs[i].token)->allocation;
-        ctx->native_allocation_list[i].WriteOperation = (refs[i].flags & 2u) != 0;
-        ctx->native_patch_list[i] = {};
-        ctx->native_patch_list[i].AllocationIndex = i;
-        ctx->native_patch_list[i].AllocationOffset = static_cast<UINT>(refs[i].offset);
-        ctx->native_patch_list[i].PatchOffset = static_cast<UINT>(offset + refs[i].patch_offset);
+        buffers->native_allocation_list[i] = {};
+        buffers->native_allocation_list[i].hAllocation = native_token(ctx, refs[i].token)->allocation;
+        buffers->native_allocation_list[i].WriteOperation = (refs[i].flags & 2u) != 0;
+        buffers->native_patch_list[i] = {};
+        buffers->native_patch_list[i].AllocationIndex = i;
+        buffers->native_patch_list[i].AllocationOffset = static_cast<UINT>(refs[i].offset);
+        buffers->native_patch_list[i].PatchOffset = static_cast<UINT>(offset + refs[i].patch_offset);
     }
     D3DDDICB_RENDER args{};
-    args.hContext = ctx->native_heap_context; args.CommandLength = static_cast<UINT>(bytes);
+    args.hContext = buffers->native_heap_context; args.CommandLength = static_cast<UINT>(bytes);
     args.NumAllocations = args.NumPatchLocations = count;
-    args.pNewCommandBuffer = ctx->native_commands; args.NewCommandBufferSize = ctx->native_command_capacity;
-    args.pNewAllocationList = ctx->native_allocation_list; args.NewAllocationListSize = ctx->native_allocation_capacity;
-    args.pNewPatchLocationList = ctx->native_patch_list; args.NewPatchLocationListSize = ctx->native_patch_capacity;
+    args.pNewCommandBuffer = buffers->native_commands; args.NewCommandBufferSize = buffers->native_command_capacity;
+    args.pNewAllocationList = buffers->native_allocation_list; args.NewAllocationListSize = buffers->native_allocation_capacity;
+    args.pNewPatchLocationList = buffers->native_patch_list; args.NewPatchLocationListSize = buffers->native_patch_capacity;
     for (uint32_t i = 0; i < count; ++i) {
         auto *heap = native_token(ctx, refs[i].token);
         ++heap->users; ++heap->submitted;
@@ -246,25 +251,37 @@ int32_t MWD_CALL native_runtime_submit(void *owner, const void *stream, uint32_t
     while (*tail) tail = &(*tail)->next;
     auto *submitted = completion.release();
     *tail = submitted; ++ctx->native_submission_count;
+    if (queue) { ++queue->users; ++queue->submissions; }
+    ctx->native_last_submitted = fence;
     ctx->native_submitting = true;
     hr = ctx->kernel_callbacks.pfnRenderCb(ctx->runtime_device.handle, &args);
     ctx->native_submitting = false;
     submitted->pending = false;
     if (!op.live()) return DXGI_ERROR_DEVICE_REMOVED;
     // All replacement buffers are consumed even on callback failure.
-    ctx->native_commands = args.pNewCommandBuffer; ctx->native_command_capacity = args.NewCommandBufferSize;
-    ctx->native_allocation_list = args.pNewAllocationList; ctx->native_allocation_capacity = args.NewAllocationListSize;
-    ctx->native_patch_list = args.pNewPatchLocationList; ctx->native_patch_capacity = args.NewPatchLocationListSize;
-    if (!ctx->native_commands || !ctx->native_allocation_list || !ctx->native_patch_list ||
-            ctx->native_command_capacity < sizeof(NativeRenderInfo) || ctx->native_command_capacity > 65536 ||
-            !ctx->native_allocation_capacity || ctx->native_allocation_capacity > 1024 ||
-            !ctx->native_patch_capacity || ctx->native_patch_capacity > 1024) hr = E_FAIL;
+    buffers->native_commands = args.pNewCommandBuffer; buffers->native_command_capacity = args.NewCommandBufferSize;
+    buffers->native_allocation_list = args.pNewAllocationList; buffers->native_allocation_capacity = args.NewAllocationListSize;
+    buffers->native_patch_list = args.pNewPatchLocationList; buffers->native_patch_capacity = args.NewPatchLocationListSize;
+    if (!buffers->native_commands || !buffers->native_allocation_list || !buffers->native_patch_list ||
+            buffers->native_command_capacity < sizeof(NativeRenderInfo) || buffers->native_command_capacity > 65536 ||
+            !buffers->native_allocation_capacity || buffers->native_allocation_capacity > 1024 ||
+            !buffers->native_patch_capacity || buffers->native_patch_capacity > 1024) hr = E_FAIL;
     const HRESULT completion_hr = native_submission_reap(ctx);
     if (FAILED(hr)) return hr;
     return FAILED(completion_hr) ? completion_hr : native_heap_generation(ctx);
 }
+int32_t MWD_CALL native_runtime_submit(void *owner, uint32_t fence, const void *stream, uint32_t size,
+        const mwd_reference *refs, uint32_t count) {
+    return native_runtime_submit_on_queue(owner, nullptr, fence, stream, size, refs, count);
+}
+int32_t MWD_CALL native_runtime_submit_queue(void *owner, void *queue, uint32_t fence, const void *stream, uint32_t size,
+        const mwd_reference *refs, uint32_t count) {
+    if (!queue) return E_INVALIDARG;
+    return native_runtime_submit_on_queue(owner, queue, fence, stream, size, refs, count);
+}
 static const mwd_callbacks native_runtime_callbacks = {
     MWD_RUNTIME_MAGIC, MWD_RUNTIME_ABI_VERSION, sizeof(mwd_callbacks), 0,
     native_runtime_context, native_runtime_allocate, native_runtime_retain, native_runtime_release,
-    native_runtime_map, native_runtime_unmap, native_runtime_submit, native_runtime_completed, native_runtime_status
+    native_runtime_map, native_runtime_unmap, native_runtime_submit, native_runtime_completed, native_runtime_status,
+    native_runtime_queue_retain, native_runtime_queue_release, native_runtime_submit_queue
 };
