@@ -168,3 +168,29 @@ DDI consumer must remain unpublished while any provider operation is a stub.
 - Local `d3dkmddi` DXGK_BUILDPAGINGBUFFER_UPDATEPAGETABLE,
   DXGKARG_BUILDPAGINGBUFFER, DXGK_BUILDPAGINGBUFFER_OPERATION,
   DxgkDdiSignalMonitoredFence and DXGKARG_SIGNALMONITOREDFENCE
+
+## Probe build validation and handoff
+
+Commit `3ffcd2b06060e0b0786165daa09c65b5936dfb0c` passed all five jobs of
+[CI 35444359358](https://github.com/sunflower2333/vkd3d-proton/actions/runs/35444359358).
+Actual x86/x64 logs show the new probe compiled, linked, and rejected an
+unspecified mode/LUID before device access. ARM64 compiled and linked as well.
+Native runtime fixtures, semantic negative controls and the explicitly CPU WARP
+public D3D12 fence/copy harness still pass on all three execution architectures.
+The new OS mapping mode itself is **not run** in CI or on the target by this
+worker: it requires the actual VIOGPU adapter. No native-import runtime result
+is inferred from compilation.
+
+| Architecture | Artifact ID | Archive SHA256 |
+| --- | --- | --- |
+| ARM64 | 10584882172 | 729e6e707380414858f7d40f4916c34e7864a1ecf01a67a3b55cfcbda4e78e7e |
+| x64 | 10585361633 | af8646aa643d9569aad9fc0628e5dbeb10b911138793602e3d7f50b4fc02fab0 |
+| x86 | 10584992067 | 6e36b052b1343198e974c16b3c19412a06f885d94beafda1f860359e5c03ab92 |
+
+ARM64 `package/vkd3d-umd-shared-gpu-probe.exe` SHA256, from the build log:
+`76a5161ebe51b2548a984b283ad6a80dcb97d22b890b76421d198296b9e40105`.
+Jobs: Linux `105900630403`, x86 `105900630504`, ARM64 build `105900630519`,
+x64 `105900630554`, ARM64 runtime `105901454077`.
+Archive identities are from the GitHub API; this worker downloaded nothing.
+Root can stage only this executable for the OS mapping mode; replacing
+`viogpud3d12.dll`, installing a matched ICD or modifying 58552 is unnecessary.
