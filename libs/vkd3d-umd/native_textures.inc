@@ -65,7 +65,13 @@ void APIENTRY copy_texture(D3D12DDI_HCOMMANDLIST c, const D3D12DDIARG_BUFFER_PLA
     if (!sampler_operation_live(op)) { error(ctx, DXGI_ERROR_DEVICE_REMOVED); return; }
     vkdu_texture_copy_location destination{}, source{};
     vkdu_box region{};
-    if (box) region = {box->left, box->top, box->front, box->right, box->bottom, box->back};
+    if (box) {
+        if (box->Left < 0 || box->Top < 0 || box->Front < 0 || box->Right < 0 || box->Bottom < 0 || box->Back < 0) {
+            error(cmd, E_INVALIDARG); return;
+        }
+        region = {static_cast<UINT>(box->Left), static_cast<UINT>(box->Top), static_cast<UINT>(box->Front),
+            static_cast<UINT>(box->Right), static_cast<UINT>(box->Bottom), static_cast<UINT>(box->Back)};
+    }
     auto *command = cmd->backend;
     if (!vkdu_object_retain(command)) { error(ctx, E_OUTOFMEMORY); return; }
     AcquireSRWLockShared(&ctx->resources_lock);

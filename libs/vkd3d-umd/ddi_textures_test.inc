@@ -73,6 +73,9 @@ static int check_native_textures() {
     dst.BaseAddress.UMD.Offset = 1;
     commands.pfnCopyTextureRegion({&command}, &dst, image, 2, 2, 0, &src, buffer, &box);
     REQUIRE(texture_copy_calls == 1 && reported == E_INVALIDARG); dst.BaseAddress.UMD.Offset = 0;
+    box.Left = -1;
+    commands.pfnCopyTextureRegion({&command}, &dst, image, 2, 2, 0, &src, buffer, &box);
+    REQUIRE(texture_copy_calls == 1 && reported == E_INVALIDARG); box.Left = 1;
     texture_slots[0] = &texture; texture_slots[1] = &upload; texture_slots[2] = &command;
     texture_placement = &src; texture_layout = &footprint; texture_box_input = &box; texture_hook = texture_poison;
     const unsigned before_destroy = destroys; next_result = E_FAIL;
