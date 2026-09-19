@@ -16,6 +16,7 @@ static void check_graphics(vkdu_device *device, vkdu_device *other)
 {
     vkdu_object *root = NULL, *pipeline = NULL, *gradient = NULL, *target = NULL, *heap = NULL, *wrong_heap = NULL;
     vkdu_object *queue = NULL, *allocator = NULL, *command = NULL, *fence = NULL, *readback = NULL, *indices = NULL;
+    vkdu_object *occlusion = NULL, *timestamp = NULL, *statistics = NULL, *query_readback = NULL;
     /* Runtime signatures may be a superset of actual shader declarations. */
     const struct vkdu_signature vertex_input[] = {{6, 0, 1, 1}, {0, 3, 15, 3}};
     const struct vkdu_signature vertex_output[] = {{1, 0, 15, 3}, {0, 5, 15, 3}};
@@ -55,6 +56,10 @@ static void check_graphics(vkdu_device *device, vkdu_device *other)
     CHECK(vkdu_command_create(device, allocator, 0, &command)); CHECK(vkdu_fence_create(device, 0, &fence));
     CHECK(vkdu_buffer_create(device, 4096, 3, 0, D3D12_RESOURCE_STATE_COPY_DEST, &readback));
     CHECK(vkdu_buffer_create(device, 4096, 2, 0, D3D12_RESOURCE_STATE_GENERIC_READ, &indices));
+    CHECK(vkdu_query_heap_create(device, D3D12_QUERY_HEAP_TYPE_OCCLUSION, 2, &occlusion));
+    CHECK(vkdu_query_heap_create(device, D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 2, &timestamp));
+    CHECK(vkdu_query_heap_create(device, D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS, 1, &statistics));
+    CHECK(vkdu_buffer_create(device, 4096, 3, 0, D3D12_RESOURCE_STATE_COPY_DEST, &query_readback));
     CHECK(vkdu_buffer_map(indices, 0, 0, &mapped));
     ((uint16_t *)mapped)[0] = ((uint16_t *)mapped)[1] = 99;
     ((uint16_t *)mapped)[2] = 0; ((uint16_t *)mapped)[3] = 1; ((uint16_t *)mapped)[4] = 2;
@@ -73,6 +78,9 @@ static void check_graphics(vkdu_device *device, vkdu_device *other)
         CHECK(vkdu_buffer_map(readback, 0, 0, &mapped));
         for (i = 0; i < 1024; ++i) ((uint32_t *)mapped)[i] = sentinel;
         CHECK(vkdu_buffer_unmap(readback, 0, 4096));
+        CHECK(vkdu_buffer_map(query_readback, 0, 0, &mapped));
+        memset(mapped, 0xa5, 4096);
+        CHECK(vkdu_buffer_unmap(query_readback, 0, 4096));
         REJECT(vkdu_command_draw(command, 3, 1, 0, 0)); /* Reset invalidates prior graphics state. */
         CHECK(vkdu_command_clear_rtv(command, heap, 2, clear, 0, NULL));
         CHECK(vkdu_command_graphics_root(command, root)); CHECK(vkdu_command_pipeline(command, round == 4 ? gradient : pipeline));
@@ -81,6 +89,15 @@ static void check_graphics(vkdu_device *device, vkdu_device *other)
         CHECK(vkdu_command_scissors(command, 1, &scissor));
         REJECT(vkdu_command_render_target(command, wrong_heap, 2));
         REJECT(vkdu_command_topology(command, 99)); /* Rejected state must preserve valid state. */
+        REJECT(vkdu_command_query(command, timestamp, D3D12_QUERY_TYPE_TIMESTAMP, 0, 1));
+        REJECT(vkdu_command_query(command, occlusion, D3D12_QUERY_TYPE_OCCLUSION, 0, 0));
+        REJECT(vkdu_command_query(command, occlusion, D3D12_QUERY_TYPE_TIMESTAMP, 0, 0));
+        CHECK(vkdu_command_query(command, timestamp, D3D12_QUERY_TYPE_TIMESTAMP, 0, 0));
+        CHECK(vkdu_command_query(command, occlusion, D3D12_QUERY_TYPE_OCCLUSION, 0, 1));
+        REJECT(vkdu_command_query(command, occlusion, D3D12_QUERY_TYPE_OCCLUSION, 0, 1));
+        REJECT(vkdu_command_query_resolve(command, occlusion, D3D12_QUERY_TYPE_OCCLUSION, 0, 1, query_readback, 64));
+        REJECT(vkdu_command_close(command));
+        CHECK(vkdu_command_query(command, statistics, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0, 1));
         if (round & 1) {
             CHECK(vkdu_command_index_buffer(command, indices, 0, 10, DXGI_FORMAT_R16_UINT));
             REJECT(vkdu_command_draw_indexed(command, 4, 1, 2, 13, 0));
@@ -88,6 +105,18 @@ static void check_graphics(vkdu_device *device, vkdu_device *other)
              * in this shader. A nonzero base must not shift its generated shape. */
             CHECK(vkdu_command_draw_indexed(command, round == 3 ? 0 : 3, 1, 2, 13, 7));
         } else CHECK(vkdu_command_draw(command, 3, round == 2 ? 0 : 1, 0, 5));
+        CHECK(vkdu_command_query(command, statistics, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0, 0));
+        CHECK(vkdu_command_query(command, occlusion, D3D12_QUERY_TYPE_OCCLUSION, 0, 0));
+        CHECK(vkdu_command_query(command, timestamp, D3D12_QUERY_TYPE_TIMESTAMP, 1, 0));
+        CHECK(vkdu_command_query(command, occlusion, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 1, 1));
+        CHECK(vkdu_command_draw(command, 3, round == 2 || round == 3 ? 0 : 1, 0, 5));
+        CHECK(vkdu_command_query(command, occlusion, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 1, 0));
+        REJECT(vkdu_command_query_resolve(command, timestamp, D3D12_QUERY_TYPE_TIMESTAMP, 0, 3, query_readback, 0));
+        REJECT(vkdu_command_query_resolve(command, timestamp, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, query_readback, 4090));
+        CHECK(vkdu_command_query_resolve(command, occlusion, D3D12_QUERY_TYPE_OCCLUSION, 0, 1, query_readback, 64));
+        CHECK(vkdu_command_query_resolve(command, occlusion, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 1, 1, query_readback, 80));
+        CHECK(vkdu_command_query_resolve(command, statistics, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0, 1, query_readback, 128));
+        CHECK(vkdu_command_query_resolve(command, timestamp, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, query_readback, 256));
         CHECK(vkdu_command_transition(command, target, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE));
         CHECK(vkdu_command_texture_copy(command, &dst, 0, 0, 0, &src, NULL));
         CHECK(vkdu_command_close(command)); CHECK(vkdu_queue_execute(queue, 1, &command));
@@ -121,9 +150,36 @@ static void check_graphics(vkdu_device *device, vkdu_device *other)
             }
         }
         CHECK(vkdu_buffer_unmap(readback, 0, 0));
+        CHECK(vkdu_buffer_map(query_readback, 0, 4096, &mapped));
+        {
+            const uint64_t *values = mapped;
+            const uint64_t pixels = round == 2 || round == 3 ? 0 :
+                (uint64_t)(scissor.right - scissor.left) * (scissor.bottom - scissor.top);
+            const D3D12_QUERY_DATA_PIPELINE_STATISTICS *stats = (const void *)(values + 16);
+            if (values[8] != pixels || values[10] != !!pixels || !values[32] || values[33] < values[32] ||
+                    stats->IAVertices != (pixels ? 3u : 0u) || stats->IAPrimitives != (pixels ? 1u : 0u) ||
+                    stats->CSInvocations || (pixels && !stats->PSInvocations)) {
+                fprintf(stderr, "FAIL query GPU results round%u: samples%llu expected%llu binary%llu IA%llu/%llu PS%llu timestamp%llu/%llu\n",
+                        round, (unsigned long long)values[8], (unsigned long long)pixels, (unsigned long long)values[10],
+                        (unsigned long long)stats->IAVertices, (unsigned long long)stats->IAPrimitives,
+                        (unsigned long long)stats->PSInvocations, (unsigned long long)values[32], (unsigned long long)values[33]);
+                exit(1);
+            }
+            for (i = 0; i < 4096; i++) {
+                if ((i >= 64 && i < 72) || (i >= 80 && i < 88) ||
+                        (i >= 128 && i < 128 + sizeof(*stats)) || (i >= 256 && i < 272)) continue;
+                if (((const unsigned char *)mapped)[i] != 0xa5) {
+                    fprintf(stderr, "FAIL query resolve overwrote sentinel byte%u\n", i); exit(1);
+                }
+            }
+        }
+        CHECK(vkdu_buffer_unmap(query_readback, 0, 0));
+        printf("PASS actual query round%u occlusion, binary, pipeline statistics, timestamps and resolve sentinels\n", round);
         printf("PASS actual graphics round%u rebuilt VS/PS, draw/index/zero count/scissor/varyings:1024 checked words\n", round);
     }
     vkdu_object_destroy(command); vkdu_object_destroy(allocator); vkdu_object_destroy(queue); vkdu_object_destroy(fence);
+    vkdu_object_destroy(query_readback); vkdu_object_destroy(occlusion);
+    vkdu_object_destroy(timestamp); vkdu_object_destroy(statistics);
     vkdu_object_destroy(indices); vkdu_object_destroy(readback); vkdu_object_destroy(wrong_heap);
     vkdu_object_destroy(heap); vkdu_object_destroy(target); vkdu_object_destroy(gradient); vkdu_object_destroy(pipeline); vkdu_object_destroy(root);
 }

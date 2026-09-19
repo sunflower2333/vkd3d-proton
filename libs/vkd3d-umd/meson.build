@@ -57,4 +57,10 @@ if get_option('enable_umd_bridge_tests')
   umd_graphics_negative = executable('vkd3d-umd-graphics-negative', 'backend.c', 'debug_policy.c', 'backend_test.c',
     c_args : ['-DVKDU_ENABLE_TEST_DEVICE', '-DVKDU_TEST_GRAPHICS_DROP_SCISSOR'],
     dependencies : vkd3d_dep, include_directories : vkd3d_private_includes)
+  umd_query_resolve_negative = executable('vkd3d-umd-query-resolve-negative', 'backend.c', 'debug_policy.c', 'backend_test.c',
+    c_args : ['-DVKDU_ENABLE_TEST_DEVICE', '-DVKDU_TEST_QUERY_DROP_RESOLVE'],
+    dependencies : vkd3d_dep, include_directories : vkd3d_private_includes)
+  umd_query_owner_negative = executable('vkd3d-umd-query-owner-negative', 'backend.c', 'debug_policy.c', 'backend_test.c',
+    c_args : ['-DVKDU_ENABLE_TEST_DEVICE', '-DVKDU_TEST_QUERY_DROP_OWNER'],
+    dependencies : vkd3d_dep, include_directories : vkd3d_private_includes)
 endif

@@ -2,7 +2,7 @@ param([Parameter(Mandatory)][string]$Executable)
 $ErrorActionPreference = 'Stop'
 $exe = (Resolve-Path -LiteralPath $Executable).Path
 $directory = Split-Path -Parent $exe
-foreach ($scenario in @('lifecycle', 'deferred-negative', 'command-owner-negative', 'uav-global-negative', 'queue-owner-negative', 'completion-negative', 'indirect-count-negative', 'fence-owner-negative', 'fence-mask-negative', 'residency-pending-negative', 'residency-evict-negative')) {
+foreach ($scenario in @('lifecycle', 'deferred-negative', 'command-owner-negative', 'uav-global-negative', 'queue-owner-negative', 'completion-negative', 'indirect-count-negative', 'fence-owner-negative', 'fence-mask-negative', 'residency-pending-negative', 'residency-evict-negative', 'query-order-negative')) {
     $negative = $scenario -ne 'lifecycle'
     $name = 'runtime-' + $scenario
     $stdout = Join-Path $directory ($name + '.stdout.txt')
@@ -18,6 +18,7 @@ foreach ($scenario in @('lifecycle', 'deferred-negative', 'command-owner-negativ
     if ($scenario -eq 'fence-mask-negative') { $start.ArgumentList = '--negative-control-native-fence-mask' }
     if ($scenario -eq 'residency-pending-negative') { $start.ArgumentList = '--negative-control-native-residency-pending' }
     if ($scenario -eq 'residency-evict-negative') { $start.ArgumentList = '--negative-control-native-residency-evict' }
+    if ($scenario -eq 'query-order-negative') { $start.ArgumentList = '--negative-control-query-field-order' }
     $process = Start-Process @start
     $null = $process.Handle
     if (!$process.WaitForExit(90000)) {
@@ -45,6 +46,8 @@ foreach ($scenario in @('lifecycle', 'deferred-negative', 'command-owner-negativ
             'FAIL native residency lost accepted pending paging fence'
         } elseif ($scenario -eq 'residency-evict-negative') {
             'FAIL native residency omitted runtime eviction'
+        } elseif ($scenario -eq 'query-order-negative') {
+            'FAIL native query CORE_0003 field order'
         } else { 'FAIL native command error escaped its runtime command-list owner' }
         if ($process.ExitCode -ne 1 -or $errors -notmatch $expected) {
             throw "$scenario negative control did not fail semantically: exit=$($process.ExitCode) $errors"
@@ -65,6 +68,7 @@ foreach ($scenario in @('lifecycle', 'deferred-negative', 'command-owner-negativ
                 $output -notmatch 'PASS native heap residency identity, pending paging fences, atomic validation, callback retirement and cleanup retention' -or
                 $output -notmatch 'PASS native descriptor/query backing residency, deduplication, host-only proof, runtime eviction policy and retained object retirement' -or
                 $output -notmatch 'PASS native query constructor reset and pageable enumeration device retirement without stale runtime access' -or
+                $output -notmatch 'PASS native query execution CORE_0003 ABI, owned handles, freed caller slots, reset and retirement' -or
                 $output -notmatch 'PASS native command-list runtime error ownership, device-loss forwarding, rejected creation and reentrant retirement') {
             throw "Runtime lifecycle fixture failed: exit=$($process.ExitCode) $errors"
         }

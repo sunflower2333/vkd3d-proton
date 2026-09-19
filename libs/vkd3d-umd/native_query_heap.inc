@@ -42,3 +42,52 @@ void APIENTRY native_query_destroy(D3D12DDI_HDEVICE device, D3D12DDI_HQUERYHEAP 
     { NativeBackendCall call(op.ctx); vkdu_object_destroy(value); }
     release(op.ctx);
 }
+
+void native_query_command(D3D12DDI_HCOMMANDLIST h, D3D12DDI_HQUERYHEAP heap,
+        D3D12DDI_QUERY_TYPE type, UINT first, UINT count, D3D12DDI_HRESOURCE destination,
+        UINT64 offset, int operation) {
+    NativeGraphicsCommand command(h);
+    if (!command.value) { command.report(E_INVALIDARG); return; }
+    auto *ctx = command.op.ctx;
+    HRESULT hr = ctx->native_adapter ? native_heap_generation(ctx) : S_OK;
+    vkdu_object *query = nullptr, *buffer = nullptr;
+    if (SUCCEEDED(hr)) {
+        AcquireSRWLockShared(&ctx->resources_lock);
+        // Opaque slots are compared before dereference, including foreign/stale handles.
+        auto *entry = native_submission_find(ctx->query_heaps, heap.pDrvPrivate);
+        auto *resource = operation == 2 ? find_buffer(ctx, destination.pDrvPrivate) : nullptr;
+        if (!entry || (operation == 2 && !resource)) hr = E_INVALIDARG;
+        else {
+            if (vkdu_object_retain(entry->backend)) query = entry->backend;
+            if (resource && vkdu_object_retain(resource->backend)) buffer = resource->backend;
+            if (!query || (resource && !buffer)) hr = E_OUTOFMEMORY;
+        }
+        ReleaseSRWLockShared(&ctx->resources_lock);
+    }
+    {
+        NativeBackendCall call(ctx);
+        if (SUCCEEDED(hr))
+            hr = operation == 2 ? vkdu_command_query_resolve(command.value, query, type, first, count, buffer, offset) :
+                vkdu_command_query(command.value, query, type, first, operation == 0);
+        vkdu_object_destroy(buffer); vkdu_object_destroy(query);
+    }
+    if (SUCCEEDED(hr) && ctx->native_adapter) hr = native_heap_generation(ctx);
+    command.report(hr);
+}
+void APIENTRY native_begin_query(D3D12DDI_HCOMMANDLIST command, D3D12DDI_HQUERYHEAP heap,
+        D3D12DDI_QUERY_TYPE type, UINT index) {
+    native_query_command(command, heap, type, index, 0, {}, 0, 0);
+}
+void APIENTRY native_end_query(D3D12DDI_HCOMMANDLIST command, D3D12DDI_HQUERYHEAP heap,
+        D3D12DDI_QUERY_TYPE type, UINT index) {
+    native_query_command(command, heap, type, index, 0, {}, 0, 1);
+}
+void APIENTRY native_resolve_query(D3D12DDI_HCOMMANDLIST command, D3D12DDI_HQUERYHEAP heap,
+        D3D12DDI_QUERY_TYPE type, UINT first, UINT count, D3D12DDI_HRESOURCE destination, UINT64 offset) {
+    native_query_command(command, heap, type, first, count, destination, offset, 2);
+}
+void native_query_tables(D3D12DDI_COMMAND_LIST_FUNCS_3D_0003 *commands) {
+    commands->pfnBeginQuery = native_begin_query;
+    commands->pfnEndQuery = native_end_query;
+    commands->pfnResolveQueryData = native_resolve_query;
+}

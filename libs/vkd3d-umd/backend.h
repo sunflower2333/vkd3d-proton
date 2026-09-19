@@ -88,6 +88,8 @@ int32_t vkdu_buffer_place(vkdu_device *device, vkdu_object *heap, uint64_t offse
 /* Test-only entrypoint is absent from the production bridge. CPU Vulkan only. */
 #ifdef VKDU_ENABLE_TEST_DEVICE
 int32_t vkdu_test_device_create(PFN_vkGetInstanceProcAddr loader, vkdu_device **out);
+int32_t vkdu_test_destroy_counter(vkdu_object *object, uint32_t *counter);
+uint32_t vkdu_test_counter_load(uint32_t *counter);
 #endif
 void vkdu_device_destroy(vkdu_device *device);
 int32_t vkdu_device_status(vkdu_device *device);
@@ -124,6 +126,9 @@ int32_t vkdu_command_texture_upload(vkdu_object *command, vkdu_object *texture,
 int32_t vkdu_sampler_create(vkdu_object *heap, uint32_t index, const struct vkdu_sampler_desc *desc);
 int32_t vkdu_heap_create(vkdu_device *device, uint32_t type, uint32_t count, int shader_visible, vkdu_object **out);
 int32_t vkdu_query_heap_create(vkdu_device *device, uint32_t type, uint32_t count, vkdu_object **out);
+int32_t vkdu_command_query(vkdu_object *command, vkdu_object *heap, uint32_t type, uint32_t index, int begin);
+int32_t vkdu_command_query_resolve(vkdu_object *command, vkdu_object *heap, uint32_t type,
+        uint32_t first, uint32_t count, vkdu_object *destination, uint64_t offset);
 int32_t vkdu_pageable_backing(vkdu_object *object, uint32_t *count, struct mwd_allocation *allocations);
 uint32_t vkdu_descriptor_size(vkdu_device *device, uint32_t type);
 uint64_t vkdu_heap_start(vkdu_object *heap, int gpu);

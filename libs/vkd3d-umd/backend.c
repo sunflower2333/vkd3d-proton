@@ -13,6 +13,7 @@
 
 struct vkdu_device { ID3D12Device *object; };
 struct vkdu_root_slot { uint32_t type, extent, heap_type, unbounded; };
+struct vkdu_query_scope { IUnknown *heap; uint32_t type, index; };
 struct vkdu_object {
     uint32_t references;
     IUnknown *object;
@@ -30,6 +31,8 @@ struct vkdu_object {
     uint32_t width, height, format;
     int texture_heap;
     uint32_t graphics_root, graphics_pipeline, topology, viewport_count, scissor_count, render_target, index_count;
+    uint32_t query_type, query_count, query_scope_count, query_scope_capacity;
+    struct vkdu_query_scope *query_scopes;
 };
 
 #define OBJ(type, o) ((type *)(o)->object)
@@ -133,6 +136,22 @@ int32_t vkdu_device_create_shared(PFN_vkGetInstanceProcAddr loader, const uint8_
 #ifdef VKDU_ENABLE_TEST_DEVICE
 int32_t vkdu_test_device_create(PFN_vkGetInstanceProcAddr loader, vkdu_device **out)
 { return create_device(loader, NULL, 1, 0, NULL, out); }
+static void __stdcall test_destroyed(void *counter)
+{ vkd3d_atomic_uint32_increment((uint32_t *)counter, vkd3d_memory_order_release); }
+int32_t vkdu_test_destroy_counter(vkdu_object *object, uint32_t *counter)
+{
+    ID3DDestructionNotifier *notifier = NULL;
+    UINT id;
+    HRESULT hr;
+    if (!object || !counter) return E_INVALIDARG;
+    hr = IUnknown_QueryInterface(object->object, &IID_ID3DDestructionNotifier, (void **)&notifier);
+    if (FAILED(hr)) return hr;
+    hr = ID3DDestructionNotifier_RegisterDestructionCallback(notifier, test_destroyed, counter, &id);
+    ID3DDestructionNotifier_Release(notifier);
+    return hr;
+}
+uint32_t vkdu_test_counter_load(uint32_t *counter)
+{ return vkd3d_atomic_uint32_load_explicit(counter, vkd3d_memory_order_acquire); }
 #endif
 void vkdu_device_destroy(vkdu_device *device)
 { if (device) { ID3D12Device_Release(device->object); free(device); } }
@@ -158,7 +177,8 @@ int vkdu_object_retain(vkdu_object *object)
 void vkdu_object_destroy(vkdu_object *object)
 {
     if (object && !vkd3d_atomic_uint32_decrement(&object->references, vkd3d_memory_order_acq_rel)) {
-        IUnknown_Release(object->object); ID3D12Device_Release(object->owner); free(object);
+        IUnknown_Release(object->object); ID3D12Device_Release(object->owner);
+        free(object->query_scopes); free(object);
     }
 }
 int vkdu_object_is(vkdu_object *object, enum vkdu_kind kind) { return VALID(object, kind); }
@@ -290,7 +310,9 @@ int32_t vkdu_query_heap_create(vkdu_device *device, uint32_t type, uint32_t coun
     if (!device || !count || type > D3D12_QUERY_HEAP_TYPE_SO_STATISTICS) return E_INVALIDARG;
     desc.Type = type; desc.Count = count; desc.NodeMask = 1;
     hr = ID3D12Device_CreateQueryHeap(device->object, &desc, &IID_ID3D12QueryHeap, (void **)&heap);
-    return wrap(device, VKDU_QUERY_HEAP, hr, (IUnknown *)heap, out);
+    hr = wrap(device, VKDU_QUERY_HEAP, hr, (IUnknown *)heap, out);
+    if (SUCCEEDED(hr)) { (*out)->query_type = type; (*out)->query_count = count; }
+    return hr;
 }
 int32_t vkdu_pageable_backing(vkdu_object *object, uint32_t *count, struct mwd_allocation *allocations)
 {
@@ -561,7 +583,7 @@ int32_t vkdu_command_create(vkdu_device *device, vkdu_object *allocator, uint32_
 int32_t vkdu_command_close(vkdu_object *command)
 {
     HRESULT hr;
-    if (!RECORDING(command)) return E_INVALIDARG;
+    if (!RECORDING(command) || command->query_scope_count) return E_INVALIDARG;
     hr = ID3D12GraphicsCommandList_Close(OBJ(ID3D12GraphicsCommandList, command));
     if (SUCCEEDED(hr)) command->closed = 1;
     return hr;
@@ -577,9 +599,12 @@ int32_t vkdu_command_reset(vkdu_object *command, vkdu_object *allocator)
         memset(command->bound_heaps, 0, sizeof(command->bound_heaps));
         command->graphics_root = command->graphics_pipeline = command->topology = 0;
         command->viewport_count = command->scissor_count = command->render_target = command->index_count = 0;
+        command->query_scope_count = 0;
     }
     return hr;
 }
+#include "backend_queries.inc"
+
 int32_t vkdu_command_copy(vkdu_object *command, vkdu_object *dst, uint64_t dst_offset, vkdu_object *src, uint64_t src_offset, uint64_t bytes)
 {
     if (!RECORDING(command) || !VALID(dst, VKDU_BUFFER) || !VALID(src, VKDU_BUFFER) ||

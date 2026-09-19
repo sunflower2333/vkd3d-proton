@@ -34,6 +34,13 @@ static bool force_drop_global_barrier;
 static bool force_drop_indirect_count;
 static unsigned signature_creates, indirect_calls;
 static unsigned query_peers;
+static unsigned query_execution_calls;
+static uint32_t recorded_query_type, recorded_query_first, recorded_query_count;
+static uint64_t recorded_query_offset;
+static int recorded_query_operation;
+static HRESULT query_execution_result = S_OK;
+static std::function<void()> query_execution_callback;
+static bool force_query_swap_fields;
 static uint32_t recorded_indirect_stride, recorded_indirect_maximum;
 static uint64_t recorded_argument_offset, recorded_count_offset;
 static vkdu_object *recorded_arguments, *recorded_count, *recorded_signature;
@@ -162,6 +169,8 @@ static int32_t test_queue_bind(vkdu_object *, void *, void *);
 static int32_t test_queue_execute(vkdu_object *, uint32_t, vkdu_object *const *);
 static int32_t test_signature_create(vkdu_device *, uint32_t, vkdu_object **);
 static int32_t test_query_heap_create(vkdu_device *, uint32_t, uint32_t, vkdu_object **);
+static int32_t test_query_execution(vkdu_object *, vkdu_object *, uint32_t, uint32_t, int);
+static int32_t test_query_resolve(vkdu_object *, vkdu_object *, uint32_t, uint32_t, uint32_t, vkdu_object *, uint64_t);
 static int32_t test_pageable_backing(vkdu_object *, uint32_t *, mwd_allocation *);
 static int32_t test_execute_indirect(vkdu_object *, vkdu_object *, uint32_t, vkdu_object *, uint64_t, vkdu_object *, uint64_t);
 static DWORD WINAPI test_event_wait(HANDLE event, DWORD timeout) {
@@ -199,6 +208,8 @@ static DWORD WINAPI test_event_wait(HANDLE event, DWORD timeout) {
 #define vkdu_queue_execute test_queue_execute
 #define vkdu_dispatch_signature_create test_signature_create
 #define vkdu_query_heap_create test_query_heap_create
+#define vkdu_command_query test_query_execution
+#define vkdu_command_query_resolve test_query_resolve
 #define vkdu_pageable_backing test_pageable_backing
 #define vkdu_command_execute_indirect test_execute_indirect
 #define WaitForSingleObject test_event_wait
@@ -372,6 +383,30 @@ static int32_t test_query_heap_create(vkdu_device *device, uint32_t type, uint32
     ++query_peers;
     if (query_create_callback) query_create_callback();
     return S_OK;
+}
+static int32_t test_query_record(vkdu_object *command, vkdu_object *heap, uint32_t type,
+        uint32_t first, uint32_t count, vkdu_object *destination, uint64_t offset, int operation) {
+    ++query_execution_calls;
+    if (!test_object_is(command, VKDU_COMMAND_LIST) || !test_object_is(heap, VKDU_QUERY_HEAP) ||
+            (destination && !test_object_is(destination, VKDU_BUFFER))) fixture_abort(__LINE__);
+    for (auto *owner : {command, heap, destination})
+        if (owner && reinterpret_cast<ImportPeer *>(owner)->references < 2) fixture_abort(__LINE__);
+    auto *device = reinterpret_cast<TestDevice *>(reinterpret_cast<ImportPeer *>(command)->device);
+    wait_backend_worker(device->callbacks, device->owner);
+    recorded_query_type = force_query_swap_fields ? first : type;
+    recorded_query_first = force_query_swap_fields ? type : first;
+    recorded_query_count = count; recorded_query_offset = offset; recorded_query_operation = operation;
+    if (query_execution_callback) query_execution_callback();
+    for (auto *owner : {command, heap, destination})
+        if (owner && !reinterpret_cast<ImportPeer *>(owner)->references) fixture_abort(__LINE__);
+    return query_execution_result;
+}
+static int32_t test_query_execution(vkdu_object *command, vkdu_object *heap, uint32_t type, uint32_t index, int begin) {
+    return test_query_record(command, heap, type, index, 0, nullptr, 0, begin ? 0 : 1);
+}
+static int32_t test_query_resolve(vkdu_object *command, vkdu_object *heap, uint32_t type,
+        uint32_t first, uint32_t count, vkdu_object *destination, uint64_t offset) {
+    return test_query_record(command, heap, type, first, count, destination, offset, 2);
 }
 static int32_t test_pageable_backing(vkdu_object *object, uint32_t *count, mwd_allocation *out) {
     *count = 0;
@@ -1597,6 +1632,7 @@ static int test_native_completion() {
 #include "runtime_indirect_test.inc"
 #include "runtime_fences_test.inc"
 #include "runtime_residency_test.inc"
+#include "runtime_queries_test.inc"
 
 int main(int argc, char **argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -1610,6 +1646,7 @@ int main(int argc, char **argv) {
     else if (argc == 2 && !std::strcmp(argv[1], "--negative-control-native-fence-mask")) native_fence_drop_mask = true;
     else if (argc == 2 && !std::strcmp(argv[1], "--negative-control-native-residency-pending")) native_residency_drop_pending = true;
     else if (argc == 2 && !std::strcmp(argv[1], "--negative-control-native-residency-evict")) native_residency_skip_evict = true;
+    else if (argc == 2 && !std::strcmp(argv[1], "--negative-control-query-field-order")) force_query_swap_fields = true;
     else if (argc != 1) return 2;
     REQUIRE(test_finalization_borrow() == 0);
     REQUIRE(OpenAdapter12(nullptr) == E_INVALIDARG);
@@ -1718,6 +1755,7 @@ int main(int argc, char **argv) {
     REQUIRE(test_native_indirect() == 0);
     REQUIRE(test_native_fences() == 0);
     REQUIRE(test_native_residency() == 0);
+    REQUIRE(test_native_queries() == 0);
     std::printf("PASS native OpenAdapter12 WDK identity/negotiation/private memory/callback/lifetime/error cleanup (%zu-bit); no system-runtime or GPU acceptance\n", sizeof(void *) * 8);
     return 0;
 }

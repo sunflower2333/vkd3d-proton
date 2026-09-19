@@ -27,7 +27,7 @@ jobs:
           done
       - run: sudo apt-get update && sudo apt-get install -y meson ninja-build wine64-tools libwine-dev glslang-tools mesa-vulkan-drivers
       - run: meson setup build-umd --buildtype debugoptimized -Denable_umd_bridge=true -Denable_umd_bridge_tests=true
-      - run: meson compile -C build-umd -j 3 vkd3d-umd-backend-test vkd3d-umd-fence-test vkd3d-umd-fence-negative vkd3d-umd-sampler-negative vkd3d-umd-texture-negative vkd3d-umd-graphics-negative
+      - run: meson compile -C build-umd -j 3 vkd3d-umd-backend-test vkd3d-umd-fence-test vkd3d-umd-fence-negative vkd3d-umd-sampler-negative vkd3d-umd-texture-negative vkd3d-umd-graphics-negative vkd3d-umd-query-resolve-negative vkd3d-umd-query-owner-negative
       - name: Execute real backend on CPU Vulkan, never report GPU acceptance
         shell: bash
         run: |
@@ -40,6 +40,24 @@ jobs:
           export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json
           if [ ! -f "$VK_DRIVER_FILES" ]; then export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json; fi
           timeout 60 build-umd/libs/vkd3d-umd/vkd3d-umd-fence-test
+      - name: Reject omitted query GPU resolve and premature query ownership release
+        shell: bash
+        run: |
+          export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+          if [ ! -f "$VK_DRIVER_FILES" ]; then export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json; fi
+          for control in resolve owner; do
+            set +e
+            timeout 90 build-umd/libs/vkd3d-umd/vkd3d-umd-query-${control}-negative > query-${control}.txt 2>&1
+            result=$?
+            set -e
+            cat query-${control}.txt
+            test "$result" -eq 1
+            if [ "$control" = resolve ]; then
+              grep -F 'FAIL query GPU results round0' query-${control}.txt
+            else
+              grep -F 'FAIL query owners released before recording retirement' query-${control}.txt
+            fi
+          done
       - name: Reject a dropped real backend queue wait
         shell: bash
         run: |
