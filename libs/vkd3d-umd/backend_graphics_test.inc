@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "../../tests/shaders/render_target/headers/vs_flat_color.h"
 #include "../../tests/shaders/render_target/headers/ps_flat_color.h"
+#include "../../tests/shaders/render_target/headers/vs_gradient.h"
+#include "../../tests/shaders/render_target/headers/ps_gradient.h"
 static const uint32_t *graphics_tokens(const uint32_t *container)
 {
     uint32_t i;
@@ -12,7 +14,7 @@ static const uint32_t *graphics_tokens(const uint32_t *container)
 }
 static void check_graphics(vkdu_device *device, vkdu_device *other)
 {
-    vkdu_object *root = NULL, *pipeline = NULL, *target = NULL, *heap = NULL, *wrong_heap = NULL;
+    vkdu_object *root = NULL, *pipeline = NULL, *gradient = NULL, *target = NULL, *heap = NULL, *wrong_heap = NULL;
     vkdu_object *queue = NULL, *allocator = NULL, *command = NULL, *fence = NULL, *readback = NULL, *indices = NULL;
     /* Runtime signatures may be a superset of actual shader declarations. */
     const struct vkdu_signature vertex_input[] = {{6, 0, 1, 1}, {0, 3, 15, 3}};
@@ -35,6 +37,14 @@ static void check_graphics(vkdu_device *device, vkdu_device *other)
     CHECK(vkdu_root_create(device, NULL, 0, 0, &root));
     CHECK(vkdu_graphics_pipeline_create(device, root, vs, vs_size, ps, ps_size, &desc, &pipeline));
     vkdu_shader_dxbc_free(vs); vkdu_shader_dxbc_free(ps);
+    {
+        const struct vkdu_signature varying[] = {{1, 0, 15, 3}, {0, 1, 3, 3}, {0, 5, 15, 3}};
+        const uint32_t *vertex = graphics_tokens(vs_gradient_code_dxbc), *pixel = graphics_tokens(ps_gradient_code_dxbc);
+        CHECK(vkdu_shader_dxbc(1, vertex, vertex[1], vertex_input, 2, varying, 3, &vs, &vs_size));
+        CHECK(vkdu_shader_dxbc(0, pixel, pixel[1], varying, 3, &pixel_output, 1, &ps, &ps_size));
+        CHECK(vkdu_graphics_pipeline_create(device, root, vs, vs_size, ps, ps_size, &desc, &gradient));
+        vkdu_shader_dxbc_free(vs); vkdu_shader_dxbc_free(ps);
+    }
     CHECK(vkdu_render_target_create(device, 16, 12, &target));
     CHECK(vkdu_heap_create(device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 4, 0, &heap));
     CHECK(vkdu_heap_create(other, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 4, 0, &wrong_heap));
@@ -49,7 +59,7 @@ static void check_graphics(vkdu_device *device, vkdu_device *other)
     ((uint16_t *)mapped)[0] = ((uint16_t *)mapped)[1] = 99;
     ((uint16_t *)mapped)[2] = 0; ((uint16_t *)mapped)[3] = 1; ((uint16_t *)mapped)[4] = 2;
     CHECK(vkdu_buffer_unmap(indices, 0, 10));
-    for (round = 0; round < 4; ++round) {
+    for (round = 0; round < 5; ++round) {
         const uint32_t sentinel = 0x71710000u ^ round;
         const float clear[4] = {1, 0, 0, 1};
         const struct vkdu_viewport viewport = {0, 0, 16, 12, 0, 1};
@@ -65,7 +75,7 @@ static void check_graphics(vkdu_device *device, vkdu_device *other)
         CHECK(vkdu_buffer_unmap(readback, 0, 4096));
         REJECT(vkdu_command_draw(command, 3, 1, 0, 0)); /* Reset invalidates prior graphics state. */
         CHECK(vkdu_command_clear_rtv(command, heap, 2, clear, 0, NULL));
-        CHECK(vkdu_command_graphics_root(command, root)); CHECK(vkdu_command_pipeline(command, pipeline));
+        CHECK(vkdu_command_graphics_root(command, root)); CHECK(vkdu_command_pipeline(command, round == 4 ? gradient : pipeline));
         CHECK(vkdu_command_render_target(command, heap, 2));
         CHECK(vkdu_command_topology(command, 4)); CHECK(vkdu_command_viewports(command, 1, &viewport));
         CHECK(vkdu_command_scissors(command, 1, &scissor));
@@ -89,15 +99,31 @@ static void check_graphics(vkdu_device *device, vkdu_device *other)
                 const uint32_t x = (i - 128) % 64, y = (i - 128) / 64;
                 expected = round < 2 && x >= (uint32_t)scissor.left && x < (uint32_t)scissor.right &&
                     y >= (uint32_t)scissor.top && y < (uint32_t)scissor.bottom ? 0xffffffff : 0xff0000ff;
+                if (round == 4 && x >= (uint32_t)scissor.left && x < (uint32_t)scissor.right &&
+                        y >= (uint32_t)scissor.top && y < (uint32_t)scissor.bottom) {
+                    const float u = (x + 0.5f) / 16, v = 1 - (y + 0.5f) / 12;
+                    const float values[4] = {u, v, u + v, u * v};
+                    uint32_t channel;
+                    /* Account only for the permitted UNORM rounding variance;
+                     * coordinates, channel order and alpha are independently checked. */
+                    for (channel = 0; channel < 4; ++channel) {
+                        const int reference = (int)((values[channel] < 1 ? values[channel] : 1) * 255 + 0.5f);
+                        const int got = (((uint32_t *)mapped)[i] >> (channel * 8)) & 255;
+                        if (abs(got - reference) > 1) {
+                            fprintf(stderr, "graphics varying word%u channel%u=%u expected%u\n", i, channel, got, reference); exit(1);
+                        }
+                    }
+                    continue;
+                }
             }
             if (((uint32_t *)mapped)[i] != expected) {
                 fprintf(stderr, "graphics round%u word%u=%08x expected%08x\n", round, i, ((uint32_t *)mapped)[i], expected); exit(1);
             }
         }
         CHECK(vkdu_buffer_unmap(readback, 0, 0));
-        printf("PASS actual graphics round%u rebuilt VS/PS, draw/index/zero count/scissor:1024 checked words\n", round);
+        printf("PASS actual graphics round%u rebuilt VS/PS, draw/index/zero count/scissor/varyings:1024 checked words\n", round);
     }
     vkdu_object_destroy(command); vkdu_object_destroy(allocator); vkdu_object_destroy(queue); vkdu_object_destroy(fence);
     vkdu_object_destroy(indices); vkdu_object_destroy(readback); vkdu_object_destroy(wrong_heap);
-    vkdu_object_destroy(heap); vkdu_object_destroy(target); vkdu_object_destroy(pipeline); vkdu_object_destroy(root);
+    vkdu_object_destroy(heap); vkdu_object_destroy(target); vkdu_object_destroy(gradient); vkdu_object_destroy(pipeline); vkdu_object_destroy(root);
 }

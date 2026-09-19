@@ -34,8 +34,10 @@ References: local Microsoft `d3d12umddi.h`,
 
 ## Validation and boundaries
 
-Local CPU Vulkan execution passes four rounds x1024 checked words: direct draw,
-indexed draw with nonzero first index/base, zero instances, and zero indices.
+Local CPU Vulkan execution passes five rounds x1024 checked words: direct draw,
+indexed draw with nonzero first index/base, zero instances, zero indices and a
+VS-to-PS interpolated RGBA gradient. The gradient checks all four components
+with at most one UNORM quantization step of tolerance.
 Each verifies changing scissor pixels over a red clear plus readback padding and
 sentinels. The shaders are reconstructed through the production helper, including
 unused runtime signature entries. A separately compiled scissor-drop mutation
