@@ -257,6 +257,47 @@ HRESULT native_heap_reserve(Context *ctx, NativeHeap *heap, uint64_t requested =
     return S_OK;
 }
 
+void APIENTRY native_allocation_info(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATERESOURCE_0003 *resource,
+        D3D12DDI_RESOURCE_OPTIMIZATION_FLAGS flags, UINT64 restriction, UINT visible,
+        D3D12DDI_RESOURCE_ALLOCATION_INFO *out) {
+    NativeHeapOperation op(context(h));
+    if (!op.live()) { error(op.ctx, DXGI_ERROR_DEVICE_REMOVED); return; }
+    if (!resource || !out || visible != 1 || (restriction && restriction != native_heap_alignment)) {
+        error(op.ctx, E_INVALIDARG); return;
+    }
+    auto request = *resource;
+    const bool texture = request.ResourceType == D3D12DDI_RT_TEXTURE2D;
+    const UINT allowed = D3D12DDI_RESOURCE_OPTIMIZATION_FLAG_SHADER_RESOURCE |
+        D3D12DDI_RESOURCE_OPTIMIZATION_FLAG_DETERMINISTIC |
+        (texture ? 0u : static_cast<UINT>(D3D12DDI_RESOURCE_OPTIMIZATION_FLAG_UNORDERED_ACCESS));
+    if (static_cast<UINT>(flags) & ~allowed) { error(op.ctx, DXGI_ERROR_UNSUPPORTED); return; }
+    // Validate the same resource subset as creation, independently of its
+    // initial state. This description is only a validation bound, not a heap.
+    D3D12DDIARG_CREATEHEAP_0001 bound{};
+    bound.ByteSize = UINT32_MAX & ~(native_heap_alignment - 1); bound.Alignment = native_heap_alignment;
+    bound.MemoryPool = D3D12DDI_MEMORY_POOL_L0; bound.CPUPageProperty = D3D12DDI_CPU_PAGE_PROPERTY_NOT_AVAILABLE;
+    bound.Flags = texture ? D3D12DDI_HEAP_FLAG_NON_RT_DS_TEXTURES : D3D12DDI_HEAP_FLAG_BUFFERS;
+    bound.CreationNodeMask = bound.VisibleNodeMask = 1;
+    request.InitialResourceState = D3D12DDI_RESOURCE_STATE_COMMON;
+    HRESULT hr = native_heap_desc(&bound, &request);
+    if (FAILED(hr)) { error(op.ctx, hr); return; }
+    D3D12DDI_RESOURCE_ALLOCATION_INFO result{};
+    {
+        NativeBackendCall call(op.ctx);
+        hr = texture ? vkdu_texture2d_allocation(op.ctx->backend, static_cast<UINT>(request.Width), request.Height,
+                request.Format, &result.ResourceDataSize, &result.ResourceDataAlignment) :
+            vkdu_buffer_allocation(op.ctx->backend, request.Width, &result.ResourceDataSize, &result.ResourceDataAlignment);
+    }
+    if (!op.live()) hr = DXGI_ERROR_DEVICE_REMOVED;
+    if (SUCCEEDED(hr) && (!result.ResourceDataSize || result.ResourceDataSize > bound.ByteSize ||
+            result.ResourceDataAlignment != native_heap_alignment || result.ResourceDataSize % native_heap_alignment)) hr = E_INVALIDARG;
+    if (FAILED(hr)) { error(op.ctx, hr); return; }
+    result.Layout = texture ? D3D12DDI_TL_DEVICE_DEPENDENT_SWIZZLE_0 : D3D12DDI_TL_ROW_MAJOR;
+    // Publish once, after any backend callback, without touching retired caller
+    // storage. Auxiliary metadata is part of the opaque image's allocation.
+    *out = result;
+}
+
 D3D12DDI_HEAP_AND_RESOURCE_SIZES APIENTRY native_heap_sizes(D3D12DDI_HDEVICE h,
         const D3D12DDIARG_CREATEHEAP_0001 *heap, const D3D12DDIARG_CREATERESOURCE_0003 *resource) {
     NativeHeapOperation op(context(h));
@@ -483,6 +524,7 @@ void native_heap_forget(Context *ctx) {
 }
 
 void native_heap_tables(D3D12DDI_DEVICE_FUNCS_CORE_0003 *table) {
+    table->pfnCheckResourceAllocationInfo = native_allocation_info;
     table->pfnCalcPrivateHeapAndResourceSizes = native_heap_sizes;
     table->pfnCreateHeapAndResource = native_heap_create;
     table->pfnDestroyHeapAndResource = native_heap_destroy;

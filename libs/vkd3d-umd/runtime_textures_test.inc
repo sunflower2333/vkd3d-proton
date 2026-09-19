@@ -16,6 +16,40 @@ static int test_native_textures(Context *ctx, D3D12DDI_HDEVICE device,
     for (auto format : {DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM}) {
         desc.Format = format; storage.fill(0xa5); resource.fill(0xa5);
         const unsigned before = allocations;
+        REQUIRE(table.pfnCheckResourceAllocationInfo);
+        D3D12DDI_RESOURCE_ALLOCATION_INFO info;
+        std::memset(&info, 0xa5, sizeof(info));
+        const auto original = info;
+        const auto query_desc = desc;
+        const unsigned before_queries = allocation_queries;
+        texture_allocation_callback = [&]() { std::memset(&desc, 0xcc, sizeof(desc)); };
+        table.pfnCheckResourceAllocationInfo(device, &desc, D3D12DDI_RESOURCE_OPTIMIZATION_FLAG_SHADER_RESOURCE,
+                65536, 1, &info);
+        texture_allocation_callback = {}; desc = query_desc;
+        REQUIRE(info.ResourceDataSize == 65536 && info.ResourceDataAlignment == 65536 &&
+                info.Layout == D3D12DDI_TL_DEVICE_DEPENDENT_SWIZZLE_0 && !info.AdditionalDataSize &&
+                !info.AdditionalDataHeaderSize && allocations == before && allocation_queries == before_queries + 1);
+        const auto valid_info = info;
+        auto rejected_query = [&](UINT64 restriction, UINT visible, D3D12DDI_RESOURCE_OPTIMIZATION_FLAGS flags) {
+            info = original;
+            table.pfnCheckResourceAllocationInfo(device, &desc, flags, restriction, visible, &info);
+            return !std::memcmp(&info, &original, sizeof(info));
+        };
+        REQUIRE(rejected_query(4096, 1, D3D12DDI_RESOURCE_OPTIMIZATION_FLAG_NONE));
+        REQUIRE(rejected_query(65536, 2, D3D12DDI_RESOURCE_OPTIMIZATION_FLAG_NONE));
+        REQUIRE(rejected_query(65536, 1, D3D12DDI_RESOURCE_OPTIMIZATION_FLAG_PRIMARY));
+        REQUIRE(allocation_queries == before_queries + 1);
+        allocation_query_result = E_OUTOFMEMORY;
+        REQUIRE(rejected_query(65536, 1, D3D12DDI_RESOURCE_OPTIMIZATION_FLAG_NONE)); allocation_query_result = S_OK;
+        texture_allocation_callback = [&]() { ctx->native_retiring = true; };
+        REQUIRE(rejected_query(65536, 1, D3D12DDI_RESOURCE_OPTIMIZATION_FLAG_NONE));
+        texture_allocation_callback = {}; ctx->native_retiring = false;
+        info = valid_info;
+        auto buffer_desc = desc; buffer_desc.ResourceType = D3D12DDI_RT_BUFFER; buffer_desc.Width = 65537;
+        buffer_desc.Height = 1; buffer_desc.Format = DXGI_FORMAT_UNKNOWN; buffer_desc.Layout = D3D12DDI_TL_ROW_MAJOR;
+        table.pfnCheckResourceAllocationInfo(device, &buffer_desc, D3D12DDI_RESOURCE_OPTIMIZATION_FLAG_NONE, 0, 1, &info);
+        REQUIRE(info.ResourceDataSize == 131072 && info.ResourceDataAlignment == 65536 && info.Layout == D3D12DDI_TL_ROW_MAJOR &&
+                allocations == before);
         heap.CPUPageProperty = D3D12DDI_CPU_PAGE_PROPERTY_WRITE_BACK;
         REQUIRE(create() == DXGI_ERROR_UNSUPPORTED && allocations == before);
         heap.CPUPageProperty = D3D12DDI_CPU_PAGE_PROPERTY_NOT_AVAILABLE;
@@ -54,5 +88,6 @@ static int test_native_textures(Context *ctx, D3D12DDI_HDEVICE device,
         REQUIRE(!ctx->native_heaps && kernel_heaps.empty());
     }
     puts("PASS native texture heap allocation/import, request poisoning, format ownership, alias lifetime and failure cleanup");
+    puts("PASS native allocation-info query, backend requirements, no allocation, rejected-output preservation and retirement");
     return 0;
 }

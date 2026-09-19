@@ -3,6 +3,11 @@ static void check_texture_copies(vkdu_device *device, vkdu_device *other)
 {
     uint32_t format_index;
     const uint32_t formats[] = {DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM};
+    uint64_t bytes, alignment;
+    CHECK(vkdu_buffer_allocation(device, 65537, &bytes, &alignment));
+    if (bytes != 131072 || alignment != 65536) exit(1);
+    REJECT(vkdu_buffer_allocation(device, UINT64_MAX, &bytes, &alignment));
+    REJECT(vkdu_buffer_allocation(device, 0, &bytes, &alignment));
     for (format_index = 0; format_index < 2; ++format_index) {
         vkdu_object *texture = NULL, *second = NULL, *foreign = NULL, *upload = NULL, *readback = NULL;
         vkdu_object *queue = NULL, *allocator = NULL, *command = NULL, *fence = NULL;

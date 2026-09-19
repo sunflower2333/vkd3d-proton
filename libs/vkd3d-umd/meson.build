@@ -11,6 +11,8 @@ if vkd3d_platform == 'windows'
     include_directories : vkd3d_private_includes,
     cpp_args : ['-DNOMINMAX'])
   if get_option('enable_umd_bridge_tests')
+    # Deliberately no backend dependency: this is an ordinary system D3D12 app.
+    umd_system_probe = executable('vkd3d-system-d3d12-probe', 'system_d3d12_probe.cpp', cpp_args : ['-DNOMINMAX'])
     umd_runtime_test = executable('vkd3d-umd-runtime-test', 'runtime_test.cpp',
       dependencies : [umd_backend_dep, lib_gdi32, lib_dxgi],
       include_directories : vkd3d_private_includes, cpp_args : ['-DNOMINMAX'])

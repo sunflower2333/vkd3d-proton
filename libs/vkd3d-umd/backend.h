@@ -68,6 +68,7 @@ int vkdu_object_is(vkdu_object *object, enum vkdu_kind kind);
 int vkdu_same_device(vkdu_object *a, vkdu_object *b);
 int vkdu_object_belongs(vkdu_device *device, vkdu_object *object);
 int32_t vkdu_buffer_create(vkdu_device *device, uint64_t bytes, uint32_t heap_type, uint32_t flags, uint32_t state, vkdu_object **out);
+int32_t vkdu_buffer_allocation(vkdu_device *device, uint64_t width, uint64_t *bytes, uint64_t *alignment);
 int32_t vkdu_buffer_map(vkdu_object *buffer, uint64_t begin, uint64_t end, void **out);
 int32_t vkdu_buffer_unmap(vkdu_object *buffer, uint64_t begin, uint64_t end);
 uint64_t vkdu_buffer_address(vkdu_object *buffer);

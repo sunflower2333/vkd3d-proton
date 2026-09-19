@@ -1,5 +1,23 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 uint32_t vkdu_texture2d_format(vkdu_object *texture) { return VALID(texture, VKDU_TEXTURE2D) ? texture->format : 0; }
+int32_t vkdu_buffer_allocation(vkdu_device *device, uint64_t width, uint64_t *bytes, uint64_t *alignment)
+{
+    D3D12_RESOURCE_DESC desc = {0};
+    D3D12_RESOURCE_ALLOCATION_INFO info;
+    if (!bytes || !alignment) return E_POINTER;
+    *bytes = *alignment = 0;
+    if (!device || !width || width > UINT32_MAX) return E_INVALIDARG;
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; desc.Width = width;
+    desc.Height = desc.DepthOrArraySize = desc.MipLevels = desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    desc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    info = ID3D12Device_GetResourceAllocationInfo(device->object, 0, 1, &desc);
+    if (!info.SizeInBytes || info.SizeInBytes == UINT64_MAX || info.Alignment != 65536 ||
+            info.SizeInBytes % info.Alignment) return E_INVALIDARG;
+    *bytes = info.SizeInBytes; *alignment = info.Alignment;
+    return S_OK;
+}
 static int32_t vkdu_texture_desc(uint32_t width, uint32_t height, uint32_t format, D3D12_RESOURCE_DESC *desc)
 {
     if (!width || !height || width > 16384 || height > 16384 ||

@@ -134,6 +134,7 @@ static void APIENTRY test_command_error(D3D12DDI_HRTCOMMANDLIST runtime, HRESULT
 static int32_t test_import_heap(vkdu_device *, void *, void *, uint64_t, int, vkdu_object **);
 static int32_t test_place_buffer(vkdu_device *, vkdu_object *, uint64_t, uint64_t, uint32_t, vkdu_object **);
 static int32_t test_texture_allocation(vkdu_device *, uint32_t, uint32_t, uint32_t, uint64_t *, uint64_t *);
+static int32_t test_buffer_allocation(vkdu_device *, uint64_t, uint64_t *, uint64_t *);
 static int32_t test_texture_import(vkdu_device *, void *, void *, uint64_t, vkdu_object **);
 static int32_t test_texture_place(vkdu_device *, vkdu_object *, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, vkdu_object **);
 static void test_object_destroy(vkdu_object *);
@@ -163,6 +164,7 @@ static DWORD WINAPI test_event_wait(HANDLE event, DWORD timeout) {
 #define vkdu_memory_heap_import test_import_heap
 #define vkdu_buffer_place test_place_buffer
 #define vkdu_texture2d_allocation test_texture_allocation
+#define vkdu_buffer_allocation test_buffer_allocation
 #define vkdu_texture_heap_import test_texture_import
 #define vkdu_texture2d_place test_texture_place
 #define vkdu_object_destroy test_object_destroy
@@ -199,15 +201,24 @@ struct ImportPeer {
     uint32_t width = 0, height = 0, format = 0;
 };
 static std::function<void()> texture_allocation_callback;
+static unsigned allocation_queries;
+static HRESULT allocation_query_result = S_OK;
 static uint64_t texture_required_bytes = 65536;
+static int32_t test_buffer_allocation(vkdu_device *device, uint64_t width, uint64_t *bytes, uint64_t *alignment) {
+    auto *peer = reinterpret_cast<TestDevice *>(device);
+    ++allocation_queries; wait_backend_worker(peer->callbacks, peer->owner);
+    *bytes = (width + 65535) & ~uint64_t(65535); *alignment = 65536;
+    if (texture_allocation_callback) texture_allocation_callback();
+    return allocation_query_result;
+}
 static int32_t test_texture_allocation(vkdu_device *device, uint32_t width, uint32_t height,
         uint32_t format, uint64_t *bytes, uint64_t *alignment) {
     auto *peer = reinterpret_cast<TestDevice *>(device);
-    wait_backend_worker(peer->callbacks, peer->owner);
+    ++allocation_queries; wait_backend_worker(peer->callbacks, peer->owner);
     if (!width || !height || (format != 28 && format != 41)) fixture_abort(__LINE__);
     *bytes = texture_required_bytes; *alignment = 65536;
     if (texture_allocation_callback) texture_allocation_callback();
-    return S_OK;
+    return allocation_query_result;
 }
 static int32_t test_texture_import(vkdu_device *device, void *owner, void *token, uint64_t bytes, vkdu_object **out) {
     return test_import_heap(device, owner, token, bytes, 0, out);

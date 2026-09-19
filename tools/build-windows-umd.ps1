@@ -24,7 +24,7 @@ $crossArgs = @()
 if ($Architecture -eq 'arm64') { $crossArgs = @('--cross-file', 'tools/umd-arm64-msvc.ini') }
 meson setup $buildDir @crossArgs --buildtype release -Ddebug=true -Denable_umd_bridge=true -Denable_umd_bridge_tests=true
 if ($LASTEXITCODE) { exit $LASTEXITCODE }
-meson compile -C $buildDir -j 3 viogpud3d12 vkd3d-umd-ddi-abi-test vkd3d-umd-ddi-descriptor-test vkd3d-umd-gpu-probe vkd3d-umd-runtime-test vkd3d-umd-shared-gpu-probe
+meson compile -C $buildDir -j 3 viogpud3d12 vkd3d-umd-ddi-abi-test vkd3d-umd-ddi-descriptor-test vkd3d-umd-gpu-probe vkd3d-umd-runtime-test vkd3d-umd-shared-gpu-probe vkd3d-system-d3d12-probe
 if ($LASTEXITCODE) { exit $LASTEXITCODE }
 $dll = Join-Path $buildDir 'libs\vkd3d-umd\viogpud3d12.dll'
 $test = Join-Path $buildDir 'libs\vkd3d-umd\vkd3d-umd-ddi-abi-test.exe'
@@ -38,6 +38,9 @@ if ($Architecture -ne 'arm64') {
     if ($LASTEXITCODE -ne 2) { throw 'GPU probe must require explicit adapter identity before loading Vulkan' }
     & (Join-Path $buildDir 'libs\vkd3d-umd\vkd3d-umd-shared-gpu-probe.exe')
     if ($LASTEXITCODE -ne 2) { throw 'Shared backing probe must require explicit LUID and execution switch' }
+    & (Join-Path $buildDir 'libs\vkd3d-umd\vkd3d-system-d3d12-probe.exe')
+    if ($LASTEXITCODE -ne 2) { throw 'System D3D12 probe must require explicit mode before loading graphics DLLs' }
+    ./tools/test-system-d3d12-probe.ps1 -Executable (Join-Path $buildDir 'libs\vkd3d-umd\vkd3d-system-d3d12-probe.exe')
 }
 $output = Join-Path $buildDir 'package'
 New-Item -ItemType Directory -Force $output | Out-Null
@@ -46,6 +49,7 @@ Copy-Item (Join-Path $buildDir 'libs\vkd3d-umd\vkd3d-umd-ddi-descriptor-test.exe
 Copy-Item (Join-Path $buildDir 'libs\vkd3d-umd\vkd3d-umd-gpu-probe.exe') $output
 Copy-Item (Join-Path $buildDir 'libs\vkd3d-umd\vkd3d-umd-runtime-test.exe') $output
 Copy-Item (Join-Path $buildDir 'libs\vkd3d-umd\vkd3d-umd-shared-gpu-probe.exe') $output
+Copy-Item (Join-Path $buildDir 'libs\vkd3d-umd\vkd3d-system-d3d12-probe.exe') $output
 Copy-Item libs/vkd3d-umd/README.md $output
 dumpbin /headers $dll | Out-File (Join-Path $output 'pe-headers.txt')
 dumpbin /exports $dll | Out-File (Join-Path $output 'exports.txt')
@@ -53,7 +57,11 @@ dumpbin /dependents $dll | Out-File (Join-Path $output 'dependents.txt')
 $sharedProbe = Join-Path $buildDir 'libs\vkd3d-umd\vkd3d-umd-shared-gpu-probe.exe'
 dumpbin /dependents $sharedProbe | Out-File (Join-Path $output 'shared-probe-dependents.txt')
 dumpbin /headers $sharedProbe | Out-File (Join-Path $output 'shared-probe-pe-headers.txt')
-foreach ($image in @($dll, $sharedProbe)) {
+$systemProbe = Join-Path $buildDir 'libs\vkd3d-umd\vkd3d-system-d3d12-probe.exe'
+$systemDependencies = (dumpbin /dependents $systemProbe) -join "`n"
+$systemDependencies | Out-File (Join-Path $output 'system-probe-dependents.txt')
+if ($systemDependencies -match '(?i)(viogpu|vkd3d|vulkan|dxvk).*\.dll') { throw 'Ordinary D3D12 probe must not import a private graphics engine' }
+foreach ($image in @($dll, $sharedProbe, $systemProbe)) {
 $stream = [IO.File]::OpenRead($image)
 try {
     $reader = New-Object IO.BinaryReader($stream)
@@ -66,8 +74,10 @@ try {
 [PSCustomObject]@{Source=(& git rev-parse HEAD); Submodules=(& git submodule status --recursive);
     Architecture=$Architecture; WindowsKit=$sdkVersion; NativeRuntimeValidated=$false;
     SharedBackingProbeRuntime='Emulated callbacks forwarding to real D3DKMT'; SharedBackingProbeTargetValidated=$false;
+    SystemD3D12Probe='Ordinary System32 D3D12 API with explicit hardware LUID; CPU WARP only validates the harness';
     Contract='Native lifecycle, shared runtime KMD heaps and private Turnip buffer/texture import; zero advertised feature levels; emulated-runtime GPU probes require target execution; no native runtime acceptance'} |
     ConvertTo-Json -Depth 4 | Set-Content (Join-Path $output 'source.json')
 $hashes = Get-ChildItem $output -File | Get-FileHash -Algorithm SHA256
 $hashes | ForEach-Object { $_.Hash + '  ' + [IO.Path]::GetFileName($_.Path) } |
     Set-Content (Join-Path $output 'SHA256SUMS')
+Get-Content (Join-Path $output 'SHA256SUMS')

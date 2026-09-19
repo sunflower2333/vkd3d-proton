@@ -70,6 +70,7 @@ not repaired or hidden by this engine change.
 [placed resources](https://learn.microsoft.com/windows/win32/api/d3d12/nf-d3d12-id3d12device-createplacedresource),
 [texture-copy locations](https://learn.microsoft.com/windows/win32/api/d3d12/ns-d3d12-d3d12_texture_copy_location).
 
-Native GetResourceAllocationInfo/DDI capability reporting, multiple subresources,
+Native allocation-info query now has a bounded implementation described in
+[the ordinary D3D12 audit](vkd3d-system-d3d12-20260919.md). DDI capability reporting, multiple subresources,
 render-target/depth views, graphics pipeline, public monitored fences, residency,
 GPUVA and Present must still be implemented before widening native admission.
