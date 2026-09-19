@@ -29,6 +29,7 @@ struct vkdu_object {
     uint64_t bound_heaps[2];
     uint32_t width, height, format;
     int texture_heap;
+    uint32_t graphics_root, graphics_pipeline, topology, viewport_count, scissor_count, render_target, index_count;
 };
 
 #define OBJ(type, o) ((type *)(o)->object)
@@ -554,6 +555,8 @@ int32_t vkdu_command_reset(vkdu_object *command, vkdu_object *allocator)
     if (SUCCEEDED(hr)) {
         command->closed = 0; command->slot_count = 0;
         memset(command->bound_heaps, 0, sizeof(command->bound_heaps));
+        command->graphics_root = command->graphics_pipeline = command->topology = 0;
+        command->viewport_count = command->scissor_count = command->render_target = command->index_count = 0;
     }
     return hr;
 }
@@ -731,8 +734,11 @@ int32_t vkdu_pipeline_create_tokens(vkdu_device *device, vkdu_object *root, cons
 int32_t vkdu_command_pipeline(vkdu_object *command, vkdu_object *pipeline)
 {
     if (!RECORDING(command) || !VALID(pipeline, VKDU_PIPELINE) || !vkdu_same_device(command, pipeline)) return E_INVALIDARG;
-    ID3D12GraphicsCommandList_SetPipelineState(OBJ(ID3D12GraphicsCommandList, command), OBJ(ID3D12PipelineState, pipeline)); return S_OK;
+    ID3D12GraphicsCommandList_SetPipelineState(OBJ(ID3D12GraphicsCommandList, command), OBJ(ID3D12PipelineState, pipeline));
+    command->graphics_pipeline = pipeline->graphics_pipeline;
+    return S_OK;
 }
+#include "backend_graphics.inc"
 int32_t vkdu_command_uav(vkdu_object *command, uint32_t index, vkdu_object *buffer, uint64_t offset)
 {
     if (!RECORDING(command) || index >= command->slot_count || command->slots[index].type != D3D12_ROOT_PARAMETER_TYPE_UAV ||

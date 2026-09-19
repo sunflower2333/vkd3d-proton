@@ -21,6 +21,7 @@
 
 #include "backend_samplers_test.inc"
 #include "backend_textures_test.inc"
+#include "backend_graphics_test.inc"
 
 #ifdef VKDU_GPU_PROBE
 static struct vkdu_adapter requested_adapter;
@@ -785,6 +786,7 @@ int main(int argc, char **argv)
     check_retained_queue(device);
     check_samplers(device, wrong);
     check_texture_copies(device, wrong);
+    check_graphics(device, wrong);
     /* Caller follows D3D12 lifetime rules: reset/destroy only after completion. */
     vkdu_object_destroy(command); vkdu_object_destroy(allocator);
     vkdu_object_destroy(table_pipeline); vkdu_object_destroy(table_root);

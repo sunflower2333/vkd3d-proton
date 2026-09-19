@@ -437,9 +437,10 @@ HRESULT vkd3d_create_heap_wddm(ID3D12Device *iface, const D3D12_HEAP_DESC *desc,
     *heap = NULL;
     if (!device || !owner || device->wddm_runtime_owner != owner || !token || !desc ||
             (desc->Flags != D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS &&
-             desc->Flags != D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES) || !desc->SizeInBytes ||
+             desc->Flags != D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES &&
+             desc->Flags != D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES) || !desc->SizeInBytes ||
             desc->Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) return E_INVALIDARG;
-    if (desc->Flags == D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES &&
+    if (desc->Flags != D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS &&
             desc->Properties.Type != D3D12_HEAP_TYPE_DEFAULT) return E_INVALIDARG;
     if (!(object = vkd3d_malloc(sizeof(*object)))) return E_OUTOFMEMORY;
     if (FAILED(hr = d3d12_heap_init(object, device, desc, NULL, &import)))

@@ -54,4 +54,7 @@ if get_option('enable_umd_bridge_tests')
   umd_texture_negative = executable('vkd3d-umd-texture-negative', 'backend.c', 'debug_policy.c', 'backend_test.c',
     c_args : ['-DVKDU_ENABLE_TEST_DEVICE', '-DVKDU_TEST_TEXTURE_DROP_OFFSET'],
     dependencies : vkd3d_dep, include_directories : vkd3d_private_includes)
+  umd_graphics_negative = executable('vkd3d-umd-graphics-negative', 'backend.c', 'debug_policy.c', 'backend_test.c',
+    c_args : ['-DVKDU_ENABLE_TEST_DEVICE', '-DVKDU_TEST_GRAPHICS_DROP_SCISSOR'],
+    dependencies : vkd3d_dep, include_directories : vkd3d_private_includes)
 endif

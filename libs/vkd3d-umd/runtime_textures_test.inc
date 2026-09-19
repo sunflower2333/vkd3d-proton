@@ -13,7 +13,13 @@ static int test_native_textures(Context *ctx, D3D12DDI_HDEVICE device,
     alignas(Object) std::array<unsigned char, sizeof(Object) + 8> resource;
     D3D12DDI_HHEAP h{storage.data()}; D3D12DDI_HRESOURCE r{resource.data()};
     auto create = [&]() { return table.pfnCreateHeapAndResource(device, &heap, h, {}, &desc, nullptr, r); };
-    for (auto format : {DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM}) {
+    for (unsigned round = 0; round < 3; ++round) {
+        const bool rt = round == 2;
+        const auto format = round ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R32_FLOAT;
+        heap.Flags = rt ? D3D12DDI_HEAP_FLAG_RT_DS_TEXTURES : D3D12DDI_HEAP_FLAG_NON_RT_DS_TEXTURES;
+        desc.Flags = static_cast<D3D12DDI_RESOURCE_FLAGS_0003>(rt ? 1 : 0);
+        desc.InitialResourceState = rt ? D3D12DDI_RESOURCE_STATE_RENDER_TARGET : D3D12DDI_RESOURCE_STATE_COPY_DEST;
+        const unsigned prior_rt_queries = rt_queries, prior_rt_imports = rt_imports, prior_rt_placements = rt_placements;
         desc.Format = format; storage.fill(0xa5); resource.fill(0xa5);
         const unsigned before = allocations;
         REQUIRE(table.pfnCheckResourceAllocationInfo);
@@ -47,6 +53,7 @@ static int test_native_textures(Context *ctx, D3D12DDI_HDEVICE device,
         info = valid_info;
         auto buffer_desc = desc; buffer_desc.ResourceType = D3D12DDI_RT_BUFFER; buffer_desc.Width = 65537;
         buffer_desc.Height = 1; buffer_desc.Format = DXGI_FORMAT_UNKNOWN; buffer_desc.Layout = D3D12DDI_TL_ROW_MAJOR;
+        buffer_desc.Flags = static_cast<D3D12DDI_RESOURCE_FLAGS_0003>(0); buffer_desc.InitialResourceState = D3D12DDI_RESOURCE_STATE_COPY_DEST;
         table.pfnCheckResourceAllocationInfo(device, &buffer_desc, D3D12DDI_RESOURCE_OPTIMIZATION_FLAG_NONE, 0, 1, &info);
         REQUIRE(info.ResourceDataSize == 131072 && info.ResourceDataAlignment == 65536 && info.Layout == D3D12DDI_TL_ROW_MAJOR &&
                 allocations == before);
@@ -73,6 +80,9 @@ static int test_native_textures(Context *ctx, D3D12DDI_HDEVICE device,
         REQUIRE(token && token->users == 2 && token->allocation && !token->cpu_visible && !last_import_cpu_visible);
         REQUIRE(view->kind == VKDU_TEXTURE2D && !view->address && !find_buffer(ctx, r.pDrvPrivate) &&
                 find_resource(ctx, r.pDrvPrivate) == view && peer->width == 4 && peer->height == 4 && peer->format == format);
+        REQUIRE(last_placement_state == (rt ? 4u : 0x400u));
+        if (rt) REQUIRE(rt_queries > prior_rt_queries && rt_imports == prior_rt_imports + 3 && rt_placements == prior_rt_placements + 2);
+        else REQUIRE(rt_queries == prior_rt_queries && rt_imports == prior_rt_imports && rt_placements == prior_rt_placements);
         for (size_t i = sizeof(Object); i < resource.size(); ++i) REQUIRE(resource[i] == 0xa5);
         for (size_t i = sizeof(NativeHeapSlot); i < storage.size(); ++i) REQUIRE(storage[i] == 0xa5);
         void *mapped = nullptr;
@@ -87,7 +97,7 @@ static int test_native_textures(Context *ctx, D3D12DDI_HDEVICE device,
         test_object_destroy(alias);
         REQUIRE(!ctx->native_heaps && kernel_heaps.empty());
     }
-    puts("PASS native texture heap allocation/import, request poisoning, format ownership, alias lifetime and failure cleanup");
+    puts("PASS native sampled/RT texture heap allocation/import, request poisoning, exact backing branch, alias lifetime and failure cleanup");
     puts("PASS native allocation-info query, backend requirements, no allocation, rejected-output preservation and retirement");
     return 0;
 }

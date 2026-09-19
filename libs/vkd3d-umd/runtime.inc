@@ -85,7 +85,7 @@ HRESULT APIENTRY native_optional_tables(D3D12DDI_HADAPTER handle, UINT32 *count,
 HRESULT APIENTRY native_caps(D3D12DDI_HADAPTER handle, const D3D12DDIARG_GETCAPS *args) {
     if (!native_adapter(handle) || !args || !args->pData || !args->DataSize) return E_INVALIDARG;
     // The embedded API feature level is not the native driver's feature level.
-    // In particular, do not report FL11_0 for this compute-only DDI bridge.
+    // Bounded compute/graphics callbacks do not satisfy the complete FL11_0 contract.
     return DXGI_ERROR_UNSUPPORTED;
 }
 
@@ -140,6 +140,7 @@ HRESULT native_load_vulkan(HMODULE *module, PFN_vkGetInstanceProcAddr *loader) {
 #include "native_heap.inc"
 #include "native_samplers.inc"
 #include "native_textures.inc"
+#include "native_graphics.inc"
 
 // error_mutex owns these lists. Compare opaque slots before dereferencing them.
 Object *native_submission_find(Object *head, void *slot) {

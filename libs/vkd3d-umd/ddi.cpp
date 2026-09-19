@@ -23,6 +23,8 @@ void native_submission_forget(Context *);
 void native_runtime_queues_forget(Context *);
 HRESULT native_submission_reap(Context *);
 void native_heap_tables(D3D12DDI_DEVICE_FUNCS_CORE_0003 *);
+void native_graphics_tables(D3D12DDI_DEVICE_FUNCS_CORE_0003 *, D3D12DDI_COMMAND_LIST_FUNCS_3D_0003 *);
+HRESULT native_graphics_pipeline(Context *, const D3D12DDIARG_CREATE_PIPELINE_STATE_0001 *);
 HRESULT native_command_create(Context *, const D3D12DDIARG_CREATE_COMMAND_LIST_0001 *);
 void native_command_destroy(Context *, Object *);
 HRESULT native_queue_create(Context *, const D3D12DDIARG_CREATECOMMANDQUEUE_0001 *);
@@ -79,6 +81,7 @@ struct Context : NativeContextBuffers {
     NativeRuntimeQueue *native_runtime_queues = nullptr;
     Object *native_command_objects = nullptr;
     Object *indirect_signatures = nullptr; // protected by error_mutex
+    Object *graphics_objects = nullptr;
     std::shared_ptr<NativeAdapter> native_adapter;
     D3D12DDI_HRTDEVICE runtime_device{};
     D3DDDI_DEVICECALLBACKS kernel_callbacks{};
@@ -115,6 +118,7 @@ struct Object {
     D3D12DDI_HRTCOMMANDLIST runtime_command{};
     D3D12DDI_HRTCOMMANDQUEUE runtime_queue{};
     NativeRuntimeQueue *runtime_route = nullptr;
+    uint32_t native_graphics_tag = 0;
 };
 Context *context(D3D12DDI_HDEVICE handle) {
     if (handle.pDrvPrivate) {
@@ -657,9 +661,10 @@ void APIENTRY shader_destroy(D3D12DDI_HDEVICE h, D3D12DDI_HSHADER shader) {
 SIZE_T APIENTRY pipeline_size(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATE_PIPELINE_STATE_0001 *) { return sizeof(Object); }
 HRESULT APIENTRY pipeline_create(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATE_PIPELINE_STATE_0001 *args) {
     auto *ctx = context(h); vkdu_object *value = nullptr;
-    if (!ctx || !args || args->NodeMask > 1 || !belongs(ctx, args->hComputeShader.pDrvPrivate) || !belongs(ctx, args->hRootSignature.pDrvPrivate)) return E_INVALIDARG;
+    if (!ctx || !args || args->NodeMask > 1 || !belongs(ctx, args->hRootSignature.pDrvPrivate)) return E_INVALIDARG;
     if (args->hVertexShader.pDrvPrivate || args->hPixelShader.pDrvPrivate || args->hDomainShader.pDrvPrivate ||
-        args->hHullShader.pDrvPrivate || args->hGeometryShader.pDrvPrivate) return E_NOTIMPL;
+        args->hHullShader.pDrvPrivate || args->hGeometryShader.pDrvPrivate) return native_graphics_pipeline(ctx, args);
+    if (!belongs(ctx, args->hComputeShader.pDrvPrivate)) return E_INVALIDARG;
     auto *shader = object(args->hComputeShader.pDrvPrivate);
     if (!shader->shader) return E_INVALIDARG;
     HRESULT hr = vkdu_pipeline_create_tokens(ctx->backend, backend(args->hRootSignature.pDrvPrivate, VKDU_ROOT), shader->shader, shader->shader_words, &value);
@@ -704,6 +709,11 @@ extern "C" void APIENTRY VioGpuD3D12BridgeUnbindObject(void *memory) {
         if (*p) *p = value->next;
         ReleaseSRWLockExclusive(&ctx->resources_lock);
     }
+    if (value->native_graphics_tag) {
+        auto **link = &ctx->graphics_objects;
+        while (*link && *link != value) link = &(*link)->next;
+        if (*link) *link = value->next;
+    }
     vkdu_object_destroy(value->backend); delete[] value->shader;
     std::memset(value, 0, sizeof(*value)); release(ctx);
 }
@@ -742,6 +752,7 @@ extern "C" HRESULT APIENTRY VioGpuD3D12BridgeGetTables(D3D12DDI_DEVICE_FUNCS_COR
     commands->pfnSetComputeRoot32BitConstants = root_constants;
     commands->pfnSetDescriptorHeaps = set_heaps; commands->pfnSetComputeRootDescriptorTable = set_table;
     queue->pfnExecuteCommandLists = execute;
+    native_graphics_tables(device, commands);
     // Native heaps/import cover buffers and bounded non-RT/DS textures. OS monitored fences,
     // residency, WDDM2 GPUVA, graphics and Present remain absent; no admission.
     return S_OK;

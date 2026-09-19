@@ -43,6 +43,36 @@ struct vkdu_texture_copy_location {
     uint32_t footprint, format, width, height, depth, row_pitch;
 };
 struct vkdu_box { uint32_t left, top, front, right, bottom, back; };
+struct vkdu_signature { uint32_t system_value, reg, mask, component_type; };
+struct vkdu_graphics_desc {
+    uint32_t format, sample_mask, fill_mode, cull_mode, front_ccw, depth_clip, write_mask;
+};
+struct vkdu_viewport { float x, y, width, height, min_depth, max_depth; };
+struct vkdu_rect { int32_t left, top, right, bottom; };
+/* Native VS/PS tokens need real input/output signatures, not a compute wrapper. */
+int32_t vkdu_shader_dxbc(uint32_t stage, const uint32_t *tokens, uint32_t words,
+        const struct vkdu_signature *inputs, uint32_t input_count,
+        const struct vkdu_signature *outputs, uint32_t output_count, void **code, size_t *size);
+void vkdu_shader_dxbc_free(void *code);
+int32_t vkdu_graphics_pipeline_create(vkdu_device *device, vkdu_object *root,
+        const void *vs, size_t vs_size, const void *ps, size_t ps_size,
+        const struct vkdu_graphics_desc *desc, vkdu_object **out);
+int32_t vkdu_render_target_create(vkdu_device *device, uint32_t width, uint32_t height, vkdu_object **out);
+int32_t vkdu_render_target_allocation(vkdu_device *device, uint32_t width, uint32_t height, uint64_t *bytes, uint64_t *alignment);
+int32_t vkdu_render_target_heap_import(vkdu_device *device, void *owner, void *token, uint64_t bytes, vkdu_object **out);
+int32_t vkdu_render_target_place(vkdu_device *device, vkdu_object *heap, uint32_t width, uint32_t height, uint32_t state, vkdu_object **out);
+int32_t vkdu_texture2d_rtv(vkdu_object *heap, uint32_t index, vkdu_object *texture);
+int32_t vkdu_command_graphics_root(vkdu_object *command, vkdu_object *root);
+int32_t vkdu_command_topology(vkdu_object *command, uint32_t topology);
+int32_t vkdu_command_viewports(vkdu_object *command, uint32_t count, const struct vkdu_viewport *views);
+int32_t vkdu_command_scissors(vkdu_object *command, uint32_t count, const struct vkdu_rect *rects);
+int32_t vkdu_command_render_target(vkdu_object *command, vkdu_object *heap, uint32_t index);
+int32_t vkdu_command_clear_rtv(vkdu_object *command, vkdu_object *heap, uint32_t index,
+        const float color[4], uint32_t count, const struct vkdu_rect *rects);
+int32_t vkdu_command_index_buffer(vkdu_object *command, vkdu_object *buffer, uint64_t offset, uint32_t size, uint32_t format);
+int32_t vkdu_command_draw(vkdu_object *command, uint32_t vertices, uint32_t instances, uint32_t first, uint32_t first_instance);
+int32_t vkdu_command_draw_indexed(vkdu_object *command, uint32_t indices, uint32_t instances,
+        uint32_t first, int32_t base_vertex, uint32_t first_instance);
 
 int32_t vkdu_device_create(PFN_vkGetInstanceProcAddr loader, const struct vkdu_adapter *adapter, vkdu_device **out);
 /* Native runtime adapter identity is the KMD-provided LUID. Vulkan vendor and

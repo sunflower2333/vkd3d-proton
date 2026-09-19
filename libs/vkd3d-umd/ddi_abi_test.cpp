@@ -43,6 +43,19 @@ int main(int argc, char **argv) {
             device.value.pfnDestroyHeapAndResource && device.value.pfnMapHeap && device.value.pfnUnmapHeap);
     REQUIRE(!device.value.pfnCreateFence && !device.value.pfnMakeResident);
     REQUIRE(!queue.value.pfnSignalFence && !queue.value.pfnWaitForFence);
+    REQUIRE(device.value.pfnCreateVertexShader && device.value.pfnCreatePixelShader && device.value.pfnCreateRenderTargetView);
+    REQUIRE(device.value.pfnCreateBlendState && device.value.pfnCreateRasterizerState && device.value.pfnCreateDepthStencilState);
+    REQUIRE(commands.value.pfnDrawInstanced && commands.value.pfnDrawIndexedInstanced && commands.value.pfnIaSetTopology &&
+            commands.value.pfnRsSetViewports && commands.value.pfnRsSetScissorRects && commands.value.pfnOMSetRenderTargets &&
+            commands.value.pfnClearRenderTargetView && commands.value.pfnIASetIndexBuffer && commands.value.pfnSetGraphicsRootSignature);
+    commands.value.pfnDrawInstanced({}, 3, 1, 0, 0);
+    commands.value.pfnDrawIndexedInstanced({}, 3, 1, 0, -1, 0);
+    commands.value.pfnRsSetViewports({}, 0, nullptr);
+    commands.value.pfnRsSetScissorRects({}, 0, nullptr);
+    commands.value.pfnSetGraphicsRootSignature({}, {});
+    commands.value.pfnOMSetRenderTargets({}, 0, nullptr, FALSE, nullptr);
+    commands.value.pfnClearRenderTargetView({}, {}, nullptr, 0, nullptr);
+    commands.value.pfnIASetIndexBuffer({}, nullptr);
     D3D12DDI_HDEVICE h{};
     D3D12DDIARG_CREATECOMMANDQUEUE_0001 q{};
     REQUIRE(device.value.pfnCalcPrivateCommandQueueSize(h, &q) == size());

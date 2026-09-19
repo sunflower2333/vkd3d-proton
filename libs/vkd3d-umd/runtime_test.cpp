@@ -142,6 +142,9 @@ static int32_t test_texture_allocation(vkdu_device *, uint32_t, uint32_t, uint32
 static int32_t test_buffer_allocation(vkdu_device *, uint64_t, uint64_t *, uint64_t *);
 static int32_t test_texture_import(vkdu_device *, void *, void *, uint64_t, vkdu_object **);
 static int32_t test_texture_place(vkdu_device *, vkdu_object *, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, vkdu_object **);
+static int32_t test_rt_allocation(vkdu_device *, uint32_t, uint32_t, uint64_t *, uint64_t *);
+static int32_t test_rt_import(vkdu_device *, void *, void *, uint64_t, vkdu_object **);
+static int32_t test_rt_place(vkdu_device *, vkdu_object *, uint32_t, uint32_t, uint32_t, vkdu_object **);
 static void test_object_destroy(vkdu_object *);
 static int test_object_retain(vkdu_object *);
 static int test_object_is(vkdu_object *, vkdu_kind);
@@ -174,6 +177,9 @@ static DWORD WINAPI test_event_wait(HANDLE event, DWORD timeout) {
 #define vkdu_buffer_allocation test_buffer_allocation
 #define vkdu_texture_heap_import test_texture_import
 #define vkdu_texture2d_place test_texture_place
+#define vkdu_render_target_allocation test_rt_allocation
+#define vkdu_render_target_heap_import test_rt_import
+#define vkdu_render_target_place test_rt_place
 #define vkdu_object_destroy test_object_destroy
 #define vkdu_object_retain test_object_retain
 #define vkdu_object_is test_object_is
@@ -242,6 +248,16 @@ static int32_t test_texture_place(vkdu_device *device, vkdu_object *memory, uint
     return hr;
 }
 static bool import_failure, placement_failure, retire_during_import;
+static unsigned rt_queries, rt_imports, rt_placements;
+static int32_t test_rt_allocation(vkdu_device *device, uint32_t width, uint32_t height, uint64_t *bytes, uint64_t *alignment) {
+    ++rt_queries; return test_texture_allocation(device, width, height, 28, bytes, alignment);
+}
+static int32_t test_rt_import(vkdu_device *device, void *owner, void *token, uint64_t bytes, vkdu_object **out) {
+    ++rt_imports; return test_texture_import(device, owner, token, bytes, out);
+}
+static int32_t test_rt_place(vkdu_device *device, vkdu_object *memory, uint32_t width, uint32_t height, uint32_t state, vkdu_object **out) {
+    ++rt_placements; return test_texture_place(device, memory, 0, width, height, 28, state, out);
+}
 static unsigned imports, placements;
 static bool last_import_cpu_visible;
 static uint32_t last_placement_state;

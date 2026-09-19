@@ -141,6 +141,7 @@ static int32_t test_texture_copy(vkdu_object *command, const vkdu_texture_copy_l
     seen_texture_box = box ? *box : vkdu_box{}; texture_x = x; texture_y = y; texture_z = z;
     return next_result;
 }
+#include "ddi_graphics_mocks.inc"
 #define vkdu_object_is test_is
 #define vkdu_object_belongs test_belongs
 #define vkdu_object_destroy test_destroy
@@ -173,9 +174,11 @@ static int32_t test_texture_copy(vkdu_object *command, const vkdu_texture_copy_l
 static void APIENTRY capture(void *, HRESULT hr) { reported = hr; }
 #include "ddi_samplers_test.inc"
 #include "ddi_textures_test.inc"
+#include "ddi_graphics_test.inc"
 int main() {
     if (check_native_samplers()) return 1;
     if (check_native_textures()) return 1;
+    if (check_native_graphics()) return 1;
     calls = destroys = sampler_calls = 0; next_result = reported = S_OK;
     Context ctx;
     ctx.backend = reinterpret_cast<vkdu_device *>(&next_base);
