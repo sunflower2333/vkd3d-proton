@@ -64,6 +64,52 @@ fence-release event behavior. Explicit CI WARP validates this harness on all
 three Windows architectures; it is never VIOGPU acceptance. The installed native
 driver still requires a root-owned target run and the missing OS fence mapping.
 
+### Verified CI checkpoint
+
+Production commit `9ab92ec87535fa3c50c9257c94cb57970066cee2` passed all five jobs
+of [run 35443399378](https://github.com/sunflower2333/vkd3d-proton/actions/runs/35443399378).
+Actual logs were checked, including the precise positive and negative markers:
+
+| Job | ID | Result |
+| --- | --- | --- |
+| Linux CPU Vulkan backend | 105898092720 | Real fence event lifecycle and full backend regression pass; dropped queue wait fails as required |
+| Windows ARM64 build | 105898092809 | WDK build and package pass |
+| Windows x64 | 105898092810 | Runtime fixtures, six semantic negatives and public WARP fences/copy pass |
+| Windows x86 | 105898092844 | Runtime fixtures, six semantic negatives and public WARP fences/copy pass |
+| Windows ARM64 runtime | 105898905444 | Actual ARM64 runtime fixtures, six semantic negatives and public WARP fences/copy pass |
+
+The Windows fixtures confirm fatal native errors reach the embedded backend
+device. All three ordinary WARP runs report
+`PASS PUBLIC_FENCE_LIFECYCLE delayed_queue_completion, CPU_rewind, final_release_event`
+and four copy rounds with changed data and sentinel verification. These are
+CPU harness results, not VIOGPU or OS native monitored-fence validation.
+
+Artifacts below belong to that exact production commit. Archive SHA256 values
+come from the GitHub API; no archive was downloaded by this worker.
+
+| Architecture | Artifact ID | Bytes | Archive SHA256 |
+| --- | --- | --- | --- |
+| ARM64 | 10585190425 | 13026717 | 15ff2d1582a3736e62a902f8bbaff4e918ca0f50fdb3e17c6c0802f5472e769a |
+| x64 | 10585275364 | 13498978 | 6257069a03c85b349ce0f9d310f3c80658275530231b34fe6a77fcdc90845e93 |
+| x86 | 10585130596 | 13323071 | 1d8385d0049bcc4b2ccec8a3a4616d5694786005d84e1e4ef197ee90c4b8961b |
+
+ARM64 package file hashes from the build log:
+
+- `vkd3d-system-d3d12-probe.exe`: `fb13f846fad3e731c0503cfb862aaf82a9504f39c0bb4faca4565ab42c1a636c`
+- `viogpud3d12.dll`: `3da8c73a9662e7fcd0e26f39a8b63dc8a037ec0bdc8abed4a288636a12361346`
+
+ARM64 runtime log artifact `10585150539` has archive SHA256
+`e49e8407bed23615e48f2f79eea8631c2472d591c5f4de9fd83e91a0f5e02d3a`.
+Shared runtime-v1 header remains unchanged, SHA256
+`c072169e380f14fd4f967dd0ea765e4c0ac8f671136e93baedce8cd2dadbed34`.
+
+Root owns signing, package integration and hardware execution. The ordinary
+probe may test the installed driver independently of replacing its DLL: obtain
+the current hardware LUID with `--list`, then run `--run-device`, `--run-fences`
+or `--run-copy` with that exact LUID. Bound execution to 60 seconds. Native
+admission remains closed, so successful target D3D12CreateDevice is not expected
+from this candidate and has not been claimed.
+
 ## Still required before opening ordinary D3D12 admission
 
 1. Authoritative OS fence placement import/identity, real monitored storage and
