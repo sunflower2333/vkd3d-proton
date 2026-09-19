@@ -48,15 +48,17 @@ struct Deadline {
 };
 
 struct ProbeRuntime {
+    struct ContextCounts { unsigned renders = 0, targets = 0, events = 0; };
     LUID requested_luid{};
     D3DKMT_HANDLE adapter = 0, device = 0, context_handle = 0;
     uint32_t context_id = 0;
     std::mutex mutex;
     std::map<D3DKMT_HANDLE, NativeAllocationInfo> allocations;
+    std::map<D3DKMT_HANDLE, ContextCounts> contexts;
     std::atomic_uint creates{0}, renders{0}, target_references{0};
     std::atomic_uint target_handle{0};
     std::atomic_bool native_cleanup{false};
-    std::atomic_uint cleanup_completions{0};
+    std::atomic_uint cleanup_identity_queries{0};
     ~ProbeRuntime() { close(); }
     HRESULT close() {
         // This is the probe's actual final KMT device teardown, performed only
@@ -90,6 +92,19 @@ struct ProbeRuntime {
         std::lock_guard<std::mutex> lock(mutex);
         return allocations.count(handle) != 0;
     }
+    bool has_context(D3DKMT_HANDLE handle) {
+        std::lock_guard<std::mutex> lock(mutex);
+        return contexts.count(handle) != 0;
+    }
+    ContextCounts counts(D3DKMT_HANDLE handle) {
+        std::lock_guard<std::mutex> lock(mutex);
+        require(contexts.count(handle) != 0, "scheduler context is still registered");
+        return contexts.at(handle);
+    }
+};
+struct ProbeRuntimeQueue {
+    ProbeRuntime *runtime;
+    D3DKMT_HANDLE context = 0;
 };
 ProbeRuntime *peer(HANDLE value) { return static_cast<ProbeRuntime *>(value); }
 
@@ -98,32 +113,67 @@ HRESULT APIENTRY probe_query(HANDLE h, const D3DDDICB_QUERYADAPTERINFO *args) {
     D3DKMT_QUERYADAPTERINFO q{};
     q.hAdapter = peer(h)->adapter; q.Type = KMTQAITYPE_UMDRIVERPRIVATE;
     q.pPrivateDriverData = args->pPrivateDriverData; q.PrivateDriverDataSize = args->PrivateDriverDataSize;
-    return nt_result(D3DKMTQueryAdapterInfo(&q), "QueryAdapterInfo");
+    HRESULT hr = nt_result(D3DKMTQueryAdapterInfo(&q), "QueryAdapterInfo");
+    // The provider now retires actual context-ordered OS events. Its remaining
+    // query during cleanup only proves callback/identity liveness, not GPU idle.
+    if (SUCCEEDED(hr) && peer(h)->native_cleanup) ++peer(h)->cleanup_identity_queries;
+    return hr;
 }
-HRESULT APIENTRY probe_context_create(HANDLE h, D3DDDICB_CREATECONTEXT *args) {
-    if (!h || !args || peer(h)->context_handle) return E_INVALIDARG;
-    D3DKMT_CREATECONTEXT c{}; c.hDevice = peer(h)->device;
+HRESULT probe_create_context(ProbeRuntime &runtime, D3DDDICB_CREATECONTEXT *args) {
+    D3DKMT_CREATECONTEXT c{}; c.hDevice = runtime.device;
     c.NodeOrdinal = args->NodeOrdinal; c.EngineAffinity = args->EngineAffinity;
     c.pPrivateDriverData = args->pPrivateDriverData; c.PrivateDriverDataSize = args->PrivateDriverDataSize;
     c.ClientHint = D3DKMT_CLIENTHINT_VULKAN;
     HRESULT hr = nt_result(D3DKMTCreateContext(&c), "CreateContext");
-    peer(h)->context_handle = c.hContext;
     args->hContext = runtime_context(c.hContext);
     args->pCommandBuffer = c.pCommandBuffer; args->CommandBufferSize = c.CommandBufferSize;
     args->pAllocationList = c.pAllocationList; args->AllocationListSize = c.AllocationListSize;
     args->pPatchLocationList = c.pPatchLocationList; args->PatchLocationListSize = c.PatchLocationListSize;
+    if (c.hContext) {
+        std::lock_guard<std::mutex> lock(runtime.mutex);
+        runtime.contexts.emplace(c.hContext, ProbeRuntime::ContextCounts{});
+    }
     return hr;
 }
-HRESULT APIENTRY probe_context_destroy(HANDLE h, const D3DDDICB_DESTROYCONTEXT *args) {
-    if (!h || !args || kmt_handle(args->hContext) != peer(h)->context_handle) return E_INVALIDARG;
-    D3DKMT_DESTROYCONTEXT c{}; c.hContext = peer(h)->context_handle;
+HRESULT probe_destroy_context(ProbeRuntime &runtime, const D3DDDICB_DESTROYCONTEXT *args) {
+    D3DKMT_DESTROYCONTEXT c{}; c.hContext = kmt_handle(args->hContext);
+    if (!runtime.has_context(c.hContext)) return E_INVALIDARG;
     NTSTATUS status = D3DKMTDestroyContext(&c);
     for (unsigned attempt = 0; attempt < 100 &&
             (static_cast<uint32_t>(status) == 0x80000011u || static_cast<uint32_t>(status) == 0xc01e0102u); ++attempt) {
         Sleep(1); status = D3DKMTDestroyContext(&c);
     }
-    if (status >= 0) peer(h)->context_handle = 0;
+    if (status >= 0) {
+        std::lock_guard<std::mutex> lock(runtime.mutex);
+        runtime.contexts.erase(c.hContext);
+    }
     return nt_result(status, "DestroyContext");
+}
+HRESULT APIENTRY probe_context_create(HANDLE h, D3DDDICB_CREATECONTEXT *args) {
+    if (!h || !args || peer(h)->context_handle) return E_INVALIDARG;
+    HRESULT hr = probe_create_context(*peer(h), args);
+    peer(h)->context_handle = kmt_handle(args->hContext);
+    return hr;
+}
+HRESULT APIENTRY probe_context_destroy(HANDLE h, const D3DDDICB_DESTROYCONTEXT *args) {
+    if (!h || !args || kmt_handle(args->hContext) != peer(h)->context_handle) return E_INVALIDARG;
+    HRESULT hr = probe_destroy_context(*peer(h), args);
+    if (SUCCEEDED(hr)) peer(h)->context_handle = 0;
+    return hr;
+}
+HRESULT APIENTRY probe_queue_context_create(D3D12DDI_HRTCOMMANDQUEUE h, D3DDDICB_CREATECONTEXT *args) {
+    auto *queue = static_cast<ProbeRuntimeQueue *>(h.handle);
+    if (!queue || !queue->runtime || queue->context || !args) return E_INVALIDARG;
+    HRESULT hr = probe_create_context(*queue->runtime, args);
+    queue->context = kmt_handle(args->hContext);
+    return hr;
+}
+HRESULT APIENTRY probe_queue_context_destroy(D3D12DDI_HRTCOMMANDQUEUE h, const D3DDDICB_DESTROYCONTEXT *args) {
+    auto *queue = static_cast<ProbeRuntimeQueue *>(h.handle);
+    if (!queue || !queue->runtime || !args || kmt_handle(args->hContext) != queue->context) return E_INVALIDARG;
+    HRESULT hr = probe_destroy_context(*queue->runtime, args);
+    if (SUCCEEDED(hr)) queue->context = 0;
+    return hr;
 }
 HRESULT APIENTRY probe_escape(HANDLE h, const D3DDDICB_ESCAPE *args) {
     if (!h || !args || args->hDevice != h) return E_INVALIDARG;
@@ -135,8 +185,6 @@ HRESULT APIENTRY probe_escape(HANDLE h, const D3DDDICB_ESCAPE *args) {
         auto *info = static_cast<NativeContextInfo *>(args->pPrivateDriverData);
         if (info->opcode == 1) peer(h)->context_id = info->context_id;
     }
-    if (SUCCEEDED(hr) && peer(h)->native_cleanup && args->PrivateDriverDataSize == sizeof(NativeFenceInfo))
-        ++peer(h)->cleanup_completions;
     return hr;
 }
 HRESULT APIENTRY probe_allocate(HANDLE h, D3DDDICB_ALLOCATE *args) {
@@ -198,13 +246,13 @@ HRESULT APIENTRY probe_unlock(HANDLE h, const D3DDDICB_UNLOCK *args) {
     return nt_result(D3DKMTUnlock(&u), "Unlock");
 }
 HRESULT APIENTRY probe_render(HANDLE h, D3DDDICB_RENDER *args) {
-    if (!h || !args || kmt_handle(args->hContext) != peer(h)->context_handle) return E_INVALIDARG;
+    if (!h || !args || !peer(h)->has_context(kmt_handle(args->hContext))) return E_INVALIDARG;
     bool target = false;
     for (UINT i = 0; i < args->NumAllocations; ++i) {
         if (!peer(h)->has(args->pNewAllocationList[i].hAllocation)) return E_INVALIDARG;
         target |= args->pNewAllocationList[i].hAllocation == peer(h)->target_handle;
     }
-    D3DKMT_RENDER r{}; r.hContext = peer(h)->context_handle;
+    D3DKMT_RENDER r{}; r.hContext = kmt_handle(args->hContext);
     r.CommandLength = args->CommandLength; r.AllocationCount = args->NumAllocations;
     r.PatchLocationCount = args->NumPatchLocations;
     r.pNewCommandBuffer = args->pNewCommandBuffer; r.NewCommandBufferSize = args->NewCommandBufferSize;
@@ -214,18 +262,28 @@ HRESULT APIENTRY probe_render(HANDLE h, D3DDDICB_RENDER *args) {
     args->pNewCommandBuffer = r.pNewCommandBuffer; args->NewCommandBufferSize = r.NewCommandBufferSize;
     args->pNewAllocationList = r.pNewAllocationList; args->NewAllocationListSize = r.NewAllocationListSize;
     args->pNewPatchLocationList = r.pNewPatchLocationList; args->NewPatchLocationListSize = r.NewPatchLocationListSize;
-    if (SUCCEEDED(hr)) { ++peer(h)->renders; if (target) ++peer(h)->target_references; }
+    if (SUCCEEDED(hr)) {
+        ++peer(h)->renders; if (target) ++peer(h)->target_references;
+        std::lock_guard<std::mutex> lock(peer(h)->mutex);
+        auto &counts = peer(h)->contexts.at(r.hContext);
+        ++counts.renders; if (target) ++counts.targets;
+    }
     return hr;
 }
 HRESULT APIENTRY probe_signal(HANDLE h, const D3DDDICB_SIGNALSYNCHRONIZATIONOBJECT2 *args) {
-    if (!h || !args || kmt_handle(args->hContext) != peer(h)->context_handle ||
+    if (!h || !args || !peer(h)->has_context(kmt_handle(args->hContext)) ||
             args->ObjectCount || args->BroadcastContextCount || args->Flags.Value != 2 || !args->CpuEventHandle)
         return E_INVALIDARG;
     D3DKMT_SIGNALSYNCHRONIZATIONOBJECT2 signal{};
-    signal.hContext = peer(h)->context_handle;
+    signal.hContext = kmt_handle(args->hContext);
     signal.Flags = args->Flags;
     signal.CpuEventHandle = args->CpuEventHandle;
-    return nt_result(D3DKMTSignalSynchronizationObject2(&signal), "SignalSynchronizationObject2(CpuEvent)");
+    HRESULT hr = nt_result(D3DKMTSignalSynchronizationObject2(&signal), "SignalSynchronizationObject2(CpuEvent)");
+    if (SUCCEEDED(hr)) {
+        std::lock_guard<std::mutex> lock(peer(h)->mutex);
+        ++peer(h)->contexts.at(signal.hContext).events;
+    }
+    return hr;
 }
 void APIENTRY probe_error(D3D10DDI_HRTDEVICE, HRESULT hr) {
     std::fprintf(stderr, "native SetErrorCb=%08x\n", static_cast<unsigned>(hr));
@@ -271,6 +329,7 @@ struct NativeSession {
         kt.pfnLockCb = probe_lock; kt.pfnUnlockCb = probe_unlock; kt.pfnRenderCb = probe_render;
         kt.pfnSignalSynchronizationObject2Cb = probe_signal;
         D3D12DDI_CORELAYER_DEVICECALLBACKS_0003 um{}; um.pfnSetErrorCb = probe_error;
+        um.pfnCreateContextCb = probe_queue_context_create; um.pfnDestroyContextCb = probe_queue_context_destroy;
         create.hDrvDevice.pDrvPrivate = device_memory.data(); create.hRTDevice.handle = &runtime;
         create.Interface = D3D12DDI_INTERFACE_VERSION_R0; create.Version = D3D12DDI_BUILD_VERSION << 16;
         create.pKTCallbacks = &kt; create.p12UMCallbacks = &um;
@@ -294,17 +353,49 @@ struct NativeSession {
     }
 };
 
-void run_probe(LUID luid) {
+struct NativeProbeQueue {
+    NativeSession &native;
+    ProbeRuntimeQueue runtime;
+    Object slot{};
+    bool live = false;
+    NativeProbeQueue(NativeSession &n, ProbeRuntime &r) : native(n), runtime{&r} {}
+    ~NativeProbeQueue() { reset(); }
+    void create() {
+        D3D12DDIARG_CREATECOMMANDQUEUE_0001 args{};
+        args.NodeMask = 1; args.QueueFlags = D3D12DDI_COMMAND_QUEUE_FLAG_3D;
+        args.hRTCommandQueue.handle = &runtime; args.hDrvCommandQueue.pDrvPrivate = &slot;
+        check(native.table.pfnCreateCommandQueue(native.create.hDrvDevice, &args), "runtime-associated queue");
+        live = true;
+        require(slot.backend && slot.runtime_route && runtime.context &&
+                slot.runtime_route->native_heap_context == runtime_context(runtime.context),
+                "native queue routes to its actual runtime-associated context");
+    }
+    void reset() {
+        if (live) {
+            native.table.pfnDestroyCommandQueue(native.create.hDrvDevice, {&slot});
+            live = false;
+        }
+    }
+};
+
+void run_probe(LUID luid, bool runtime_queues = false) {
     Deadline deadline;
     ProbeRuntime runtime; runtime.open(luid);
     NativeSession native; native.initialize(runtime);
     auto *ctx = context(native.create.hDrvDevice);
     require(ctx && ctx->native_context_id == runtime.context_id, "same actual context id");
     Owned upload, queue, allocator, command, fence, alias;
+    NativeProbeQueue first(native, runtime), second(native, runtime);
     check(vkdu_buffer_create(ctx->backend, 8192, 2, 0, 0xac3, &upload.value), "upload buffer");
-    check(vkdu_queue_create(ctx->backend, 0, &queue.value), "queue");
+    if (runtime_queues) {
+        first.create(); second.create();
+        require(first.runtime.context != second.runtime.context && first.runtime.context != runtime.context_handle &&
+                second.runtime.context != runtime.context_handle, "two separate runtime contexts share the owner domain");
+        std::printf("QUEUES owner=%u first=%u second=%u domain=%u\n", runtime.context_handle,
+                first.runtime.context, second.runtime.context, runtime.context_id);
+    } else check(vkdu_queue_create(ctx->backend, 0, &queue.value), "queue");
     uint64_t gpu_clock = UINT64_MAX, cpu_clock = UINT64_MAX;
-    if (vkdu_queue_clock(queue.value, &gpu_clock, &cpu_clock) != DXGI_ERROR_UNSUPPORTED ||
+    if (vkdu_queue_clock(runtime_queues ? first.slot.backend : queue.value, &gpu_clock, &cpu_clock) != DXGI_ERROR_UNSUPPORTED ||
             gpu_clock != UINT64_MAX || cpu_clock != UINT64_MAX)
         throw std::runtime_error("runtime-v1 clock must reject unsupported calibration without fabricated outputs");
     check(vkdu_device_status(ctx->backend), "unsupported shared clock preserves device");
@@ -325,6 +416,9 @@ void run_probe(LUID luid) {
         ctx->native_context_id, runtime.context_handle, heap->allocation,
         static_cast<unsigned long long>(heap->address), static_cast<unsigned long long>(heap->bytes));
     for (uint32_t round = 0; round < 8; ++round) {
+        auto &selected = round & 1 ? second : first;
+        auto &other = round & 1 ? first : second;
+        auto *backend_queue = runtime_queues ? selected.slot.backend : queue.value;
         const uint32_t sentinel = 0xfedc0000u ^ (round * 0x01010101u);
         const uint32_t first_word = 64 + round * 32;
         void *mapped = nullptr;
@@ -343,12 +437,30 @@ void run_probe(LUID luid) {
             check(vkdu_command_reset(command.value, allocator.value), "reset command");
         }
         const unsigned target_before = runtime.target_references;
+        const auto selected_before = runtime.counts(runtime_queues ? selected.runtime.context : runtime.context_handle);
+        const auto other_before = runtime.counts(runtime_queues ? other.runtime.context : runtime.context_handle);
+        const auto owner_before = runtime.counts(runtime.context_handle);
         check(vkdu_command_copy(command.value, resource->backend, first_word * 4, upload.value, 128, 4096), "GPU copy");
         check(vkdu_command_close(command.value), "close command");
-        check(vkdu_queue_execute(queue.value, 1, &command.value), "queue execute");
-        check(vkdu_queue_signal(queue.value, fence.value, round + 1), "queue signal");
+        check(vkdu_queue_execute(backend_queue, 1, &command.value), "queue execute");
+        // Execute includes the production software-worker drain. The DMA must
+        // already be on the selected KMT context before an external OS packet
+        // could be queued by a runtime after this call returns.
+        if (runtime_queues)
+            require(runtime.counts(selected.runtime.context).targets > selected_before.targets,
+                    "Execute returns only after the selected scheduler receives target DMA");
+        check(vkdu_queue_signal(backend_queue, fence.value, round + 1), "queue signal");
         check(vkdu_fence_wait(fence.value, round + 1, 10000), "GPU completion");
         require(runtime.target_references > target_before, "RenderCb contains actual native allocation");
+        if (runtime_queues) {
+            const auto after = runtime.counts(selected.runtime.context);
+            require(after.events > selected_before.events, "real OS completion events use selected scheduler");
+            require(runtime.counts(other.runtime.context).targets == other_before.targets &&
+                    runtime.counts(runtime.context_handle).targets == owner_before.targets,
+                    "target DMA never bypasses the selected runtime context");
+            std::printf("PASS queue_round=%u KMTcontext=%u renders=%u events=%u domain=%u\n",
+                    round, selected.runtime.context, after.renders, after.events, runtime.context_id);
+        }
         check(native.table.pfnMapHeap(native.create.hDrvDevice, native.heap, &mapped), "native MapHeap readback");
         words = static_cast<uint32_t *>(mapped);
         uint32_t mismatches = 0;
@@ -365,6 +477,14 @@ void run_probe(LUID luid) {
     }
     // Retire command references before releasing resource owners.
     command.reset(); allocator.reset(); queue.reset(); fence.reset(); upload.reset();
+    first.reset(); second.reset();
+    if (runtime_queues) {
+        require(!first.runtime.context && !second.runtime.context,
+                "both runtime callbacks destroyed their own scheduler contexts");
+        std::lock_guard<std::mutex> lock(runtime.mutex);
+        require(runtime.contexts.size() == 1 && runtime.contexts.count(runtime.context_handle),
+                "allocation owner survives destruction of both runtime queues");
+    }
     const auto target = runtime.target_handle.load();
     native.table.pfnDestroyHeapAndResource(native.create.hDrvDevice, native.heap, {}); native.heap = {};
     require(runtime.has(target), "resource survives native heap slot destruction");
@@ -375,13 +495,14 @@ void run_probe(LUID luid) {
     check(VioGpuD3D12BridgeStatus(native.create.hDrvDevice), "native teardown status");
     runtime.native_cleanup = true;
     native.finish();
-    require(runtime.cleanup_completions != 0, "backend completed-fence callback succeeds during native cleanup");
+    require(runtime.cleanup_identity_queries != 0, "runtime identity callback remains live during native cleanup");
     require(runtime.context_handle == 0, "native context closed before final runtime device cleanup");
     {
         std::lock_guard<std::mutex> lock(runtime.mutex);
         require(runtime.allocations.empty(), "all native allocations released before final runtime device cleanup");
+        require(runtime.contexts.empty(), "all scheduler contexts released before final runtime device cleanup");
     }
-    std::printf("PASS cleanup completed_queries=%u native_context=0 allocations=0\n", runtime.cleanup_completions.load());
+    std::printf("PASS cleanup identity_queries=%u native_context=0 allocations=0\n", runtime.cleanup_identity_queries.load());
     check(runtime.close(), "final real KMT owner cleanup");
     std::printf("PASS shared native heap/private Turnip import/real RenderCb/MapHeap:8x16384 words; renders=%u\n",
         runtime.renders.load());
@@ -407,9 +528,10 @@ int main(int argc, char **argv) {
     uint32_t low = 0, high = 0;
     if (argc != 6 || std::strcmp(argv[1], "--luid-low") || std::strcmp(argv[3], "--luid-high") ||
             (std::strcmp(argv[5], "--run-shared-backing") && std::strcmp(argv[5], "--run-shared-textures") &&
+             std::strcmp(argv[5], "--run-runtime-queues") &&
              std::strcmp(argv[5], "--run-os-fence-mapping") && std::strcmp(argv[5], "--run-os-fence-controls")) ||
             !hex32(argv[2], low) || !hex32(argv[4], high) || !(low | high)) {
-        std::fputs("usage: vkd3d-umd-shared-gpu-probe --luid-low HEX --luid-high HEX --run-shared-backing|--run-shared-textures|--run-os-fence-mapping|--run-os-fence-controls\n"
+        std::fputs("usage: vkd3d-umd-shared-gpu-probe --luid-low HEX --luid-high HEX --run-shared-backing|--run-shared-textures|--run-runtime-queues|--run-os-fence-mapping|--run-os-fence-controls\n"
             "       --validate-os-fence-controls checks request construction only, with no KMT calls.\n"
             "Requires exact VIOGPU LUID; shared modes also need matching private-import Turnip. No native runtime admission.\n", stderr);
         return 2;
@@ -423,7 +545,7 @@ int main(int argc, char **argv) {
         const LUID luid{low, static_cast<LONG>(high)};
         if (os_fence) run_os_fence_probe(luid, os_fence_controls);
         else if (!std::strcmp(argv[5], "--run-shared-textures")) run_texture_probe(luid);
-        else run_probe(luid);
+        else run_probe(luid, !std::strcmp(argv[5], "--run-runtime-queues"));
         return 0;
     }
     catch (const std::exception &error) { std::fprintf(stderr, "FAIL shared-backing probe: %s\n", error.what()); return 1; }

@@ -3,8 +3,10 @@
 The earlier direct OS fence-import proposal overstates the role of GPUVA for
 ordinary single-adapter execution. Microsoft's physical-mode compute sample
 uses runtime-associated physical contexts and runtime external synchronization.
-The genuine missing dependency in this implementation is carrying logical
-runtime queue identity through the backend and its actual KMD submissions.
+The coordinated implementation now carries logical runtime queue identity
+through the backend and its actual KMD submissions. Production-backed lifecycle
+tests and Windows builds pass; target execution of the coordinated set is still
+required. Ordinary D3D12 admission remains disabled.
 
 ## Evidence
 
@@ -27,12 +29,12 @@ Local `graphics-driver-samples` commit
   `D3D12DDI_CORELAYER_DEVICECALLBACKS_0003`, as checked against the WDK header.
   This source evidence is not yet a VIOGPU ordinary-runtime acceptance result.
 
-## Current concrete mismatch
+## Baseline mismatch addressed by this change
 
-VKD3D's `native_heap_open_context` uses the legacy device-scoped kernel callback
+The original `native_heap_open_context` used the legacy device-scoped kernel callback
 `pKTCallbacks->pfnCreateContextCb(hRTDevice, ...)`, once for the whole VkDevice.
-`native_queue_create` remembers `hRTCommandQueue` but never associates it with
-that actual scheduler context. `mwd_callbacks.submit/completed` receive only a
+`native_queue_create` remembered `hRTCommandQueue` but never associated it with
+that actual scheduler context. `mwd_callbacks.submit/completed` received only a
 device owner; there is no per-submission logical queue identity. Embedded
 `ExecuteCommandLists` queues work asynchronously, so a temporary caller-thread
 global cannot correctly route later submissions.
@@ -44,23 +46,74 @@ Merely creating extra runtime contexts would either send work to a context that
 does not own those allocations, or leave the runtime-associated context idle
 while real GPU work goes elsewhere. Neither satisfies runtime fence ordering.
 
-## Coordinated implementation under development
+## Coordinated implementation and validated boundary
 
 Root authorized isolated local KMD/Mesa worktrees from `bab3d2ff`/`a304f0ff`,
 both on `work/d3d12-runtime-queues-20260919`. The existing VKD3D branch owns its
 consumer changes. Root active worktrees and pins stay untouched.
 
-The bounded implementation separates a retained native allocation domain from
-the scheduler contexts associated with each runtime command queue. Queue-aware
-callbacks must route each actual submitted packet and completion to the same
-context registered with that runtime queue. Resource imports retain their shared
-domain; cross-device, reset-generation and stale-domain requests must reject.
+The implementation separates a retained native allocation domain from
+the scheduler contexts associated with each runtime command queue. The KMD uses
+an exact 40-byte shared create packet with numeric domain ID and generation;
+legacy 32-byte creation is unchanged. Child contexts retain the allocation
+owner; owner destruction rejects while children exist. Each child owns its
+scheduler state and cannot detach the owner's native registration.
+
+VKD3D creates each child with the actual `hRTCommandQueue` runtime callback,
+checks its domain identity, and routes each submitted packet and completion
+event to the returned context. Separate retained records outlive runtime slots.
+Embedded logical queues carry their identity even when they share one `VkQueue`.
+The metadata survives asynchronous workers and split/fallback/wait/signal paths.
+Mesa retains the token in its real common submission object, forbids merging
+submissions carrying metadata and routes Turnip batches through the provider.
+
+Execute drains software translation and kernel enqueue before returning. This
+does not wait for GPU idle; it prevents a later runtime external fence packet
+from overtaking the actual Render callback. Mesa also observes device loss while
+waiting when a failed worker exits without the normal queue-pop notification.
+Completion is a domain-wide FIFO watermark advanced by real context-ordered OS
+events, not a private-fence query against an idle owner context. Resource imports
+retain their shared domain; foreign device, reset and stale token requests reject.
 Runtime external signal/wait packets operate on those scheduler contexts, while
 embedded Vulkan fences remain an independent completion mechanism.
 
-Required validation includes actual production paths for two independent queue
-identities, per-queue ordering/completion, shared allocations, rejected foreign
-domains, partial construction rollback, reset, pending destruction and precisely
-balanced lifetime. A dropped queue identity or routing to the allocation-owner
-context must be detected by negative controls. Do not open ordinary admission
-until these paths and mandatory graphics/residency/Present contracts work.
+Private runtime ABI is now version **2**. The paired headers are byte-identical
+with SHA256 `facd7a43c42b227b9bc9cc44d184b4801b3e5201168028fb9ae9700f8abd1999`.
+Do not pair these artifacts with runtime-v1 Mesa or VKD3D.
+
+- KMD `00d851e5`: retained domains; production lifetime and 500 create/close
+  races, three semantic controls, Render/prepatch 54/54 and private ABI pass.
+  Inherited Advanced Color fixture repair `23aef2df`, disposable Windows fixture
+  cleanup `8b3d09b4`, and default-build guards `89f4061c` are separate commits.
+  Contract and all 47 Advanced Color negatives pass locally. ARM64 driver build
+  run 35450586472 is pending; do not claim this KMD is compiled yet.
+- Mesa `709ac5ef`: run 35450196385 passes regression, ARM64 SDK/WDK compilation
+  and full Turnip linking. Production queue metadata/drain passes ASan/UBSan;
+  reread-token, double-release and skip-drain semantic controls are caught.
+- VKD3D `09c70fb`: run 35450195342 passes Linux real CPU Vulkan backend, Windows
+  ARM64 build, x86/x64 execution and actual ARM64 lifecycle execution. Production
+  logical-worker routing/split/drain tests and drop-route/shared-token/skip-drain
+  controls pass. Actual DDI lifecycle tests verify two distinct runtime contexts,
+  shared allocation, per-context Render/events, FIFO completion and teardown.
+
+## Controlled target probe
+
+`vkd3d-umd-shared-gpu-probe --luid-low HEX --luid-high HEX --run-runtime-queues`
+requires the coordinated KMD and private-import Mesa set. It emulates the
+Microsoft runtime callbacks while forwarding to real KMT; it does **not** call
+ordinary Microsoft `D3D12CreateDevice` or validate runtime external fence policy.
+It creates two native command queues and two actual shared-domain KMT contexts,
+alternates eight changing buffer copies, verifies that Execute has enqueued the
+target DMA before returning, checks Render and OS events use the selected queue,
+then validates all 16384 readback words including untouched sentinel regions.
+Each queue must destroy its own context before allocation-owner cleanup.
+
+The existing backing probe's cleanup observation now checks identity callback
+liveness, reflecting the new completion implementation. An identity query is
+not a GPU-completion claim; real readback, OS events and production FIFO tests
+are the completion evidence. Target execution is pending.
+
+Admission must remain zero until ordinary runtime scheduling plus the mandatory
+graphics, residency and Present contracts are implemented and validated. Current
+CPU fixtures, cross-compilation and controlled KMT probes cannot satisfy that
+acceptance condition on their own.
