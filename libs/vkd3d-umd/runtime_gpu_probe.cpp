@@ -388,6 +388,7 @@ void run_probe(LUID luid) {
     std::puts("BOUNDARY emulated runtime callbacks + real KMT/GPU; NOT Microsoft D3D12CreateDevice acceptance");
 }
 #include "runtime_textures_probe.inc"
+#include "os_fence_probe.inc"
 
 bool hex32(const char *text, uint32_t &value) {
     if (!text || !*text || std::strlen(text) > 10 || *text == '-' || *text == '+') return false;
@@ -401,17 +402,21 @@ bool hex32(const char *text, uint32_t &value) {
 int main(int argc, char **argv) {
     uint32_t low = 0, high = 0;
     if (argc != 6 || std::strcmp(argv[1], "--luid-low") || std::strcmp(argv[3], "--luid-high") ||
-            (std::strcmp(argv[5], "--run-shared-backing") && std::strcmp(argv[5], "--run-shared-textures")) ||
+            (std::strcmp(argv[5], "--run-shared-backing") && std::strcmp(argv[5], "--run-shared-textures") &&
+             std::strcmp(argv[5], "--run-os-fence-mapping")) ||
             !hex32(argv[2], low) || !hex32(argv[4], high) || !(low | high)) {
-        std::fputs("usage: vkd3d-umd-shared-gpu-probe --luid-low HEX --luid-high HEX --run-shared-backing|--run-shared-textures\n"
-            "Requires exact VIOGPU LUID and matching private-import Turnip. No native runtime admission.\n", stderr);
+        std::fputs("usage: vkd3d-umd-shared-gpu-probe --luid-low HEX --luid-high HEX --run-shared-backing|--run-shared-textures|--run-os-fence-mapping\n"
+            "Requires exact VIOGPU LUID; shared modes also need matching private-import Turnip. No native runtime admission.\n", stderr);
         return 2;
     }
     std::setvbuf(stdout, nullptr, _IONBF, 0);
-    std::puts("PROBE emulated runtime callbacks -> production native entry -> real KMT -> private Turnip import");
+    const bool os_fence = !std::strcmp(argv[5], "--run-os-fence-mapping");
+    std::puts(os_fence ? "PROBE real KMT-owned monitored fence mappings; no Vulkan or system D3D12 device creation" :
+        "PROBE emulated runtime callbacks -> production native entry -> real KMT -> private Turnip import");
     try {
         const LUID luid{low, static_cast<LONG>(high)};
-        if (!std::strcmp(argv[5], "--run-shared-textures")) run_texture_probe(luid);
+        if (os_fence) run_os_fence_probe(luid);
+        else if (!std::strcmp(argv[5], "--run-shared-textures")) run_texture_probe(luid);
         else run_probe(luid);
         return 0;
     }
