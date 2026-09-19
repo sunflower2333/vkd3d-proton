@@ -4615,6 +4615,7 @@ HRESULT d3d12_resource_create_placed(struct d3d12_device *device, const D3D12_RE
 
     if (heap->allocation.device_allocation.vk_memory == VK_NULL_HANDLE)
     {
+        if (heap->wddm_imported) return DXGI_ERROR_UNSUPPORTED;
         WARN("Placing resource on heap with no memory backing it. Falling back to committed resource.\n");
 
         if (FAILED(hr = d3d12_resource_create_committed(device, desc, &heap->desc.Properties,
@@ -4665,6 +4666,14 @@ HRESULT d3d12_resource_create_placed(struct d3d12_device *device, const D3D12_RE
 
         /* Align manually. This works because we padded the required allocation size reported to the app. */
         VK_CALL(vkGetImageMemoryRequirements(device->vk_device, object->res.vk_image, &memory_requirements));
+
+        if (heap->wddm_imported && ((object->flags & VKD3D_RESOURCE_LINEAR_STAGING_COPY) ||
+                !(memory_requirements.memoryTypeBits &
+                  (1u << heap->allocation.device_allocation.vk_memory_type))))
+        {
+            hr = DXGI_ERROR_UNSUPPORTED;
+            goto fail;
+        }
 
         /* For SMALL_RESOURCE_PLACEMENT when we have workaround active,
          * verify that application did in fact check alignment requirements.

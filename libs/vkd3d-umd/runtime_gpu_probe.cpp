@@ -3,6 +3,7 @@
  * Uses production native entry and backend. Never system D3D12 acceptance. */
 #include "ddi.h"
 #include <d3dkmthk.h>
+#include <d3d12.h>
 #include <cstdio>
 #include <cstdlib>
 #include <chrono>
@@ -240,6 +241,7 @@ struct NativeSession {
     D3D12DDIARG_OPENADAPTER open{};
     D3D12DDIARG_CREATEDEVICE_0003 create{};
     D3D12DDI_DEVICE_FUNCS_CORE_0003 table{};
+    D3D12DDI_COMMAND_LIST_FUNCS_3D_0003 commands{};
     alignas(NativeDevice) std::array<unsigned char, sizeof(NativeDevice)> device_memory{};
     alignas(NativeHeapSlot) std::array<unsigned char, sizeof(NativeHeapSlot)> heap_memory{};
     alignas(Object) std::array<unsigned char, sizeof(Object)> resource_memory{};
@@ -273,7 +275,6 @@ struct NativeSession {
         create.Interface = D3D12DDI_INTERFACE_VERSION_R0; create.Version = D3D12DDI_BUILD_VERSION << 16;
         create.pKTCallbacks = &kt; create.p12UMCallbacks = &um;
         check(adapter.pfnCreateDevice(open.hAdapter, &create), "native CreateDevice/private Turnip handshake");
-        D3D12DDI_COMMAND_LIST_FUNCS_3D_0003 commands{};
         D3D12DDI_COMMAND_QUEUE_FUNCS_CORE_0001 queue{};
         check(VioGpuD3D12BridgeGetTables(&table, &commands, &queue), "controlled native tables");
     }
@@ -386,6 +387,8 @@ void run_probe(LUID luid) {
         runtime.renders.load());
     std::puts("BOUNDARY emulated runtime callbacks + real KMT/GPU; NOT Microsoft D3D12CreateDevice acceptance");
 }
+#include "runtime_textures_probe.inc"
+
 bool hex32(const char *text, uint32_t &value) {
     if (!text || !*text || std::strlen(text) > 10 || *text == '-' || *text == '+') return false;
     char *end = nullptr;
@@ -398,13 +401,19 @@ bool hex32(const char *text, uint32_t &value) {
 int main(int argc, char **argv) {
     uint32_t low = 0, high = 0;
     if (argc != 6 || std::strcmp(argv[1], "--luid-low") || std::strcmp(argv[3], "--luid-high") ||
-            std::strcmp(argv[5], "--run-shared-backing") || !hex32(argv[2], low) || !hex32(argv[4], high) || !(low | high)) {
-        std::fputs("usage: vkd3d-umd-shared-gpu-probe --luid-low HEX --luid-high HEX --run-shared-backing\n"
+            (std::strcmp(argv[5], "--run-shared-backing") && std::strcmp(argv[5], "--run-shared-textures")) ||
+            !hex32(argv[2], low) || !hex32(argv[4], high) || !(low | high)) {
+        std::fputs("usage: vkd3d-umd-shared-gpu-probe --luid-low HEX --luid-high HEX --run-shared-backing|--run-shared-textures\n"
             "Requires exact VIOGPU LUID and matching private-import Turnip. No native runtime admission.\n", stderr);
         return 2;
     }
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::puts("PROBE emulated runtime callbacks -> production native entry -> real KMT -> private Turnip import");
-    try { run_probe(LUID{low, static_cast<LONG>(high)}); return 0; }
+    try {
+        const LUID luid{low, static_cast<LONG>(high)};
+        if (!std::strcmp(argv[5], "--run-shared-textures")) run_texture_probe(luid);
+        else run_probe(luid);
+        return 0;
+    }
     catch (const std::exception &error) { std::fprintf(stderr, "FAIL shared-backing probe: %s\n", error.what()); return 1; }
 }

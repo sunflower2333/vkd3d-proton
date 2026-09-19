@@ -120,6 +120,27 @@ static int32_t test_static_root(vkdu_device *d, const vkdu_root_parameter *, uin
     *out = SUCCEEDED(next_result) ? make_peer(d, VKDU_ROOT) : nullptr;
     return next_result;
 }
+static unsigned texture_srv_calls, texture_copy_calls;
+static vkdu_texture_copy_location seen_texture_src, seen_texture_dst;
+static vkdu_box seen_texture_box;
+static uint32_t texture_x, texture_y, texture_z;
+static void (*texture_hook)();
+static uint32_t test_texture_format(vkdu_object *p) { return peer(p)->type; }
+static int32_t test_texture_srv(vkdu_object *heap, uint32_t index, vkdu_object *texture) {
+    ++texture_srv_calls; srv_index = index; srv_buffer = texture;
+    if (peer(heap)->references < 2 || peer(texture)->references < 2) std::abort();
+    if (texture_hook) texture_hook();
+    return next_result;
+}
+static int32_t test_texture_copy(vkdu_object *command, const vkdu_texture_copy_location *dst,
+        uint32_t x, uint32_t y, uint32_t z, const vkdu_texture_copy_location *src, const vkdu_box *box) {
+    ++texture_copy_calls;
+    if (peer(command)->references < 2 || peer(src->resource)->references < 2 || peer(dst->resource)->references < 2) std::abort();
+    if (texture_hook) texture_hook();
+    seen_texture_src = *src; seen_texture_dst = *dst;
+    seen_texture_box = box ? *box : vkdu_box{}; texture_x = x; texture_y = y; texture_z = z;
+    return next_result;
+}
 #define vkdu_object_is test_is
 #define vkdu_object_belongs test_belongs
 #define vkdu_object_destroy test_destroy
@@ -143,13 +164,18 @@ static int32_t test_static_root(vkdu_device *d, const vkdu_root_parameter *, uin
 #define vkdu_root_create test_root
 #define vkdu_root_create_samplers test_static_root
 #define vkdu_sampler_create test_sampler
+#define vkdu_texture2d_format test_texture_format
+#define vkdu_texture2d_srv test_texture_srv
+#define vkdu_command_texture_copy test_texture_copy
 #include "ddi.cpp"
 
 #define REQUIRE(x) do { if (!(x)) { std::fprintf(stderr, "FAIL native descriptor line %d: %s\n", __LINE__, #x); return 1; } } while (0)
 static void APIENTRY capture(void *, HRESULT hr) { reported = hr; }
 #include "ddi_samplers_test.inc"
+#include "ddi_textures_test.inc"
 int main() {
     if (check_native_samplers()) return 1;
+    if (check_native_textures()) return 1;
     calls = destroys = sampler_calls = 0; next_result = reported = S_OK;
     Context ctx;
     ctx.backend = reinterpret_cast<vkdu_device *>(&next_base);
@@ -257,7 +283,7 @@ int main() {
     REQUIRE(calls == before && reported == E_INVALIDARG);
     srv.ResourceDimension = D3D12DDI_RD_TEXTURE2D;
     device.pfnCreateShaderResourceView(h, &srv, destination);
-    REQUIRE(calls == before && reported == E_NOTIMPL);
+    REQUIRE(calls == before && reported == E_INVALIDARG);
     srv.ResourceDimension = D3D12DDI_RD_BUFFER;
     ++destination.ptr;
     device.pfnCreateShaderResourceView(h, &srv, destination);

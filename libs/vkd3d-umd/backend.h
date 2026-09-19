@@ -37,6 +37,12 @@ struct vkdu_static_sampler {
     struct vkdu_sampler_desc desc;
     uint32_t border_color, shader_register, register_space, visibility;
 };
+struct vkdu_texture_copy_location {
+    vkdu_object *resource;
+    uint64_t offset; /* Byte offset for a footprint; subresource index otherwise. */
+    uint32_t footprint, format, width, height, depth, row_pitch;
+};
+struct vkdu_box { uint32_t left, top, front, right, bottom, back; };
 
 int32_t vkdu_device_create(PFN_vkGetInstanceProcAddr loader, const struct vkdu_adapter *adapter, vkdu_device **out);
 /* Native runtime adapter identity is the KMD-provided LUID. Vulkan vendor and
@@ -70,7 +76,16 @@ uint64_t vkdu_buffer_size(vkdu_object *buffer);
  * Committed backend resources, not native runtime heap/texture admission. */
 int32_t vkdu_texture2d_create(vkdu_device *device, uint32_t width, uint32_t height,
         uint32_t format, vkdu_object **out);
+int32_t vkdu_texture2d_allocation(vkdu_device *device, uint32_t width, uint32_t height,
+        uint32_t format, uint64_t *bytes, uint64_t *alignment);
+int32_t vkdu_texture_heap_import(vkdu_device *device, void *owner, void *token, uint64_t bytes, vkdu_object **out);
+int32_t vkdu_texture2d_place(vkdu_device *device, vkdu_object *heap, uint64_t offset,
+        uint32_t width, uint32_t height, uint32_t format, uint32_t state, vkdu_object **out);
+int32_t vkdu_command_texture_copy(vkdu_object *command, const struct vkdu_texture_copy_location *dst,
+        uint32_t x, uint32_t y, uint32_t z, const struct vkdu_texture_copy_location *src,
+        const struct vkdu_box *box);
 int32_t vkdu_texture2d_srv(vkdu_object *heap, uint32_t index, vkdu_object *texture);
+uint32_t vkdu_texture2d_format(vkdu_object *texture);
 int32_t vkdu_command_texture_upload(vkdu_object *command, vkdu_object *texture,
         vkdu_object *upload, uint64_t offset, uint32_t row_pitch);
 int32_t vkdu_sampler_create(vkdu_object *heap, uint32_t index, const struct vkdu_sampler_desc *desc);

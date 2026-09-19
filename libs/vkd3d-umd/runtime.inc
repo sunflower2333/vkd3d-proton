@@ -139,6 +139,7 @@ HRESULT native_load_vulkan(HMODULE *module, PFN_vkGetInstanceProcAddr *loader) {
 
 #include "native_heap.inc"
 #include "native_samplers.inc"
+#include "native_textures.inc"
 
 // error_mutex owns these lists. Compare opaque slots before dereferencing them.
 Object *native_submission_find(Object *head, void *slot) {

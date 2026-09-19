@@ -1055,6 +1055,7 @@ struct d3d12_heap
 #endif
 
     struct d3d12_device *device;
+    bool wddm_imported;
     struct vkd3d_private_store private_store;
     struct d3d_destruction_notifier destruction_notifier;
 };

@@ -4,6 +4,14 @@ This target statically embeds vkd3d-proton in `viogpud3d12.dll`. It does not
 import or replace the application `d3d12.dll` or export D3D12CreateDevice.
 It exports the genuine WDK OpenAdapter12 entrypoint, but advertises no complete
 DDI version or feature level yet and is not registered as the active D3D12 UMD.
+The bounded texture continuation supports single-layer/mip/sample R32_FLOAT
+and RGBA8 non-render-target images backed by the native runtime's allocation.
+It adds native texture SRVs and physical-pitched CopyTextureRegion, validates
+actual embedded image allocation requirements, and rejects separate committed
+or staging-memory fallbacks. It does not advertise native D3D12 admission,
+graphics, render-target/depth views, residency or Present. See
+`docs/vkd3d-native-textures-20260919.md` for exact tests and limits.
+
 The engine revision
 and every submodule are pinned by the driver parent repository.
 

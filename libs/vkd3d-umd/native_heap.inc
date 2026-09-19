@@ -99,9 +99,22 @@ HRESULT native_heap_desc(const D3D12DDIARG_CREATEHEAP_0001 *heap,
             heap->ByteSize > (UINT32_MAX & ~uint64_t(4095)) ||
             (heap->Alignment && heap->Alignment != native_heap_alignment) ||
             heap->CreationNodeMask != 1 || heap->VisibleNodeMask != 1) return E_INVALIDARG;
-    if (heap->Flags != D3D12DDI_HEAP_FLAG_BUFFERS || heap->MemoryPool != D3D12DDI_MEMORY_POOL_L0 ||
+    if ((heap->Flags != D3D12DDI_HEAP_FLAG_BUFFERS && heap->Flags != D3D12DDI_HEAP_FLAG_NON_RT_DS_TEXTURES) ||
+            heap->MemoryPool != D3D12DDI_MEMORY_POOL_L0 ||
             (heap->CPUPageProperty != D3D12DDI_CPU_PAGE_PROPERTY_NOT_AVAILABLE &&
              heap->CPUPageProperty != D3D12DDI_CPU_PAGE_PROPERTY_WRITE_BACK)) return DXGI_ERROR_UNSUPPORTED;
+    if (heap->Flags == D3D12DDI_HEAP_FLAG_NON_RT_DS_TEXTURES) {
+        if (!resource || heap->CPUPageProperty != D3D12DDI_CPU_PAGE_PROPERTY_NOT_AVAILABLE) return DXGI_ERROR_UNSUPPORTED;
+        D3D12DDIARG_BUFFER_PLACEMENT no_reuse{};
+        if (resource->ResourceType != D3D12DDI_RT_TEXTURE2D || !resource->Width || resource->Width > 16384 ||
+                !resource->Height || resource->Height > 16384 || resource->DepthOrArraySize != 1 || resource->MipLevels != 1 ||
+                (resource->Format != DXGI_FORMAT_R32_FLOAT && resource->Format != DXGI_FORMAT_R8G8B8A8_UNORM) ||
+                resource->SampleDesc.Count != 1 || resource->SampleDesc.Quality || resource->Flags || resource->pRowMajorLayout ||
+                (resource->Layout != D3D12DDI_TL_UNDEFINED && resource->Layout != D3D12DDI_TL_DEVICE_DEPENDENT_SWIZZLE_0) ||
+                std::memcmp(&resource->ReuseBufferGPUVA, &no_reuse, sizeof(no_reuse))) return DXGI_ERROR_UNSUPPORTED;
+        const UINT state = resource->InitialResourceState;
+        return !state || state == 0x400 || state == 0x800 || state == 0x40 || state == 0x80 || state == 0xc0 ? S_OK : DXGI_ERROR_UNSUPPORTED;
+    }
     if (resource) {
         D3D12DDIARG_BUFFER_PLACEMENT no_reuse{};
         if (resource->ResourceType != D3D12DDI_RT_BUFFER || !resource->Width || resource->Width > heap->ByteSize ||
@@ -264,8 +277,24 @@ HRESULT APIENTRY native_heap_create(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATE
     HRESULT hr = native_heap_desc(args, resource);
     if (FAILED(hr)) return hr;
     auto *ctx = op.ctx;
+    const auto heap_request = *args;
+    const auto resource_request = resource ? *resource : D3D12DDIARG_CREATERESOURCE_0003{};
+    args = &heap_request;
+    if (resource) resource = &resource_request;
     if (!slot.pDrvPrivate || clear || (resource != nullptr) != (resource_slot.pDrvPrivate != nullptr) ||
             native_heap_find(ctx, slot.pDrvPrivate)) return E_INVALIDARG;
+    const bool texture = resource && resource->ResourceType == D3D12DDI_RT_TEXTURE2D;
+    if (texture) {
+        uint64_t bytes = 0, alignment = 0;
+        {
+            NativeBackendCall call(ctx);
+            hr = vkdu_texture2d_allocation(ctx->backend, static_cast<UINT>(resource->Width), resource->Height,
+                    resource->Format, &bytes, &alignment);
+        }
+        if (!op.live()) return DXGI_ERROR_DEVICE_REMOVED;
+        if (FAILED(hr)) return hr;
+        if (alignment != native_heap_alignment || bytes > args->ByteSize) return E_INVALIDARG;
+    }
     if (runtime_resource.handle)
         for (auto *existing = ctx->native_heaps; existing; existing = existing->next)
             if (existing->runtime_resource == runtime_resource.handle) return E_INVALIDARG;
@@ -299,22 +328,26 @@ HRESULT APIENTRY native_heap_create(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATE
         heap->slot = nullptr; // No native slot is published while Vulkan imports.
         {
             NativeBackendCall backend_call(ctx);
-            hr = vkdu_memory_heap_import(ctx->backend, ctx, heap, heap->bytes, heap->cpu_visible, &memory);
+            hr = texture ? vkdu_texture_heap_import(ctx->backend, ctx, heap, heap->bytes, &memory) :
+                vkdu_memory_heap_import(ctx->backend, ctx, heap, heap->bytes, heap->cpu_visible, &memory);
         }
         // Import can synchronously retire the runtime. Do not begin placement
         // against that device after reacquiring the callback lock.
         if (SUCCEEDED(hr)) hr = native_heap_generation(ctx);
         {
             NativeBackendCall backend_call(ctx);
-            if (SUCCEEDED(hr)) hr = vkdu_buffer_place(ctx->backend, memory, 0, resource->Width,
-                                                       static_cast<uint32_t>(resource->InitialResourceState), &buffer);
+            if (SUCCEEDED(hr)) hr = texture ? vkdu_texture2d_place(ctx->backend, memory, 0,
+                    static_cast<UINT>(resource->Width), resource->Height, resource->Format,
+                    static_cast<UINT>(resource->InitialResourceState), &buffer) :
+                vkdu_buffer_place(ctx->backend, memory, 0, resource->Width,
+                    static_cast<uint32_t>(resource->InitialResourceState), &buffer);
             vkdu_object_destroy(memory);
         }
         if (SUCCEEDED(hr)) hr = native_heap_generation(ctx);
-        if (SUCCEEDED(hr) && (!op.live() || vkdu_buffer_address(buffer) != heap->address))
+        if (SUCCEEDED(hr) && (!op.live() || (!texture && vkdu_buffer_address(buffer) != heap->address)))
             hr = DXGI_ERROR_DEVICE_REMOVED;
         if (SUCCEEDED(hr)) {
-            hr = bind(ctx, resource_slot.pDrvPrivate, buffer, VKDU_BUFFER);
+            hr = bind(ctx, resource_slot.pDrvPrivate, buffer, texture ? VKDU_TEXTURE2D : VKDU_BUFFER);
             if (SUCCEEDED(hr)) object(resource_slot.pDrvPrivate)->native_heap = heap;
         }
         if (FAILED(hr)) {

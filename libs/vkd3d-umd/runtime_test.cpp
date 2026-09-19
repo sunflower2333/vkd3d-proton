@@ -133,6 +133,9 @@ static void APIENTRY test_command_error(D3D12DDI_HRTCOMMANDLIST runtime, HRESULT
 
 static int32_t test_import_heap(vkdu_device *, void *, void *, uint64_t, int, vkdu_object **);
 static int32_t test_place_buffer(vkdu_device *, vkdu_object *, uint64_t, uint64_t, uint32_t, vkdu_object **);
+static int32_t test_texture_allocation(vkdu_device *, uint32_t, uint32_t, uint32_t, uint64_t *, uint64_t *);
+static int32_t test_texture_import(vkdu_device *, void *, void *, uint64_t, vkdu_object **);
+static int32_t test_texture_place(vkdu_device *, vkdu_object *, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, vkdu_object **);
 static void test_object_destroy(vkdu_object *);
 static int test_object_retain(vkdu_object *);
 static int test_object_is(vkdu_object *, vkdu_kind);
@@ -159,6 +162,9 @@ static DWORD WINAPI test_event_wait(HANDLE event, DWORD timeout) {
 #define vkdu_device_destroy test_destroy
 #define vkdu_memory_heap_import test_import_heap
 #define vkdu_buffer_place test_place_buffer
+#define vkdu_texture2d_allocation test_texture_allocation
+#define vkdu_texture_heap_import test_texture_import
+#define vkdu_texture2d_place test_texture_place
 #define vkdu_object_destroy test_object_destroy
 #define vkdu_object_retain test_object_retain
 #define vkdu_object_is test_object_is
@@ -190,7 +196,31 @@ struct ImportPeer {
     vkdu_kind kind;
     uint64_t address, bytes;
     unsigned references = 1;
+    uint32_t width = 0, height = 0, format = 0;
 };
+static std::function<void()> texture_allocation_callback;
+static uint64_t texture_required_bytes = 65536;
+static int32_t test_texture_allocation(vkdu_device *device, uint32_t width, uint32_t height,
+        uint32_t format, uint64_t *bytes, uint64_t *alignment) {
+    auto *peer = reinterpret_cast<TestDevice *>(device);
+    wait_backend_worker(peer->callbacks, peer->owner);
+    if (!width || !height || (format != 28 && format != 41)) fixture_abort(__LINE__);
+    *bytes = texture_required_bytes; *alignment = 65536;
+    if (texture_allocation_callback) texture_allocation_callback();
+    return S_OK;
+}
+static int32_t test_texture_import(vkdu_device *device, void *owner, void *token, uint64_t bytes, vkdu_object **out) {
+    return test_import_heap(device, owner, token, bytes, 0, out);
+}
+static int32_t test_texture_place(vkdu_device *device, vkdu_object *memory, uint64_t offset,
+        uint32_t width, uint32_t height, uint32_t format, uint32_t state, vkdu_object **out) {
+    HRESULT hr = test_place_buffer(device, memory, offset, texture_required_bytes, state, out);
+    if (SUCCEEDED(hr)) {
+        auto *peer = reinterpret_cast<ImportPeer *>(*out);
+        peer->kind = VKDU_TEXTURE2D; peer->width = width; peer->height = height; peer->format = format;
+    }
+    return hr;
+}
 static bool import_failure, placement_failure, retire_during_import;
 static unsigned imports, placements;
 static bool last_import_cpu_visible;
@@ -556,6 +586,8 @@ static void retire_import_with_map(Context *ctx, const mwd_allocation &allocatio
         fixture_abort(__LINE__);
 }
 
+#include "runtime_textures_test.inc"
+
 static int test_native_heaps() {
     D3DDDI_ADAPTERCALLBACKS adapter_callbacks{};
     adapter_callbacks.pfnQueryAdapterInfoCb = test_query;
@@ -744,6 +776,7 @@ static int test_native_heaps() {
     before_pair = allocations;
     REQUIRE(paired() == DXGI_ERROR_UNSUPPORTED && allocations == before_pair);
     resource.Flags = D3D12DDI_RESOURCE_FLAG_0003_NONE;
+    REQUIRE(test_native_textures(ctx, create.hDrvDevice, table) == 0);
     desc.CPUPageProperty = D3D12DDI_CPU_PAGE_PROPERTY_WRITE_BACK;
     resource.InitialResourceState = D3D12DDI_RESOURCE_STATE_COPY_DEST;
     REQUIRE(paired() == S_OK);

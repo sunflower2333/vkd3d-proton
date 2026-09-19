@@ -311,6 +311,7 @@ static HRESULT d3d12_heap_init(struct d3d12_heap *heap, struct d3d12_device *dev
     heap->refcount = 1;
     heap->desc = *desc;
     heap->device = device;
+    heap->wddm_imported = runtime_import != NULL;
     heap->priority.allows_dynamic_residency = false;
     spinlock_init(&heap->priority.spinlock);
     heap->priority.d3d12priority = D3D12_RESIDENCY_PRIORITY_NORMAL;
@@ -331,7 +332,7 @@ static HRESULT d3d12_heap_init(struct d3d12_heap *heap, struct d3d12_device *dev
     alloc_info.host_ptr = host_address;
     alloc_info.pNext = runtime_import;
 
-    if ((alloc_info.heap_desc.Flags & D3D12_HEAP_FLAG_DENY_BUFFERS) &&
+    if (!runtime_import && (alloc_info.heap_desc.Flags & D3D12_HEAP_FLAG_DENY_BUFFERS) &&
         d3d12_device_allow_image_heap_suballocation(device))
     {
         alloc_info.extra_allocation_flags = VKD3D_ALLOCATION_FLAG_ALLOW_IMAGE_SUBALLOCATION;
@@ -435,8 +436,11 @@ HRESULT vkd3d_create_heap_wddm(ID3D12Device *iface, const D3D12_HEAP_DESC *desc,
     if (!heap) return E_POINTER;
     *heap = NULL;
     if (!device || !owner || device->wddm_runtime_owner != owner || !token || !desc ||
-            desc->Flags != D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS || !desc->SizeInBytes ||
+            (desc->Flags != D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS &&
+             desc->Flags != D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES) || !desc->SizeInBytes ||
             desc->Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) return E_INVALIDARG;
+    if (desc->Flags == D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES &&
+            desc->Properties.Type != D3D12_HEAP_TYPE_DEFAULT) return E_INVALIDARG;
     if (!(object = vkd3d_malloc(sizeof(*object)))) return E_OUTOFMEMORY;
     if (FAILED(hr = d3d12_heap_init(object, device, desc, NULL, &import)))
     {

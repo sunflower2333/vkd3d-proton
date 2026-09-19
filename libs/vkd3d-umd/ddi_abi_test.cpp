@@ -37,6 +37,7 @@ int main(int argc, char **argv) {
     REQUIRE(commands.value.pfnSetComputeRootConstantBufferView && commands.value.pfnSetComputeRootShaderResourceView);
     REQUIRE(commands.value.pfnSetComputeRoot32BitConstant && commands.value.pfnSetComputeRoot32BitConstants);
     REQUIRE(commands.value.pfnSetDescriptorHeaps && commands.value.pfnSetComputeRootDescriptorTable);
+    REQUIRE(commands.value.pfnCopyTextureRegion && device.value.pfnCreateSampler);
     REQUIRE(device.value.pfnCalcPrivateHeapAndResourceSizes && device.value.pfnCreateHeapAndResource &&
             device.value.pfnDestroyHeapAndResource && device.value.pfnMapHeap && device.value.pfnUnmapHeap);
     REQUIRE(!device.value.pfnCreateFence && !device.value.pfnMakeResident);

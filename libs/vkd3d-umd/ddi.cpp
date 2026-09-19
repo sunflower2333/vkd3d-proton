@@ -35,6 +35,9 @@ void APIENTRY execute_indirect(D3D12DDI_HCOMMANDLIST, D3D12DDI_HCOMMANDSIGNATURE
 void APIENTRY create_sampler(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATE_SAMPLER *, D3D12DDI_CPU_DESCRIPTOR_HANDLE);
 HRESULT native_root_backend(Context *, void *, const vkdu_root_parameter *, UINT, UINT,
         const vkdu_static_sampler *, UINT);
+void native_texture_srv(Context *, const D3D12DDIARG_CREATE_SHADER_RESOURCE_VIEW_0002 *, D3D12DDI_CPU_DESCRIPTOR_HANDLE);
+void APIENTRY copy_texture(D3D12DDI_HCOMMANDLIST, const D3D12DDIARG_BUFFER_PLACEMENT *, D3D12DDIARG_PLACED_RESOURCE,
+        UINT, UINT, UINT, const D3D12DDIARG_BUFFER_PLACEMENT *, D3D12DDIARG_PLACED_RESOURCE, const D3D12DDI_BOX *);
 // Runtime owns this slot; child objects hold references to the separate Context.
 struct NativeDevice { uint32_t magic; Context *context; };
 // Track recursion only while the underlying mutex is owned. A call back into
@@ -195,6 +198,10 @@ HRESULT bind(Context *ctx, void *memory, vkdu_object *value, vkdu_kind kind) {
         }
         entry->next = ctx->resources; ctx->resources = entry;
         ReleaseSRWLockExclusive(&ctx->resources_lock);
+    } else if (kind == VKDU_TEXTURE2D) {
+        AcquireSRWLockExclusive(&ctx->resources_lock);
+        entry->next = ctx->resources; ctx->resources = entry;
+        ReleaseSRWLockExclusive(&ctx->resources_lock);
     } else if (kind == VKDU_DESCRIPTOR_HEAP) {
         AcquireSRWLockExclusive(&ctx->resources_lock);
         entry->next = ctx->descriptor_heaps; ctx->descriptor_heaps = entry;
@@ -260,6 +267,11 @@ Object *find_heap(Context *ctx, uint64_t address, bool gpu, uint32_t *index) {
 // Caller holds resources_lock; never dereference an unregistered native handle.
 Object *find_buffer(Context *ctx, void *handle) {
     for (auto *p = ctx->resources; p; p = p->next)
+        if (p == handle && p->kind == VKDU_BUFFER) return p;
+    return nullptr;
+}
+Object *find_resource(Context *ctx, void *handle) {
+    for (auto *p = ctx->resources; p; p = p->next)
         if (p == handle) return p;
     return nullptr;
 }
@@ -284,6 +296,7 @@ void APIENTRY create_srv(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATE_SHADER_RES
     auto *ctx = context(h);
     if (!ctx) return;
     if (!args) { error(ctx, E_INVALIDARG); return; }
+    if (args->ResourceDimension == D3D12DDI_RD_TEXTURE2D) { native_texture_srv(ctx, args, destination); return; }
     if (args->ResourceDimension != D3D12DDI_RD_BUFFER) { error(ctx, E_NOTIMPL); return; }
     uint32_t index = 0; HRESULT hr = E_INVALIDARG;
     AcquireSRWLockShared(&ctx->resources_lock);
@@ -479,7 +492,7 @@ void APIENTRY barriers(D3D12DDI_HCOMMANDLIST c, UINT count, const D3D12DDIARG_RE
             handle = args[i].UAV.hResource.pDrvPrivate;
             translated[i].type = VKDU_BARRIER_UAV;
         } else { hr = E_NOTIMPL; break; }
-        auto *resource = find_buffer(ctx, handle);
+        auto *resource = find_resource(ctx, handle);
         if (handle && !resource) { hr = E_INVALIDARG; break; }
         translated[i].resource = resource ? resource->backend : nullptr;
     }
@@ -673,9 +686,9 @@ extern "C" void APIENTRY VioGpuD3D12BridgeUnbindObject(void *memory) {
     auto *value = object(memory);
     if (!value) return;
     auto *ctx = value->context;
-    if (value->kind == VKDU_BUFFER || value->kind == VKDU_DESCRIPTOR_HEAP) {
+    if (value->kind == VKDU_BUFFER || value->kind == VKDU_TEXTURE2D || value->kind == VKDU_DESCRIPTOR_HEAP) {
         AcquireSRWLockExclusive(&ctx->resources_lock);
-        Object **p = value->kind == VKDU_BUFFER ? &ctx->resources : &ctx->descriptor_heaps;
+        Object **p = value->kind == VKDU_DESCRIPTOR_HEAP ? &ctx->descriptor_heaps : &ctx->resources;
         while (*p && *p != value) p = &(*p)->next;
         if (*p) *p = value->next;
         ReleaseSRWLockExclusive(&ctx->resources_lock);
@@ -708,6 +721,7 @@ extern "C" HRESULT APIENTRY VioGpuD3D12BridgeGetTables(D3D12DDI_DEVICE_FUNCS_COR
     device->pfnCopyDescriptors = copy_descriptors;
     commands->pfnCloseCommandList = command_close; commands->pfnResetCommandList = command_reset;
     commands->pfnCopyBufferRegion = copy; commands->pfnResourceBarrier = barriers; commands->pfnDispatch = dispatch;
+    commands->pfnCopyTextureRegion = copy_texture;
     commands->pfnExecuteIndirect = execute_indirect;
     commands->pfnSetComputeRootSignature = root_set; commands->pfnSetPipelineState = pipeline_set;
     commands->pfnSetComputeRootUnorderedAccessView = root_uav;
@@ -717,7 +731,7 @@ extern "C" HRESULT APIENTRY VioGpuD3D12BridgeGetTables(D3D12DDI_DEVICE_FUNCS_COR
     commands->pfnSetComputeRoot32BitConstants = root_constants;
     commands->pfnSetDescriptorHeaps = set_heaps; commands->pfnSetComputeRootDescriptorTable = set_table;
     queue->pfnExecuteCommandLists = execute;
-    // Native heaps/import are buffer-only. OS monitored fences,
+    // Native heaps/import cover buffers and bounded non-RT/DS textures. OS monitored fences,
     // residency, WDDM2 GPUVA, graphics and Present remain absent; no admission.
     return S_OK;
 }

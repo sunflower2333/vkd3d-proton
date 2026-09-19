@@ -66,7 +66,7 @@ try {
 [PSCustomObject]@{Source=(& git rev-parse HEAD); Submodules=(& git submodule status --recursive);
     Architecture=$Architecture; WindowsKit=$sdkVersion; NativeRuntimeValidated=$false;
     SharedBackingProbeRuntime='Emulated callbacks forwarding to real D3DKMT'; SharedBackingProbeTargetValidated=$false;
-    Contract='Native lifecycle, shared runtime KMD heaps and private Turnip buffer import; zero advertised feature levels; emulated-runtime GPU probe requires target execution; no native runtime acceptance'} |
+    Contract='Native lifecycle, shared runtime KMD heaps and private Turnip buffer/texture import; zero advertised feature levels; emulated-runtime GPU probes require target execution; no native runtime acceptance'} |
     ConvertTo-Json -Depth 4 | Set-Content (Join-Path $output 'source.json')
 $hashes = Get-ChildItem $output -File | Get-FileHash -Algorithm SHA256
 $hashes | ForEach-Object { $_.Hash + '  ' + [IO.Path]::GetFileName($_.Path) } |

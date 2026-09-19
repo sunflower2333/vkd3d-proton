@@ -28,6 +28,7 @@ struct vkdu_object {
     uint32_t slot_count;
     uint64_t bound_heaps[2];
     uint32_t width, height, format;
+    int texture_heap;
 };
 
 #define OBJ(type, o) ((type *)(o)->object)
@@ -287,6 +288,7 @@ int vkdu_heap_resolve(vkdu_object *heap, uint64_t handle, int gpu, uint32_t *ind
 }
 
 #include "backend_samplers.inc"
+#include "backend_textures.inc"
 int32_t vkdu_buffer_uav(vkdu_object *heap, uint32_t index, vkdu_object *buffer,
         uint32_t format, uint64_t first, uint32_t count, uint32_t stride, uint32_t flags,
         vkdu_object *counter, uint64_t counter_offset)
