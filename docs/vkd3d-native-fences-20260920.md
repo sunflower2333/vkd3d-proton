@@ -38,6 +38,15 @@ on the associated context remains distinct from this metadata DDI and from
 embedded Vulkan completion. The output mask alone is not proof of actual OS
 signal/wait behavior.
 
+The separate scheduler-ordering contract is documented by Microsoft's
+[SignalSynchronizationObject2 callback](https://learn.microsoft.com/windows-hardware/drivers/ddi/d3dumddi/nc-d3dumddi-pfnd3dddi_signalsynchronizationobject2cb):
+it inserts a signal into the named context DMA stream and signals only after
+the submitted signal commands are processed. The matching
+[WaitForSynchronizationObject2 callback](https://learn.microsoft.com/windows-hardware/drivers/ddi/d3dumddi/nc-d3dumddi-pfnd3dddi_waitforsynchronizationobject2cb)
+inserts a wait into the named context command stream. This is why draining
+software enqueue before returning from Execute is necessary; it does not prove
+what an ordinary D3D12 runtime will submit on this unadmitted implementation.
+
 ## Implementation
 
 CreateFence accepts exactly one description and recognized flags. It snapshots
@@ -75,8 +84,17 @@ before the simulated runtime can append its external fence packet. No GPU
 completion is provided. A separate skip-Execute-drain mutation must fail; the
 existing routing, split and worker-drain negative controls remain required.
 
-At this checkpoint local worker baseline and both drain controls pass. Actual
-Windows ARM64/x64/x86 compile and fixture execution are pending. No target
-ordinary-runtime fence, D3D12CreateDevice, presentation or scheduling acceptance
-is claimed. Full feature-level, graphics, residency and Present prerequisites
-continue to gate admission.
+Tested implementation `353263dcd77590adc84642e6fbfce7be588b09f2` passed all five
+jobs in GitHub Actions run `35455060137`: Linux production backend/worker
+regressions, Windows ARM64/x64/x86 compilation and gates, and actual ARM64
+runtime fixture execution. ARM64 job `105929542360` explicitly records the
+single-node fence PASS and both fence ownership/mask semantic negatives, plus
+all six previous lifecycle negative controls. All four worker routing/drain
+controls pass. No target ordinary-runtime fence, D3D12CreateDevice, presentation
+or scheduling acceptance is claimed. Full feature-level, graphics, residency
+and Present prerequisites continue to gate admission.
+
+The matching ARM64 artifact is `vkd3d-native-ddi-arm64`, ID `10587493537`
+(13,178,912 bytes); actual execution logs are in
+`vkd3d-runtime-arm64-validation`, ID `10588106698`. This candidate is distinct
+from the target-tested graphics artifact at `a823c15`.

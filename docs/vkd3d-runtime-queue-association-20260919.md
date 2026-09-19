@@ -124,9 +124,14 @@ graphics, residency and Present contracts are implemented and validated. Current
 CPU fixtures, cross-compilation and controlled KMT probes cannot satisfy that
 acceptance condition on their own.
 
-## Exact remaining native admission blockers
+## Historical native admission blockers at 25d1a6c
 
 Source review at implementation `25d1a6c`:
+
+The later [bounded graphics slice](vkd3d-native-graphics-20260919.md) and
+[single-node fence lifecycle](vkd3d-native-fences-20260920.md) fill some of the
+then-missing callbacks below. This table records the earlier checkpoint;
+ordinary runtime admission remains disabled in the current source.
 
 | Area | Current source behavior | Required next evidence or implementation |
 | --- | --- | --- |

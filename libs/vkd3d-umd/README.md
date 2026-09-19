@@ -25,6 +25,16 @@ and validates native DDI pixels, exact allocation references and runtime-context
 OS completion. It uses emulated runtime callbacks; it is not an ordinary
 `D3D12CreateDevice` test. See `docs/vkd3d-native-graphics-20260919.md`.
 
+The single-node fence continuation owns copied native fence descriptions and
+implements CreateFence/DestroyFence plus SignalFence/WaitForFence broadcast
+selection. Windows runtime owns and emits the actual external synchronization
+on the associated physical queue context. These DDIs reject foreign/stale
+fences and preserve callback ownership during recursive device retirement;
+they neither create replacement Vulkan fences nor interpret GPU virtual
+placements as CPU addresses. This remains a partial contract with ordinary
+admission disabled. See `docs/vkd3d-native-fences-20260920.md` for evidence and
+the explicit runtime/target acceptance boundary.
+
 The engine revision
 and every submodule are pinned by the driver parent repository.
 
