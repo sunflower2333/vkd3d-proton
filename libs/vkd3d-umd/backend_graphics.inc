@@ -125,11 +125,53 @@ int32_t vkdu_shader_dxbc(uint32_t stage, const uint32_t *tokens, uint32_t words,
 }
 void vkdu_shader_dxbc_free(void *code) { free(code); }
 
+static HRESULT vkdu_input_layout(uint32_t count, const struct vkdu_input_element *elements,
+        D3D12_INPUT_ELEMENT_DESC native[32])
+{
+    uint32_t i, used = 0, slots = 0, offsets[32] = {0}, classes[32] = {0}, steps[32] = {0};
+    if (count > 32 || (count && !elements)) return E_INVALIDARG;
+    for (i = 0; i < count; i++) {
+        const struct vkdu_input_element *e = &elements[i];
+        uint32_t bytes, alignment, offset;
+        switch (e->format) {
+        case DXGI_FORMAT_R32G32B32A32_FLOAT: case DXGI_FORMAT_R32G32B32A32_UINT: case DXGI_FORMAT_R32G32B32A32_SINT:
+            bytes = 16; alignment = 4; break;
+        case DXGI_FORMAT_R32G32B32_FLOAT: case DXGI_FORMAT_R32G32B32_UINT: case DXGI_FORMAT_R32G32B32_SINT:
+            bytes = 12; alignment = 4; break;
+        case DXGI_FORMAT_R32G32_FLOAT: case DXGI_FORMAT_R32G32_UINT: case DXGI_FORMAT_R32G32_SINT:
+            bytes = 8; alignment = 4; break;
+        case DXGI_FORMAT_R32_FLOAT: case DXGI_FORMAT_R32_UINT: case DXGI_FORMAT_R32_SINT:
+            bytes = 4; alignment = 4; break;
+        case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_SNORM:
+        case DXGI_FORMAT_R8G8B8A8_UINT: case DXGI_FORMAT_R8G8B8A8_SINT:
+            bytes = 4; alignment = 1; break;
+        default: return DXGI_ERROR_UNSUPPORTED;
+        }
+        if (e->slot >= 32 || e->reg >= 32 || (used & (1u << e->reg)) || e->per_instance > 1 ||
+                (!e->per_instance && e->step_rate)) return E_INVALIDARG;
+        if ((slots & (1u << e->slot)) && (classes[e->slot] != e->per_instance || steps[e->slot] != e->step_rate))
+            return E_INVALIDARG;
+        offset = e->offset == UINT32_MAX ? (offsets[e->slot] + alignment - 1) & ~(alignment - 1) : e->offset;
+        if (offset > 2048 - bytes || offset % alignment) return E_INVALIDARG;
+        used |= 1u << e->reg; slots |= 1u << e->slot;
+        offsets[e->slot] = offset + bytes; classes[e->slot] = e->per_instance; steps[e->slot] = e->step_rate;
+        native[i].SemanticName = "ATTR"; native[i].SemanticIndex = e->reg;
+        native[i].Format = e->format; native[i].InputSlot = e->slot; native[i].AlignedByteOffset = offset;
+        native[i].InputSlotClass = e->per_instance; native[i].InstanceDataStepRate = e->step_rate;
+    }
+    return S_OK;
+}
+int32_t vkdu_input_layout_validate(uint32_t count, const struct vkdu_input_element *elements)
+{
+    D3D12_INPUT_ELEMENT_DESC native[32];
+    return vkdu_input_layout(count, elements, native);
+}
 int32_t vkdu_graphics_pipeline_create(vkdu_device *device, vkdu_object *root,
         const void *vs, size_t vs_size, const void *ps, size_t ps_size,
         const struct vkdu_graphics_desc *state, vkdu_object **out)
 {
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {0};
+    D3D12_INPUT_ELEMENT_DESC elements[32];
     ID3D12PipelineState *pipeline = NULL;
     HRESULT hr;
     if (!out) return E_POINTER;
@@ -138,6 +180,8 @@ int32_t vkdu_graphics_pipeline_create(vkdu_device *device, vkdu_object *root,
             !state || state->format != DXGI_FORMAT_R8G8B8A8_UNORM ||
             (state->fill_mode != 2 && state->fill_mode != 3) || state->cull_mode < 1 || state->cull_mode > 3 ||
             state->front_ccw > 1 || state->depth_clip > 1 || state->write_mask > 15) return E_INVALIDARG;
+    if (FAILED(hr = vkdu_input_layout(state->input_count, state->inputs, elements))) return hr;
+    desc.InputLayout.NumElements = state->input_count; desc.InputLayout.pInputElementDescs = elements;
     desc.pRootSignature = OBJ(ID3D12RootSignature, root);
     desc.VS.pShaderBytecode = vs; desc.VS.BytecodeLength = vs_size;
     desc.PS.pShaderBytecode = ps; desc.PS.BytecodeLength = ps_size;
@@ -315,6 +359,8 @@ int32_t vkdu_command_clear_rtv(vkdu_object *command, vkdu_object *heap, uint32_t
 int32_t vkdu_command_index_buffer(vkdu_object *command, vkdu_object *buffer, uint64_t offset, uint32_t size, uint32_t format)
 {
     D3D12_INDEX_BUFFER_VIEW view;
+    ID3D12Resource *owner;
+    HRESULT hr;
     uint32_t stride = format == DXGI_FORMAT_R16_UINT ? 2 : format == DXGI_FORMAT_R32_UINT ? 4 : 0;
     if (!RECORDING(command) || command->command_type) return E_INVALIDARG;
     if (!buffer) {
@@ -325,8 +371,43 @@ int32_t vkdu_command_index_buffer(vkdu_object *command, vkdu_object *buffer, uin
     if (!stride || !VALID(buffer, VKDU_BUFFER) || !vkdu_same_device(command, buffer) ||
             !size || offset % stride || size % stride || offset > buffer->bytes || size > buffer->bytes - offset) return E_INVALIDARG;
     view.BufferLocation = vkdu_buffer_address(buffer) + offset; view.SizeInBytes = size; view.Format = format;
+    owner = OBJ(ID3D12Resource, buffer);
+    if (FAILED(hr = vkd3d_wddm_command_retain_resources(OBJ(ID3D12GraphicsCommandList, command), 1, &owner))) return hr;
     ID3D12GraphicsCommandList_IASetIndexBuffer(OBJ(ID3D12GraphicsCommandList, command), &view);
     command->index_count = size / stride; return S_OK;
+}
+int32_t vkdu_command_vertex_buffers(vkdu_object *command, uint32_t first, uint32_t count,
+        const struct vkdu_vertex_buffer *buffers)
+{
+    D3D12_VERTEX_BUFFER_VIEW views[32] = {{0}};
+    ID3D12Resource *owners[32] = {0};
+    uint32_t i;
+    HRESULT hr;
+    if (!RECORDING(command) || command->command_type || first > 32 || count > 32 - first) return E_INVALIDARG;
+    for (i = 0; i < count; i++) {
+        const struct vkdu_vertex_buffer *b = buffers ? &buffers[i] : NULL;
+        if (!b) continue;
+        if (!b->buffer) {
+            if (b->offset || b->size || b->stride) return E_INVALIDARG;
+            continue;
+        }
+        if (!VALID(b->buffer, VKDU_BUFFER) || !vkdu_same_device(command, b->buffer) || b->stride > 2048 ||
+                b->offset > b->buffer->bytes || b->size > b->buffer->bytes - b->offset) return E_INVALIDARG;
+        views[i].BufferLocation = vkdu_buffer_address(b->buffer) + b->offset;
+        views[i].SizeInBytes = b->size; views[i].StrideInBytes = b->stride;
+        owners[i] = OBJ(ID3D12Resource, b->buffer);
+    }
+#if !defined(VKDU_ENABLE_TEST_DEVICE) || !defined(VKDU_TEST_VERTEX_DROP_OWNER)
+    if (FAILED(hr = vkd3d_wddm_command_retain_resources(OBJ(ID3D12GraphicsCommandList, command), count, owners))) return hr;
+#else
+    (void)owners; (void)hr;
+#endif
+#if defined(VKDU_ENABLE_TEST_DEVICE) && defined(VKDU_TEST_VERTEX_DROP_OFFSET)
+    for (i = 0; i < count; i++) if (buffers && buffers[i].buffer)
+        views[i].BufferLocation -= buffers[i].offset;
+#endif
+    ID3D12GraphicsCommandList_IASetVertexBuffers(OBJ(ID3D12GraphicsCommandList, command), first, count, views);
+    return S_OK;
 }
 static int vkdu_draw_ready(vkdu_object *command)
 {

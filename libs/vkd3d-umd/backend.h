@@ -45,8 +45,12 @@ struct vkdu_texture_copy_location {
 };
 struct vkdu_box { uint32_t left, top, front, right, bottom, back; };
 struct vkdu_signature { uint32_t system_value, reg, mask, component_type; };
+struct vkdu_input_element { uint32_t slot, offset, format, per_instance, step_rate, reg; };
+struct vkdu_vertex_buffer { vkdu_object *buffer; uint64_t offset; uint32_t size, stride; };
 struct vkdu_graphics_desc {
     uint32_t format, sample_mask, fill_mode, cull_mode, front_ccw, depth_clip, write_mask;
+    uint32_t input_count;
+    const struct vkdu_input_element *inputs;
 };
 struct vkdu_viewport { float x, y, width, height, min_depth, max_depth; };
 struct vkdu_rect { int32_t left, top, right, bottom; };
@@ -71,6 +75,9 @@ int32_t vkdu_command_render_target(vkdu_object *command, vkdu_object *heap, uint
 int32_t vkdu_command_clear_rtv(vkdu_object *command, vkdu_object *heap, uint32_t index,
         const float color[4], uint32_t count, const struct vkdu_rect *rects);
 int32_t vkdu_command_index_buffer(vkdu_object *command, vkdu_object *buffer, uint64_t offset, uint32_t size, uint32_t format);
+int32_t vkdu_input_layout_validate(uint32_t count, const struct vkdu_input_element *elements);
+int32_t vkdu_command_vertex_buffers(vkdu_object *command, uint32_t first, uint32_t count,
+        const struct vkdu_vertex_buffer *buffers);
 int32_t vkdu_command_draw(vkdu_object *command, uint32_t vertices, uint32_t instances, uint32_t first, uint32_t first_instance);
 int32_t vkdu_command_draw_indexed(vkdu_object *command, uint32_t indices, uint32_t instances,
         uint32_t first, int32_t base_vertex, uint32_t first_instance);

@@ -2790,9 +2790,9 @@ struct d3d12_command_allocator
     size_t descriptor_heaps_size;
     size_t descriptor_heaps_count;
 
-    IUnknown **wddm_query_owners;
-    size_t wddm_query_owners_size;
-    size_t wddm_query_owners_count;
+    IUnknown **wddm_recording_owners;
+    size_t wddm_recording_owners_size;
+    size_t wddm_recording_owners_count;
 
     struct d3d12_command_allocator_command_pool primary_pool;
     struct d3d12_command_allocator_command_pool fallback_pool;

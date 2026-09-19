@@ -27,7 +27,7 @@ jobs:
           done
       - run: sudo apt-get update && sudo apt-get install -y meson ninja-build wine64-tools libwine-dev glslang-tools mesa-vulkan-drivers
       - run: meson setup build-umd --buildtype debugoptimized -Denable_umd_bridge=true -Denable_umd_bridge_tests=true
-      - run: meson compile -C build-umd -j 3 vkd3d-umd-backend-test vkd3d-umd-fence-test vkd3d-umd-fence-negative vkd3d-umd-sampler-negative vkd3d-umd-texture-negative vkd3d-umd-graphics-negative vkd3d-umd-query-resolve-negative vkd3d-umd-query-owner-negative
+      - run: meson compile -C build-umd -j 3 vkd3d-umd-backend-test vkd3d-umd-fence-test vkd3d-umd-fence-negative vkd3d-umd-sampler-negative vkd3d-umd-texture-negative vkd3d-umd-graphics-negative vkd3d-umd-query-resolve-negative vkd3d-umd-query-owner-negative vkd3d-umd-vertex-offset-negative vkd3d-umd-vertex-owner-negative
       - name: Execute real backend on CPU Vulkan, never report GPU acceptance
         shell: bash
         run: |
@@ -106,6 +106,24 @@ jobs:
           cat graphics-negative.txt
           test "$result" -eq 1
           grep -F 'graphics round0 word128=' graphics-negative.txt
+      - name: Reject dropped actual vertex offset and recording owner
+        shell: bash
+        run: |
+          export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+          if [ ! -f "$VK_DRIVER_FILES" ]; then export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json; fi
+          for control in offset owner; do
+            set +e
+            timeout 90 build-umd/libs/vkd3d-umd/vkd3d-umd-vertex-$control-negative > vertex-$control-negative.txt 2>&1
+            result=$?
+            set -e
+            cat vertex-$control-negative.txt
+            test "$result" -eq 1
+            if [ "$control" = offset ]; then
+              grep -F 'FAIL vertex fetch round0' vertex-$control-negative.txt
+            else
+              grep -F 'FAIL vertex/index owners released before recording retirement' vertex-$control-negative.txt
+            fi
+          done
   windows:
     runs-on: windows-2025-vs2026
     strategy:
@@ -149,6 +167,7 @@ jobs:
             build-umd-${{ matrix.arch }}/package/
             build-umd-${{ matrix.arch }}/meson-logs/
             build-umd-${{ matrix.arch }}/libs/vkd3d-umd/runtime-*.txt
+            build-umd-${{ matrix.arch }}/libs/vkd3d-umd/descriptor-*.txt
             build-umd-${{ matrix.arch }}/libs/vkd3d-umd/system-d3d12-*.txt
   arm64-runtime:
     needs: windows
@@ -167,9 +186,7 @@ jobs:
         run: ./tools/test-windows-umd-runtime.ps1 -Executable candidate/package/vkd3d-umd-runtime-test.exe
       - name: Execute native ARM64 sampler and descriptor DDI ownership
         shell: pwsh
-        run: |
-          & candidate/package/vkd3d-umd-ddi-descriptor-test.exe
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        run: ./tools/test-windows-umd-descriptors.ps1 -Executable candidate/package/vkd3d-umd-ddi-descriptor-test.exe
       - name: Validate ordinary D3D12 app harness on explicit CPU WARP only
         shell: pwsh
         run: ./tools/test-system-d3d12-probe.ps1 -Executable candidate/package/vkd3d-system-d3d12-probe.exe
@@ -184,4 +201,5 @@ jobs:
           name: vkd3d-runtime-arm64-validation
           path: |
             candidate/package/runtime-*.txt
+            candidate/package/descriptor-*.txt
             candidate/package/system-d3d12-*.txt

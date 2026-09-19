@@ -63,12 +63,33 @@ template<class Desc> bool native_graphics_state(Context *ctx, void *slot, UINT t
     if (!value || value->shader_words * 4 != sizeof(Desc)) return false;
     std::memcpy(&out, value->shader, sizeof(out)); return true;
 }
+struct NativeInputLayout {
+    UINT count;
+    vkdu_input_element elements[32];
+};
+void APIENTRY native_element_layout(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATEELEMENTLAYOUT *desc,
+        D3D12DDI_HELEMENTLAYOUT handle) {
+    NativeHeapOperation op(context(h));
+    if (!sampler_operation_live(op)) { error(op.ctx, DXGI_ERROR_DEVICE_REMOVED); return; }
+    if (!desc || desc->NumElements > 32 || (desc->NumElements && !desc->pVertexElements)) {
+        error(op.ctx, E_INVALIDARG); return;
+    }
+    NativeInputLayout copy{}; copy.count = desc->NumElements;
+    for (UINT i = 0; i < copy.count; i++) {
+        const auto &e = desc->pVertexElements[i];
+        copy.elements[i] = {e.InputSlot, e.AlignedByteOffset, static_cast<UINT>(e.Format),
+            static_cast<UINT>(e.InputSlotClass), e.InstanceDataStepRate, e.InputRegister};
+    }
+    HRESULT hr = vkdu_input_layout_validate(copy.count, copy.elements);
+    if (SUCCEEDED(hr)) hr = native_graphics_store(op.ctx, handle.pDrvPrivate, 6, &copy, sizeof(copy));
+    error(op.ctx, hr);
+}
 HRESULT native_graphics_pipeline(Context *ctx, const D3D12DDIARG_CREATE_PIPELINE_STATE_0001 *args) {
     NativeHeapOperation op(ctx);
     if (!sampler_operation_live(op)) return DXGI_ERROR_DEVICE_REMOVED;
     const auto request = *args;
     if (request.hComputeShader.pDrvPrivate || request.hHullShader.pDrvPrivate || request.hDomainShader.pDrvPrivate ||
-            request.hGeometryShader.pDrvPrivate || request.hElementLayout.pDrvPrivate || request.IBStripCutValue ||
+            request.hGeometryShader.pDrvPrivate || request.IBStripCutValue ||
             request.PrimitiveTopologyType != D3D12DDI_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE ||
             request.NumRenderTargets != 1 || request.RTVFormats[0] != DXGI_FORMAT_R8G8B8A8_UNORM || request.DSVFormat ||
             request.SampleDesc.Count != 1 || request.SampleDesc.Quality) return DXGI_ERROR_UNSUPPORTED;
@@ -86,7 +107,12 @@ HRESULT native_graphics_pipeline(Context *ctx, const D3D12DDIARG_CREATE_PIPELINE
             raster.ForcedSampleCount || raster.ConservativeRasterizationMode) return DXGI_ERROR_UNSUPPORTED;
     vkdu_graphics_desc desc{static_cast<UINT>(request.RTVFormats[0]), request.SampleMask,
         static_cast<UINT>(raster.FillMode), static_cast<UINT>(raster.CullMode), static_cast<UINT>(raster.FrontCounterClockwise),
-        static_cast<UINT>(raster.DepthClipEnable), blend.RenderTarget[0].RenderTargetWriteMask};
+        static_cast<UINT>(raster.DepthClipEnable), blend.RenderTarget[0].RenderTargetWriteMask, 0, nullptr};
+    NativeInputLayout layout{};
+    if (request.hElementLayout.pDrvPrivate) {
+        if (!native_graphics_state(ctx, request.hElementLayout.pDrvPrivate, 6, layout)) return E_INVALIDARG;
+        desc.input_count = layout.count; desc.inputs = layout.elements;
+    }
     // Runtime shader/state slots can be destroyed recursively inside Vulkan.
     std::unique_ptr<uint32_t[]> code(new (std::nothrow) uint32_t[vs->shader_words + ps->shader_words]);
     if (!code) return E_OUTOFMEMORY;
@@ -230,8 +256,46 @@ void APIENTRY native_index_buffer(D3D12DDI_HCOMMANDLIST h, const D3D12DDI_INDEX_
     command.run([&] { auto hr = vkdu_command_index_buffer(command.value, buffer, offset, request.SizeInBytes, request.Format);
         vkdu_object_destroy(buffer); return hr; });
 }
+void APIENTRY native_vertex_buffers(D3D12DDI_HCOMMANDLIST h, UINT first, UINT count,
+        const D3D12DDI_VERTEX_BUFFER_VIEW *views) {
+    NativeGraphicsCommand command(h); if (!command.value) return;
+    if (first > 32 || count > 32 - first) { command.report(E_INVALIDARG); return; }
+    D3D12DDI_VERTEX_BUFFER_VIEW copy[32]{};
+    vkdu_vertex_buffer buffers[32]{};
+    if (views) std::memcpy(copy, views, count * sizeof(*views));
+    auto *ctx = command.op.ctx;
+    HRESULT hr = ctx->native_adapter ? native_heap_generation(ctx) : S_OK;
+    AcquireSRWLockShared(&ctx->resources_lock);
+    for (UINT i = 0; i < count && SUCCEEDED(hr); i++) {
+        const auto &v = copy[i];
+        if (!v.BufferLocation) {
+            if (v.SizeInBytes || v.StrideInBytes) hr = E_INVALIDARG;
+            continue;
+        }
+        if (v.StrideInBytes > 2048) { hr = E_INVALIDARG; break; }
+        for (auto *entry = ctx->resources; entry; entry = entry->next) {
+            if (entry->kind != VKDU_BUFFER || v.BufferLocation < entry->address) continue;
+            const auto offset = v.BufferLocation - entry->address;
+            if (offset < entry->bytes && v.SizeInBytes <= entry->bytes - offset && vkdu_object_retain(entry->backend)) {
+                buffers[i] = {entry->backend, offset, v.SizeInBytes, v.StrideInBytes}; break;
+            }
+        }
+        if (!buffers[i].buffer) hr = E_INVALIDARG;
+    }
+    ReleaseSRWLockShared(&ctx->resources_lock);
+    {
+        NativeBackendCall call(ctx);
+        if (SUCCEEDED(hr)) hr = vkdu_command_vertex_buffers(command.value, first, count, buffers);
+        for (UINT i = 0; i < count; i++) vkdu_object_destroy(buffers[i].buffer);
+    }
+    if (SUCCEEDED(hr) && ctx->native_adapter) hr = native_heap_generation(ctx);
+    command.report(hr);
+}
 void native_graphics_tables(D3D12DDI_DEVICE_FUNCS_CORE_0003 *device, D3D12DDI_COMMAND_LIST_FUNCS_3D_0003 *commands) {
     device->pfnCreateVertexShader = native_graphics_shader<1>; device->pfnCreatePixelShader = native_graphics_shader<0>;
+    device->pfnCalcPrivateElementLayoutSize = native_graphics_state_size<D3D12DDIARG_CREATEELEMENTLAYOUT>;
+    device->pfnCreateElementLayout = native_element_layout;
+    device->pfnDestroyElementLayout = native_graphics_state_destroy<6, D3D12DDI_HELEMENTLAYOUT>;
     device->pfnCalcPrivateBlendStateSize = native_graphics_state_size<D3D12DDI_BLEND_DESC>;
     device->pfnCreateBlendState = native_graphics_state_create<D3D12DDI_BLEND_DESC, 3, D3D12DDI_HBLENDSTATE>;
     device->pfnDestroyBlendState = native_graphics_state_destroy<3, D3D12DDI_HBLENDSTATE>;
@@ -247,4 +311,5 @@ void native_graphics_tables(D3D12DDI_DEVICE_FUNCS_CORE_0003 *device, D3D12DDI_CO
     commands->pfnIaSetTopology = native_topology; commands->pfnRsSetViewports = native_viewports;
     commands->pfnRsSetScissorRects = native_scissors; commands->pfnOMSetRenderTargets = native_render_targets;
     commands->pfnClearRenderTargetView = native_clear_rtv; commands->pfnIASetIndexBuffer = native_index_buffer;
+    commands->pfnIASetVertexBuffers = native_vertex_buffers;
 }

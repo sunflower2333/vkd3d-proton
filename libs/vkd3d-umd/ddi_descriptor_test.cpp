@@ -4,6 +4,7 @@
 #include "ddi.h"
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 struct Peer {
     vkdu_kind kind;
@@ -175,10 +176,14 @@ static void APIENTRY capture(void *, HRESULT hr) { reported = hr; }
 #include "ddi_samplers_test.inc"
 #include "ddi_textures_test.inc"
 #include "ddi_graphics_test.inc"
-int main() {
+#include "ddi_vertex_test.inc"
+int main(int argc, char **argv) {
+    if (argc == 2 && !std::strcmp(argv[1], "--negative-control-vertex-field-order")) vertex_swap_fields = true;
+    else if (argc != 1) return 2;
     if (check_native_samplers()) return 1;
     if (check_native_textures()) return 1;
     if (check_native_graphics()) return 1;
+    if (check_native_vertex_buffers()) return 1;
     calls = destroys = sampler_calls = 0; next_result = reported = S_OK;
     Context ctx;
     ctx.backend = reinterpret_cast<vkdu_device *>(&next_base);

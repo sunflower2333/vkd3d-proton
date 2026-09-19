@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
-static int test_native_queries() {
+static int test_native_queries(bool vertex = false) {
     for (unsigned mode = 0; mode < 3; ++mode) {
         D3DDDI_ADAPTERCALLBACKS ac{}; ac.pfnQueryAdapterInfoCb = test_query;
         D3D12DDI_ADAPTERFUNCS adapter{};
@@ -79,7 +79,12 @@ static int test_native_queries() {
             }
         };
         query_execution_result = mode == 0 ? E_OUTOFMEMORY : S_OK;
-        commands.pfnResolveQueryData(list.hDrvCommandList, query, D3D12DDI_QUERY_TYPE_PIPELINE_STATISTICS, 5, 2, {&buffer}, 4096);
+        if (vertex) {
+            const D3D12DDI_VERTEX_BUFFER_VIEW view{buffer.address + 64, 1024, 16};
+            commands.pfnIASetVertexBuffers(list.hDrvCommandList, 7, 1, &view);
+        } else {
+            commands.pfnResolveQueryData(list.hDrvCommandList, query, D3D12DDI_QUERY_TYPE_PIPELINE_STATISTICS, 5, 2, {&buffer}, 4096);
+        }
         query_execution_callback = {}; query_execution_result = S_OK;
         if (mode == 2) REQUIRE(command_errors.size() == errors_before_callback);
         else REQUIRE(command_errors.back() == std::make_pair(list.hRTCommandList.handle,
@@ -95,6 +100,7 @@ static int test_native_queries() {
         if (mode != 2) adapter.pfnDestroyDevice(create.hDrvDevice);
         REQUIRE(!query_peers && adapter.pfnCloseAdapter(open.hAdapter) == S_OK);
     }
-    std::puts("PASS native query execution CORE_0003 ABI, owned handles, freed caller slots, reset and retirement");
+    std::puts(vertex ? "PASS native vertex generation checks, recursive resource/list destruction and device retirement" :
+        "PASS native query execution CORE_0003 ABI, owned handles, freed caller slots, reset and retirement");
     return 0;
 }

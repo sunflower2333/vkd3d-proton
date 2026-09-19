@@ -69,6 +69,7 @@ foreach ($scenario in @('lifecycle', 'deferred-negative', 'command-owner-negativ
                 $output -notmatch 'PASS native descriptor/query backing residency, deduplication, host-only proof, runtime eviction policy and retained object retirement' -or
                 $output -notmatch 'PASS native query constructor reset and pageable enumeration device retirement without stale runtime access' -or
                 $output -notmatch 'PASS native query execution CORE_0003 ABI, owned handles, freed caller slots, reset and retirement' -or
+                $output -notmatch 'PASS native vertex generation checks, recursive resource/list destruction and device retirement' -or
                 $output -notmatch 'PASS native command-list runtime error ownership, device-loss forwarding, rejected creation and reentrant retirement') {
             throw "Runtime lifecycle fixture failed: exit=$($process.ExitCode) $errors"
         }

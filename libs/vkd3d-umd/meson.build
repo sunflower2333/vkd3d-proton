@@ -63,4 +63,10 @@ if get_option('enable_umd_bridge_tests')
   umd_query_owner_negative = executable('vkd3d-umd-query-owner-negative', 'backend.c', 'debug_policy.c', 'backend_test.c',
     c_args : ['-DVKDU_ENABLE_TEST_DEVICE', '-DVKDU_TEST_QUERY_DROP_OWNER'],
     dependencies : vkd3d_dep, include_directories : vkd3d_private_includes)
+  umd_vertex_offset_negative = executable('vkd3d-umd-vertex-offset-negative', 'backend.c', 'debug_policy.c', 'backend_test.c',
+    c_args : ['-DVKDU_ENABLE_TEST_DEVICE', '-DVKDU_TEST_VERTEX_DROP_OFFSET'],
+    dependencies : vkd3d_dep, include_directories : vkd3d_private_includes)
+  umd_vertex_owner_negative = executable('vkd3d-umd-vertex-owner-negative', 'backend.c', 'debug_policy.c', 'backend_test.c',
+    c_args : ['-DVKDU_ENABLE_TEST_DEVICE', '-DVKDU_TEST_VERTEX_DROP_OWNER'],
+    dependencies : vkd3d_dep, include_directories : vkd3d_private_includes)
 endif

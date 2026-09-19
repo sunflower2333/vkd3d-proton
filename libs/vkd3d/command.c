@@ -2856,9 +2856,9 @@ static void d3d12_command_allocator_free_resources(struct d3d12_command_allocato
     }
     allocator->descriptor_heaps_count = 0;
 
-    for (i = 0; i < allocator->wddm_query_owners_count; i++)
-        IUnknown_Release(allocator->wddm_query_owners[i]);
-    allocator->wddm_query_owners_count = 0;
+    for (i = 0; i < allocator->wddm_recording_owners_count; i++)
+        IUnknown_Release(allocator->wddm_recording_owners[i]);
+    allocator->wddm_recording_owners_count = 0;
 
     for (i = 0; i < allocator->meta_allocs_count; i++)
     {
@@ -2974,7 +2974,7 @@ static ULONG d3d12_command_allocator_dec_ref(struct d3d12_command_allocator *all
         vkd3d_free(allocator->views);
         vkd3d_free(allocator->pipelines);
         vkd3d_free(allocator->descriptor_heaps);
-        vkd3d_free(allocator->wddm_query_owners);
+        vkd3d_free(allocator->wddm_recording_owners);
         vkd3d_free(allocator->meta_allocs);
 
         if (VKD3D_CONFIG_FLAG_IS_SET(RECYCLE_COMMAND_POOLS))
@@ -6676,44 +6676,70 @@ static void d3d12_command_list_track_query_heap(struct d3d12_command_list *list,
     }
 }
 
-HRESULT vkd3d_wddm_command_retain_query(ID3D12GraphicsCommandList *command,
-        ID3D12QueryHeap *heap, ID3D12Resource *destination)
+static HRESULT d3d12_command_list_wddm_retain(struct d3d12_command_list *list,
+        size_t object_count, IUnknown *const *objects)
 {
-    struct d3d12_command_list *list;
     struct d3d12_command_allocator *allocator;
-    IUnknown *objects[2], *pending[2];
-    size_t i, j, count = 0;
+    IUnknown *pending[32];
+    size_t i, j, k, count = 0;
 
-    if (!command || !heap)
+    if (object_count > ARRAY_SIZE(pending) || !list->is_recording || !(allocator = list->allocator))
         return E_INVALIDARG;
-    list = impl_from_ID3D12GraphicsCommandList((d3d12_command_list_iface *)command);
-    if (!list->is_recording || !(allocator = list->allocator) ||
-            impl_from_ID3D12QueryHeap(heap)->device != list->device ||
-            (destination && impl_from_ID3D12Resource(destination)->device != list->device))
-        return E_INVALIDARG;
-
-    objects[0] = (IUnknown *)heap;
-    objects[1] = (IUnknown *)destination;
-    for (i = 0; i < ARRAY_SIZE(objects); i++)
+    for (i = 0; i < object_count; i++)
     {
         if (!objects[i])
             continue;
-        for (j = 0; j < allocator->wddm_query_owners_count; j++)
-            if (allocator->wddm_query_owners[j] == objects[i])
+        for (j = 0; j < allocator->wddm_recording_owners_count; j++)
+            if (allocator->wddm_recording_owners[j] == objects[i])
                 break;
-        if (j == allocator->wddm_query_owners_count)
+        for (k = 0; k < count; k++)
+            if (pending[k] == objects[i])
+                break;
+        if (j == allocator->wddm_recording_owners_count && k == count)
             pending[count++] = objects[i];
     }
-    if (!vkd3d_array_reserve((void **)&allocator->wddm_query_owners,
-            &allocator->wddm_query_owners_size, allocator->wddm_query_owners_count + count,
-            sizeof(*allocator->wddm_query_owners)))
+    if (!vkd3d_array_reserve((void **)&allocator->wddm_recording_owners,
+            &allocator->wddm_recording_owners_size, allocator->wddm_recording_owners_count + count,
+            sizeof(*allocator->wddm_recording_owners)))
         return E_OUTOFMEMORY;
     for (i = 0; i < count; i++)
     {
         IUnknown_AddRef(pending[i]);
-        allocator->wddm_query_owners[allocator->wddm_query_owners_count++] = pending[i];
+        allocator->wddm_recording_owners[allocator->wddm_recording_owners_count++] = pending[i];
     }
     return S_OK;
+}
+
+HRESULT vkd3d_wddm_command_retain_query(ID3D12GraphicsCommandList *command,
+        ID3D12QueryHeap *heap, ID3D12Resource *destination)
+{
+    struct d3d12_command_list *list;
+    IUnknown *objects[2] = {(IUnknown *)heap, (IUnknown *)destination};
+    if (!command || !heap)
+        return E_INVALIDARG;
+    list = impl_from_ID3D12GraphicsCommandList((d3d12_command_list_iface *)command);
+    if (impl_from_ID3D12QueryHeap(heap)->device != list->device ||
+            (destination && impl_from_ID3D12Resource(destination)->device != list->device))
+        return E_INVALIDARG;
+    return d3d12_command_list_wddm_retain(list, ARRAY_SIZE(objects), objects);
+}
+
+HRESULT vkd3d_wddm_command_retain_resources(ID3D12GraphicsCommandList *command,
+        UINT count, ID3D12Resource *const *resources)
+{
+    struct d3d12_command_list *list;
+    IUnknown *objects[32];
+    UINT i;
+    if (!command || count > ARRAY_SIZE(objects) || (count && !resources))
+        return E_INVALIDARG;
+    list = impl_from_ID3D12GraphicsCommandList((d3d12_command_list_iface *)command);
+    for (i = 0; i < count; i++)
+    {
+        if (resources[i] && impl_from_ID3D12Resource(resources[i])->device != list->device)
+            return E_INVALIDARG;
+        objects[i] = (IUnknown *)resources[i];
+    }
+    return d3d12_command_list_wddm_retain(list, count, objects);
 }
 
 extern ULONG STDMETHODCALLTYPE d3d12_command_list_vkd3d_ext_AddRef(d3d12_command_list_vkd3d_ext_iface *iface);

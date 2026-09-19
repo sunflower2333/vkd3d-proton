@@ -22,6 +22,7 @@
 #include "backend_samplers_test.inc"
 #include "backend_textures_test.inc"
 #include "backend_graphics_test.inc"
+#include "backend_vertex_test.inc"
 #include "backend_queries_test.inc"
 
 #ifdef VKDU_GPU_PROBE
@@ -789,8 +790,10 @@ int main(int argc, char **argv)
     check_texture_copies(device, wrong);
 #ifdef VKDU_ENABLE_TEST_DEVICE
     check_query_lifetime(device, wrong);
+    check_vertex_lifetime(device);
 #endif
     check_graphics(device, wrong);
+    check_vertex_inputs(device, wrong);
     /* Caller follows D3D12 lifetime rules: reset/destroy only after completion. */
     vkdu_object_destroy(command); vkdu_object_destroy(allocator);
     vkdu_object_destroy(table_pipeline); vkdu_object_destroy(table_root);

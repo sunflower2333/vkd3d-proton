@@ -8,6 +8,10 @@ static vkdu_viewport graphics_view;
 static vkdu_rect graphics_rect;
 static float graphics_color[4];
 static vkdu_graphics_desc graphics_state;
+static vkdu_input_element graphics_elements[32];
+static vkdu_vertex_buffer graphics_vertex_buffers[32];
+static uint32_t graphics_vertex_first, graphics_vertex_count;
+static bool vertex_swap_fields;
 static void (*graphics_hook)();
 static void graphics_borrow(vkdu_object *object) {
     if (!object || peer(object)->references < 2) std::abort();
@@ -19,6 +23,9 @@ static int32_t test_graphics_pipeline(vkdu_device *d, vkdu_object *root, const v
     if (vs_bytes < 44 || ps_bytes < 44 || static_cast<const UINT *>(vs)[0] != 0x43425844 ||
             static_cast<const UINT *>(ps)[0] != 0x43425844) std::abort();
     graphics_state = *state;
+    if (state->input_count > 32) std::abort();
+    if (state->input_count) std::memcpy(graphics_elements, state->inputs, sizeof(*state->inputs) * state->input_count);
+    graphics_state.inputs = graphics_elements;
     *out = SUCCEEDED(next_result) ? make_peer(d, VKDU_PIPELINE) : nullptr;
     return next_result;
 }
@@ -77,6 +84,16 @@ static int32_t test_index_buffer(vkdu_object *command, vkdu_object *buffer, uint
     graphics_resource = buffer; graphics_offset = offset; graphics_size = size; graphics_format = format;
     return next_result;
 }
+static int32_t test_vertex_buffers(vkdu_object *command, uint32_t first, uint32_t count, const vkdu_vertex_buffer *buffers) {
+    graphics_borrow(command); ++graphics_calls;
+    if (count > 32) std::abort();
+    for (uint32_t i = 0; i < count; i++) if (buffers[i].buffer) graphics_borrow(buffers[i].buffer);
+    if (graphics_hook) graphics_hook();
+    graphics_vertex_first = vertex_swap_fields ? count : first;
+    graphics_vertex_count = vertex_swap_fields ? first : count;
+    if (count) std::memcpy(graphics_vertex_buffers, buffers, sizeof(*buffers) * count);
+    return next_result;
+}
 #define vkdu_graphics_pipeline_create test_graphics_pipeline
 #define vkdu_command_graphics_root test_graphics_root
 #define vkdu_command_draw test_draw
@@ -88,3 +105,4 @@ static int32_t test_index_buffer(vkdu_object *command, vkdu_object *buffer, uint
 #define vkdu_command_render_target test_render_target
 #define vkdu_command_clear_rtv test_clear_rtv
 #define vkdu_command_index_buffer test_index_buffer
+#define vkdu_command_vertex_buffers test_vertex_buffers

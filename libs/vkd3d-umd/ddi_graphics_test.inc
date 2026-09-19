@@ -30,7 +30,7 @@ static int check_native_graphics() {
     D3D12DDI_DEVICE_FUNCS_CORE_0003 device{}; D3D12DDI_COMMAND_LIST_FUNCS_3D_0003 commands{};
     D3D12DDI_COMMAND_QUEUE_FUNCS_CORE_0001 queue{};
     REQUIRE(VioGpuD3D12BridgeGetTables(&device, &commands, &queue) == S_OK);
-    Object root{}, vs{}, ps{}, wrong{}, blend{}, raster{}, depth{}, pipeline{}, command{}, texture{}, heap{}, buffer{};
+    Object root{}, vs{}, ps{}, wrong{}, blend{}, raster{}, depth{}, pipeline{}, command{}, texture{}, heap{}, buffer{}, layout{};
     REQUIRE(bind(&ctx, &root, make_peer(ctx.backend, VKDU_ROOT), VKDU_ROOT) == S_OK);
     // Token validation and signature copying use the production DXBC builder.
     UINT vertex[] = {0x10050, 11, 0x04000060, 0x00101012, 0, 6, 0x04000067, 0x001020f2, 0, 1, 0x0100003e};
@@ -58,14 +58,32 @@ static int check_native_graphics() {
     device.pfnCreateBlendState(h, &bs, {&blend}); device.pfnCreateRasterizerState(h, &rs, {&raster});
     device.pfnCreateDepthStencilState(h, &ds, {&depth});
     REQUIRE(blend.magic && raster.magic && depth.magic);
+    D3D12DDIARG_INPUT_ELEMENT_DESC element{5, 12, DXGI_FORMAT_R32G32B32A32_FLOAT,
+        D3D12DDI_INPUT_CLASSIFICIATION_PER_INSTANCE_DATA, 2, 7};
+    D3D12DDIARG_CREATEELEMENTLAYOUT ld{&element, 1};
+    REQUIRE(device.pfnCalcPrivateElementLayoutSize(h, &ld) == sizeof(Object));
+    device.pfnCreateElementLayout(h, &ld, {&layout});
+    REQUIRE(layout.magic && layout.native_graphics_tag == 6);
+    element.InputRegister = 31; element.AlignedByteOffset = 2047;
+    device.pfnCreateElementLayout(h, &ld, {&wrong});
+    REQUIRE(!wrong.magic && reported == E_INVALIDARG);
+    ld.NumElements = 33; device.pfnCreateElementLayout(h, &ld, {&wrong});
+    REQUIRE(!wrong.magic && reported == E_INVALIDARG);
     D3D12DDIARG_CREATE_PIPELINE_STATE_0001 pso{};
     pso.hRootSignature = {&root}; pso.hVertexShader = {&vs}; pso.hPixelShader = {&ps};
     pso.hBlendState = {&blend}; pso.hRasterizerState = {&raster}; pso.hDepthStencilState = {&depth};
     pso.PrimitiveTopologyType = D3D12DDI_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     pso.NumRenderTargets = pso.SampleDesc.Count = 1; pso.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
     pso.SampleMask = UINT32_MAX; pso.hDrvPipelineState = {&pipeline}; pso.NodeMask = 1;
+    pso.hElementLayout = {&layout};
     REQUIRE(device.pfnCreatePipelineState(h, &pso) == S_OK && graphics_pipelines == 1 && graphics_state.write_mask == 15);
+    REQUIRE(graphics_state.input_count == 1 && graphics_elements[0].reg == 7 && graphics_elements[0].offset == 12 &&
+        graphics_elements[0].slot == 5 && graphics_elements[0].step_rate == 2 && graphics_elements[0].per_instance == 1);
     device.pfnDestroyPipelineState(h, {&pipeline});
+    pso.hElementLayout = {reinterpret_cast<void *>(1)};
+    REQUIRE(device.pfnCreatePipelineState(h, &pso) == E_INVALIDARG); pso.hElementLayout = {&layout};
+    auto *layout_registry = ctx.graphics_objects; ctx.graphics_objects = layout.next;
+    REQUIRE(device.pfnCreatePipelineState(h, &pso) == E_INVALIDARG); ctx.graphics_objects = layout_registry;
     pso.hVertexShader = {&ps}; REQUIRE(device.pfnCreatePipelineState(h, &pso) == E_INVALIDARG); pso.hVertexShader = {&vs};
     pso.hPixelShader = {reinterpret_cast<void *>(1)};
     REQUIRE(device.pfnCreatePipelineState(h, &pso) == E_INVALIDARG); pso.hPixelShader = {&ps};
@@ -80,8 +98,10 @@ static int check_native_graphics() {
     // Creation may recurse into destruction of every shader/state/root slot.
     graphics_slots[0] = &root; graphics_slots[1] = &vs; graphics_slots[2] = &ps;
     graphics_slots[3] = &blend; graphics_slots[4] = &raster; graphics_slots[5] = &depth;
+    graphics_slots[6] = &layout;
     graphics_hook = graphics_poison;
     REQUIRE(device.pfnCreatePipelineState(h, &pso) == S_OK && graphics_locks_free && !ctx.graphics_objects);
+    REQUIRE(graphics_state.input_count == 1 && graphics_elements[0].reg == 7 && graphics_elements[0].offset == 12);
     graphics_hook = nullptr; for (auto &slot : graphics_slots) slot = nullptr;
     device.pfnDestroyPipelineState(h, {&pipeline});
     REQUIRE(bind(&ctx, &command, make_peer(ctx.backend, VKDU_COMMAND_LIST), VKDU_COMMAND_LIST) == S_OK);

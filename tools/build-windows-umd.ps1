@@ -32,8 +32,7 @@ if ($Architecture -ne 'arm64') {
     ./tools/test-windows-umd-runtime.ps1 -Executable (Join-Path $buildDir 'libs\vkd3d-umd\vkd3d-umd-runtime-test.exe')
     & $test (Resolve-Path $dll).Path
     if ($LASTEXITCODE) { exit $LASTEXITCODE }
-    & (Join-Path $buildDir 'libs\vkd3d-umd\vkd3d-umd-ddi-descriptor-test.exe')
-    if ($LASTEXITCODE) { exit $LASTEXITCODE }
+    ./tools/test-windows-umd-descriptors.ps1 -Executable (Join-Path $buildDir 'libs\vkd3d-umd\vkd3d-umd-ddi-descriptor-test.exe')
     & (Join-Path $buildDir 'libs\vkd3d-umd\vkd3d-umd-gpu-probe.exe')
     if ($LASTEXITCODE -ne 2) { throw 'GPU probe must require explicit adapter identity before loading Vulkan' }
     & (Join-Path $buildDir 'libs\vkd3d-umd\vkd3d-umd-shared-gpu-probe.exe')

@@ -19,6 +19,8 @@ HRESULT vkd3d_wddm_queue_drain_enqueue(ID3D12CommandQueue *queue);
 /* Retained by the actual submission allocator through GPU completion/reset. */
 HRESULT vkd3d_wddm_command_retain_query(ID3D12GraphicsCommandList *command,
         ID3D12QueryHeap *heap, ID3D12Resource *destination);
+HRESULT vkd3d_wddm_command_retain_resources(ID3D12GraphicsCommandList *command,
+        UINT count, ID3D12Resource *const *resources);
 /* Private embedded-fence event ownership, not an OS monitored-fence import. */
 struct vkd3d_wddm_fence_event;
 HRESULT vkd3d_wddm_device_lost(ID3D12Device *device, HRESULT reason);
