@@ -47,17 +47,33 @@ shader does not test base-vertex attribute fetch because it has no attributes.
 Actual-WDK fixtures cover wrong/stale/foreign shader/state/RTV handles, copied
 shader data, unsupported PSO state, exact draw/index arguments, request poisoning,
 recursive slot destruction, preserved runtime command-error target, and exact
-native RT allocation/import/placement and alias ownership. Windows build/runtime
-CI is pending for the final source in this report; do not infer acceptance from
-the local CPU results.
+native RT allocation/import/placement and alias ownership.
+
+Tested implementation: `a823c15140f5e71580b0f47f76086da97118080f`.
+GitHub Actions run `35453533088` passed all five jobs: Linux production backend
+and semantic controls, ARM64/x64/x86 Windows builds, and actual Windows ARM64
+runtime fixture execution. The ARM64 execution includes the native shared RT
+allocation/import/placement and retained alias checks, native graphics callback
+ownership/argument checks, and all six lifecycle semantic negative controls.
+The five pixel rounds run through CPU Vulkan on Linux; Windows CI does not
+execute the real-GPU target probe.
+
+The ready ARM64 artifact is `vkd3d-native-ddi-arm64`, artifact ID `10586819734`
+from that run. Its ZIP is 13,189,557 bytes. The runtime validation artifact is
+`vkd3d-runtime-arm64-validation`, ID `10587541866`.
 
 The target command is:
 
 ```
-vkd3d-umd-shared-gpu-probe --luid-low HEX --luid-high HEX --run-shared-graphics
+vkd3d-umd-shared-gpu-probe.exe --luid-low HEX --luid-high HEX --run-shared-graphics
 ```
 
-It requires matching runtime-v2 KMD and Mesa. It creates native VS/PS/PSO/RTV,
+It requires the shared-domain KMD and matching Mesa in-process runtime ABI-v2.
+The provider is the registered Turnip Vulkan ICD, normally
+`vulkan_freedreno.dll`, reached through System32 `vulkan-1.dll`; replacing only
+`viogpud3d.dll` does not install it. See the exact source and ABI pairing in
+[the integration receipt](vkd3d-runtime-v2-integration-20260920.md).
+It creates native VS/PS/PSO/RTV,
 draws into imported RT backing, requires target Render before Execute returns
 and ordered OS completion on the associated queue context, then checks four
 rounds x16384 readback words and last-import KMT allocation teardown. This
