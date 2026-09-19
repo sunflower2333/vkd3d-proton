@@ -36,8 +36,13 @@ result at `texture copy format41 word128`; production contains no negative
 control branch. This verifies the test can detect a lost offset.
 
 Windows WDK fixtures add heap-import cleanup/alias lifetime/request poisoning,
-texture SRV/copy translation and source/command-slot poisoning. Windows
-x86/x64/ARM64 CI execution is required and remains pending for this candidate.
+texture SRV/copy translation, negative signed coordinates and source/command-slot
+poisoning. Candidate `9da2e23e62aeb3e6bc39372e4d0c5d3b1b7cfb46` passed all five
+jobs in [CI35437025132](https://github.com/sunflower2333/vkd3d-proton/actions/runs/35437025132):
+Linux backend, x86/x64/ARM64 build and separate ARM64 runtime. Logs confirm the
+new native heap/import and SRV/copy tests ran successfully on all three Windows
+architectures. All six prior runtime semantic negative controls also pass.
+These controlled-peer fixtures do not establish VIOGPU hardware acceptance.
 
 ## Root-owned target probe
 
