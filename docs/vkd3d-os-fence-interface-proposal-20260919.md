@@ -4,10 +4,11 @@ Status: interface proposal, not an implemented native fence provider. No KMD,
 Mesa, parent-tree or runtime-v1 ABI file is changed by this checkpoint. Ordinary
 D3D12 admission remains closed.
 
-The first target probe configuration had an invalid sharing flag pair. Its
-`STATUS_INVALID_PARAMETER` result is **not evidence** that monitored fences are
-unavailable. See the correction and control matrix below; GPUVA source gaps
-listed here are independently observed source facts.
+The corrected target matrix creates all five valid monitored-fence variants
+with real CPU mappings, but all return GPUVA zero. The initial invalid sharing
+pair is confirmed as a probe error. A second probe error (missing explicit KMT
+rewind permission) is also corrected below. These probe defects do not change
+the independently observed source gaps in the GPUVA producer.
 
 ## Exact source baseline
 
@@ -132,8 +133,8 @@ DDI consumer must remain unpublished while any provider operation is a stub.
 
 ## Test and integration sequence
 
-1. Run the new owned-object mapping probe on the unchanged installed driver:
-   `vkd3d-umd-shared-gpu-probe --luid-low HEX --luid-high HEX --run-os-fence-mapping`.
+1. Run the owned-object control matrix on the unchanged installed driver:
+   `vkd3d-umd-shared-gpu-probe --luid-low HEX --luid-high HEX --run-os-fence-controls`.
    It validates the exact KMD-published VIOGPU LUID and records the real KMT
    creation status/handle/CPU/GPU outputs, then tests pending event, CPU signal
    and rewind through OS APIs only. It never loads Vulkan or creates a D3D12
@@ -174,7 +175,7 @@ DDI consumer must remain unpublished while any provider operation is a stub.
   DXGKARG_BUILDPAGINGBUFFER, DXGK_BUILDPAGINGBUFFER_OPERATION,
   DxgkDdiSignalMonitoredFence and DXGKARG_SIGNALMONITOREDFENCE
 
-## Probe build validation and handoff
+## Historical initial probe build (superseded)
 
 Commit `3ffcd2b06060e0b0786165daa09c65b5936dfb0c` passed all five jobs of
 [CI 35444359358](https://github.com/sunflower2333/vkd3d-proton/actions/runs/35444359358).
@@ -254,4 +255,59 @@ recorded without counting it as GPU mapping success.
 device. CI executes it on x86/x64/ARM64, verifies documented flag combinations,
 input/output initialization and detects the original missing Shared-bit defect.
 This validation is a request-construction regression test, not OS acceptance.
-Corrected real-device runs remain pending.
+The first corrected real-device run is recorded below; it exposed a separate
+rewind-permission defect in the behavior subtest.
+
+## Corrected creation results and raw KMT rewind fix
+
+Probe commit `b5515ff61a2dec9638a05cbe134d90f484aa41ab` passed all five jobs of
+[CI 35445525811](https://github.com/sunflower2333/vkd3d-proton/actions/runs/35445525811).
+Actual x86/x64/ARM64 runtime logs confirm request-construction controls, existing
+native semantic negatives and explicitly CPU-WARP public fence/copy validation.
+This CI performs no target KMT calls.
+
+Main-thread target run `candidate58552-os-fence-controls-20260919a` used unchanged
+58552, LUID `00000000:01a9f9e3`, reset generation 2, device `40000040`, flags 0.
+Probe SHA256 `ee8ad96aae49fb7f2d8fc6ca8a1bc75e84b6a954712e808a77927ae0ad276dd6`.
+It exited 1 after 1118 ms without timeout; the main thread reported retained
+driver/desktop and no faults.
+
+- The same-device legacy fence creation control passed.
+- All five valid monitored-fence requests returned status 0 and real CPU
+  mappings, with GPUVA 0 in every case. For the four requests allowing GPU
+  access this is a missing mapping; for NoGPUAccess it is the expected result.
+- The historical invalid Shared/NT pair returned `c000000d`.
+- Every valid object reached the rewind subtest, after checking the initial
+  value, pending event and CPU signal/event completion. Unflagged rewind then
+  returned `c000000d` in all five cases.
+
+The former summary counters were inaccurate: the rewind exception prevented
+earlier mapping results from being counted. Raw per-case creation output is the
+authority for those mappings, not the zero totals of that old probe.
+
+Microsoft's `D3DDDICB_SIGNALFLAGS.AllowFenceRewind` explicitly permits intentional
+rewind. `D3DKMT_SIGNALSYNCHRONIZATIONOBJECTFROMCPU.Flags` has this exact type.
+The optional rewind subtest now sets that flag, logs its exact status, and waits
+up to two seconds for the same CPU mapping to show the new value. CPU-signal
+documentation says completion must not be assumed merely because the call
+returned. A threshold wait at 1 would already pass while the value is 4, so
+the probe observes its own mapping directly without submitting another writer.
+NoSignal is unrelated: that object flag would deny every signal, including the
+already successful signal to 4.
+
+Creation/mapping observations are now retained before any behavior subtest.
+The initial/pending/CPU signal-event result and rewind result are recorded
+separately. A later failure cannot erase GPUVA-zero, CPU-only or CPU-event
+evidence. A behavior error still prevents the whole probe from passing, and
+the GPU mapping gate stays closed when all four GPU-access variants return 0.
+CI's no-device request check now rejects omission of explicit rewind permission.
+
+Additional exact Microsoft sources:
+
+- `d3dukmdt/ns-d3dukmdt-_d3dddicb_signalflags.md`
+- `d3dkmthk/ns-d3dkmthk-_d3dkmt_signalsynchronizationobjectfromcpu.md`
+- `d3dkmthk/nf-d3dkmthk-d3dkmtsignalsynchronizationobjectfromcpu.md`
+- [WDK KMT header](https://github.com/tpn/winsdk-10/blob/master/Include/10.0.16299.0/km/d3dkmthk.h)
+
+The flagged-rewind revision is awaiting CI and root-owned target execution.
+No production UMD, KMD, Mesa or shared runtime ABI changed.

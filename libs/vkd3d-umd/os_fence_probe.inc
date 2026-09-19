@@ -57,6 +57,15 @@ bool os_fence_flags_valid(const D3DKMT_CREATESYNCHRONIZATIONOBJECT2 &create) {
         (!create.Info.Flags.NoGPUAccess || create.Info.Type == D3DDDI_MONITORED_FENCE);
 }
 
+D3DKMT_SIGNALSYNCHRONIZATIONOBJECTFROMCPU os_fence_signal_request(
+        D3DKMT_HANDLE device, const D3DKMT_HANDLE *object, const UINT64 *target, bool rewind) {
+    D3DKMT_SIGNALSYNCHRONIZATIONOBJECTFROMCPU signal{};
+    signal.hDevice = device; signal.ObjectCount = 1;
+    signal.ObjectHandleArray = object; signal.FenceValueArray = target;
+    signal.Flags.AllowFenceRewind = rewind;
+    return signal;
+}
+
 void validate_os_fence_cases() {
     for (const auto &test : os_fence_cases) {
         const auto request = os_fence_request(0x1234, test);
@@ -72,11 +81,23 @@ void validate_os_fence_cases() {
     auto old_bug = os_fence_request(0x1234, os_fence_cases[1]);
     old_bug.Info.Flags.Shared = 0;
     require(!os_fence_flags_valid(old_bug), "missing Shared bit must be detected before a positive probe");
-    std::puts("PASS OS_FENCE_CONFIGURATION_ONLY shared_pair, affinity_0_1, private, NoGPUAccess, original_bug_rejected; no KMT calls");
+    D3DKMT_HANDLE object = 0x4321;
+    UINT64 target = 1;
+    const auto monotonic = os_fence_signal_request(0x1234, &object, &target, false);
+    const auto rewind = os_fence_signal_request(0x1234, &object, &target, true);
+    require(monotonic.Flags.Value == 0 && rewind.Flags.AllowFenceRewind &&
+        rewind.Flags.Value == 4 && rewind.hDevice == 0x1234 && rewind.ObjectCount == 1 &&
+        rewind.ObjectHandleArray == &object && rewind.FenceValueArray == &target,
+        "raw KMT rewind needs explicit AllowFenceRewind without unrelated signal flags");
+    std::puts("PASS OS_FENCE_CONFIGURATION_ONLY shared_pair, affinity_0_1, private, NoGPUAccess, original_bug_rejected, explicit_AllowFenceRewind; no KMT calls");
 }
 
-enum class OsFenceResult { rejected, legacy, gpu_mapping, cpu_only, missing_gpu_mapping };
-OsFenceResult run_os_fence_case(ProbeRuntime &runtime, const OsFenceCase &test) {
+enum class OsFenceResult { unclassified, rejected, legacy, gpu_mapping, cpu_only, missing_gpu_mapping };
+struct OsFenceObservation {
+    OsFenceResult mapping = OsFenceResult::unclassified;
+    bool created = false, cpu_mapping = false, cpu_event = false, rewind = false;
+};
+void run_os_fence_case(ProbeRuntime &runtime, const OsFenceCase &test, OsFenceObservation &observed) {
     OwnedOsFence fence;
     auto create = os_fence_request(runtime.device, test);
     require(os_fence_flags_valid(create) || test.invalid_flags, "valid flags before positive KMT call");
@@ -89,20 +110,37 @@ OsFenceResult run_os_fence_case(ProbeRuntime &runtime, const OsFenceCase &test) 
         test.name, static_cast<unsigned>(status), create.hSyncObject,
         test.monitored ? create.Info.MonitoredFence.FenceValueCPUVirtualAddress : nullptr,
         test.monitored ? static_cast<unsigned long long>(create.Info.MonitoredFence.FenceValueGPUVirtualAddress) : 0ull);
-    if (status < 0) return OsFenceResult::rejected;
+    if (status < 0) { observed.mapping = OsFenceResult::rejected; return; }
+    observed.created = true;
     require(!test.invalid_flags, "OS unexpectedly accepted documented invalid flags");
     if (!test.monitored) {
         require(fence.object != 0, "same-device legacy synchronization object created");
+        observed.mapping = OsFenceResult::legacy;
         check(fence.close(), "legacy control destruction");
         std::puts("PASS KMT_LEGACY_FENCE_DEVICE_CONTROL create_destroy_only");
-        return OsFenceResult::legacy;
+        return;
     }
     require(fence.object != 0 && create.Info.MonitoredFence.FenceValueCPUVirtualAddress &&
         !(reinterpret_cast<uintptr_t>(create.Info.MonitoredFence.FenceValueCPUVirtualAddress) & 7),
         "genuine OS handle and aligned CPU mapping");
+    observed.cpu_mapping = true;
+    const UINT64 gpuva = create.Info.MonitoredFence.FenceValueGPUVirtualAddress;
+    if (test.no_gpu) {
+        require(gpuva == 0, "NoGPUAccess must not expose a GPU mapping");
+        observed.mapping = OsFenceResult::cpu_only;
+    } else if (!gpuva) observed.mapping = OsFenceResult::missing_gpu_mapping;
+    else {
+        require(!(gpuva & 7), "OS GPUVA alignment");
+        observed.mapping = OsFenceResult::gpu_mapping;
+    }
+    // Preserve creation/mapping facts even if a later CPU behavior check fails.
+    std::printf("KMT_FENCE_MAPPING_OBSERVED case=%s CPU_mapped=1 GPU_mapped=%u NoGPUAccess_CPU=%u missing_GPUVA=%u\n",
+        test.name, observed.mapping == OsFenceResult::gpu_mapping,
+        observed.mapping == OsFenceResult::cpu_only, observed.mapping == OsFenceResult::missing_gpu_mapping);
     // Only the explicit OS CPU output is dereferenced. Never cast the GPUVA.
-    // Reads below happen after synchronous CPU signal/event completion, with
-    // no concurrent writer, including on x86. No CPU store touches OS memory.
+    // No CPU store touches OS memory. Values used here fit in the low32 bits,
+    // so the optional bounded rewind observation is also safe on x86 even
+    // though a general concurrent64-bit read there would require more care.
     auto *value = static_cast<const volatile UINT64 *>(create.Info.MonitoredFence.FenceValueCPUVirtualAddress);
     require(*value == 3, "OS initial value visible through returned CPU mapping");
     fence.event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -114,26 +152,32 @@ OsFenceResult run_os_fence_case(ProbeRuntime &runtime, const OsFenceCase &test) 
     check(nt_result(D3DKMTWaitForSynchronizationObjectFromCpu(&wait), "WaitFromCpu(async)"), "OS asynchronous wait");
     require(WaitForSingleObject(fence.event, 30) == WAIT_TIMEOUT && *value == 3,
         "pending OS fence cannot complete early");
-    D3DKMT_SIGNALSYNCHRONIZATIONOBJECTFROMCPU signal{};
-    signal.hDevice = runtime.device; signal.ObjectCount = 1;
-    signal.ObjectHandleArray = &fence.object; signal.FenceValueArray = &target;
+    auto signal = os_fence_signal_request(runtime.device, &fence.object, &target, false);
     check(nt_result(D3DKMTSignalSynchronizationObjectFromCpu(&signal), "SignalFromCpu"), "OS CPU signal");
     require(WaitForSingleObject(fence.event, 2000) == WAIT_OBJECT_0 && *value == target,
         "same OS storage and actual completion event");
+    observed.cpu_event = true;
+    std::printf("PASS KMT_OWNED_MONITORED_FENCE_CPU_EVENT case=%s initial_value, delayed_event, CPU_signal\n", test.name);
+
+    // Public D3D12 rewind semantics must not be imposed on an unflagged KMT
+    // signal. This additional subtest explicitly permits intentional rewind.
     target = 1;
-    check(nt_result(D3DKMTSignalSynchronizationObjectFromCpu(&signal), "SignalFromCpu(rewind)"), "OS CPU rewind");
-    require(*value == target, "same OS storage observes rewind");
-    const UINT64 gpuva = create.Info.MonitoredFence.FenceValueGPUVirtualAddress;
-    std::printf("PASS KMT_OWNED_MONITORED_FENCE_CPU_EVENT case=%s initial_value, delayed_event, CPU_signal, rewind\n", test.name);
+    signal = os_fence_signal_request(runtime.device, &fence.object, &target, true);
+    const NTSTATUS rewind_status = D3DKMTSignalSynchronizationObjectFromCpu(&signal);
+    std::printf("KMT_FENCE_REWIND case=%s flags=%08x status=%08x target=%llu\n",
+        test.name, signal.Flags.Value, static_cast<unsigned>(rewind_status), static_cast<unsigned long long>(target));
+    check(nt_result(rewind_status, "SignalFromCpu(AllowFenceRewind)"), "OS explicitly allowed CPU rewind");
+    // CPU signal return does not guarantee completion. A threshold wait for1
+    // would already pass at4, so observe this probe-owned CPU mapping directly
+    // with a deadline; no other writer is submitted during this subtest.
+    const ULONGLONG rewind_deadline = GetTickCount64() + 2000;
+    while (*value != target && GetTickCount64() < rewind_deadline) Sleep(1);
+    require(*value == target, "same OS storage observes explicitly allowed rewind within deadline");
+    observed.rewind = true;
+    std::printf("PASS KMT_OWNED_MONITORED_FENCE_CPU_REWIND case=%s AllowFenceRewind, observed_same_mapping\n", test.name);
     check(fence.close(), "explicit OS fence destruction");
-    if (test.no_gpu) {
-        require(gpuva == 0, "NoGPUAccess must not expose a GPU mapping");
-        return OsFenceResult::cpu_only;
-    }
-    if (!gpuva) return OsFenceResult::missing_gpu_mapping;
-    require(!(gpuva & 7), "OS GPUVA alignment");
-    std::printf("PASS KMT_OWNED_MONITORED_FENCE_MAPPING_OUTPUTS_ONLY case=%s; no GPU access or ordinary D3D12 fence import proven\n", test.name);
-    return OsFenceResult::gpu_mapping;
+    if (observed.mapping == OsFenceResult::gpu_mapping)
+        std::printf("PASS KMT_OWNED_MONITORED_FENCE_MAPPING_OUTPUTS_ONLY case=%s; no GPU access or ordinary D3D12 fence import proven\n", test.name);
 }
 
 void run_os_fence_probe(LUID luid, bool controls) {
@@ -150,29 +194,36 @@ void run_os_fence_probe(LUID luid, bool controls) {
         static_cast<unsigned>(luid.HighPart), luid.LowPart,
         static_cast<unsigned long long>(identity.generation), runtime.device);
     if (!controls) {
-        const auto result = run_os_fence_case(runtime, os_fence_cases[1]);
+        OsFenceObservation observed;
+        run_os_fence_case(runtime, os_fence_cases[1], observed);
         check(runtime.close(), "explicit KMT device/adapter destruction");
-        require(result == OsFenceResult::gpu_mapping, "corrected shared affinity1 GPU mapping configuration failed");
+        require(observed.mapping == OsFenceResult::gpu_mapping, "corrected shared affinity1 GPU mapping configuration failed");
         return;
     }
     unsigned legacy = 0, mapped = 0, cpu_only = 0, rejected = 0, missing_mapping = 0, behavior_failures = 0;
+    unsigned created = 0, cpu_mapped = 0, cpu_event = 0, rewind = 0;
     for (const auto &test : os_fence_cases) {
+        OsFenceObservation observed;
         try {
-            switch (run_os_fence_case(runtime, test)) {
-                case OsFenceResult::legacy: ++legacy; break;
-                case OsFenceResult::gpu_mapping: ++mapped; break;
-                case OsFenceResult::cpu_only: ++cpu_only; break;
-                case OsFenceResult::missing_gpu_mapping: ++missing_mapping; break;
-                case OsFenceResult::rejected: ++rejected; break;
-            }
+            run_os_fence_case(runtime, test, observed);
         } catch (const ProbeFailure &error) {
             ++behavior_failures;
             std::fprintf(stderr, "KMT_FENCE_CASE_FAILURE case=%s error=%s\n", test.name, error.what());
         }
+        created += observed.created; cpu_mapped += observed.cpu_mapping;
+        cpu_event += observed.cpu_event; rewind += observed.rewind;
+        switch (observed.mapping) {
+            case OsFenceResult::legacy: ++legacy; break;
+            case OsFenceResult::gpu_mapping: ++mapped; break;
+            case OsFenceResult::cpu_only: ++cpu_only; break;
+            case OsFenceResult::missing_gpu_mapping: ++missing_mapping; break;
+            case OsFenceResult::rejected: ++rejected; break;
+            case OsFenceResult::unclassified: break;
+        }
     }
     check(runtime.close(), "explicit KMT device/adapter destruction");
-    std::printf("KMT_FENCE_CONTROLS_COMPLETE legacy=%u GPU_mapped=%u NoGPUAccess_CPU=%u rejected=%u missing_GPUVA=%u behavior_failures=%u\n",
-        legacy, mapped, cpu_only, rejected, missing_mapping, behavior_failures);
+    std::printf("KMT_FENCE_CONTROLS_COMPLETE legacy=%u GPU_mapped=%u NoGPUAccess_CPU=%u rejected=%u missing_GPUVA=%u behavior_failures=%u created=%u CPU_mapped=%u CPU_event_pass=%u rewind_pass=%u\n",
+        legacy, mapped, cpu_only, rejected, missing_mapping, behavior_failures, created, cpu_mapped, cpu_event, rewind);
     require(!behavior_failures, "one or more created OS objects violated their mapping/event contract");
     require(legacy == 1, "same-device legacy fence creation control failed");
     require(mapped != 0, "none of the tested GPU mapping configurations succeeded; inspect CPU-only outcome and statuses");
