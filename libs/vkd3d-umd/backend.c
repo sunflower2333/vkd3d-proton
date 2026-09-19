@@ -137,6 +137,10 @@ void vkdu_device_destroy(vkdu_device *device)
 { if (device) { ID3D12Device_Release(device->object); free(device); } }
 int32_t vkdu_device_status(vkdu_device *device)
 { return device ? ID3D12Device_GetDeviceRemovedReason(device->object) : E_INVALIDARG; }
+int32_t vkdu_device_remove(vkdu_device *device, int32_t reason)
+{
+    return device ? vkd3d_wddm_device_lost(device->object, reason) : E_INVALIDARG;
+}
 int vkdu_object_retain(vkdu_object *object)
 {
     uint32_t count, observed;
@@ -825,41 +829,56 @@ int32_t vkdu_fence_create(vkdu_device *device, uint64_t initial, vkdu_object **o
 }
 int32_t vkdu_queue_signal(vkdu_object *queue, vkdu_object *fence, uint64_t value)
 {
+    HRESULT hr;
     if (!VALID(queue, VKDU_QUEUE) || !VALID(fence, VKDU_FENCE) || !vkdu_same_device(queue, fence) || value == UINT64_MAX) return E_INVALIDARG;
+    if (FAILED(hr = ID3D12Device_GetDeviceRemovedReason(queue->owner))) return hr;
     return ID3D12CommandQueue_Signal(OBJ(ID3D12CommandQueue, queue), OBJ(ID3D12Fence, fence), value);
 }
 int32_t vkdu_queue_wait(vkdu_object *queue, vkdu_object *fence, uint64_t value)
 {
+    HRESULT hr;
     if (!VALID(queue, VKDU_QUEUE) || !VALID(fence, VKDU_FENCE) || !vkdu_same_device(queue, fence) || value == UINT64_MAX) return E_INVALIDARG;
+    if (FAILED(hr = ID3D12Device_GetDeviceRemovedReason(queue->owner))) return hr;
+#ifdef VKDU_TEST_FENCE_DROP_WAIT
+    return S_OK; /* Semantic negative-control binary only. */
+#endif
     return ID3D12CommandQueue_Wait(OBJ(ID3D12CommandQueue, queue), OBJ(ID3D12Fence, fence), value);
 }
 int32_t vkdu_fence_completed(vkdu_object *fence, uint64_t *value)
 {
+    HRESULT hr;
     if (!VALID(fence, VKDU_FENCE) || !value) return E_INVALIDARG;
     *value = ID3D12Fence_GetCompletedValue(OBJ(ID3D12Fence, fence));
-    return *value == UINT64_MAX ? DXGI_ERROR_DEVICE_REMOVED : S_OK;
+    if (*value != UINT64_MAX) return S_OK;
+    hr = ID3D12Device_GetDeviceRemovedReason(fence->owner);
+    return FAILED(hr) ? hr : DXGI_ERROR_DEVICE_REMOVED;
 }
-static uint64_t milliseconds(void)
+int32_t vkdu_fence_signal_cpu(vkdu_object *fence, uint64_t value)
 {
-#ifdef _WIN32
-    return GetTickCount64();
-#else
-    struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
-    return (uint64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
-#endif
+    HRESULT hr;
+    if (!VALID(fence, VKDU_FENCE) || value == UINT64_MAX) return E_INVALIDARG;
+    if (FAILED(hr = ID3D12Device_GetDeviceRemovedReason(fence->owner))) return hr;
+    return ID3D12Fence_Signal(OBJ(ID3D12Fence, fence), value);
 }
+int32_t vkdu_fence_event_create(vkdu_object *fence, uint64_t value, vkdu_fence_event **out)
+{
+    if (!out) return E_POINTER;
+    *out = NULL;
+    if (!VALID(fence, VKDU_FENCE)) return E_INVALIDARG;
+    return vkd3d_wddm_fence_event_create(OBJ(ID3D12Fence, fence), value, out);
+}
+int32_t vkdu_fence_event_wait(vkdu_fence_event *event, uint32_t timeout_ms)
+{ return vkd3d_wddm_fence_event_wait(event, timeout_ms); }
+void vkdu_fence_event_cancel(vkdu_fence_event *event)
+{ vkd3d_wddm_fence_event_cancel(event); }
+void vkdu_fence_event_destroy(vkdu_fence_event *event)
+{ vkd3d_wddm_fence_event_destroy(event); }
 int32_t vkdu_fence_wait(vkdu_object *fence, uint64_t value, uint32_t timeout_ms)
 {
-    uint64_t completed, start = milliseconds(); HRESULT hr;
-    if (!VALID(fence, VKDU_FENCE) || value == UINT64_MAX) return E_INVALIDARG;
-    do {
-        if (FAILED(hr = vkdu_fence_completed(fence, &completed))) return hr;
-        if (completed >= value) return S_OK;
-        if (milliseconds() - start >= timeout_ms) return (int32_t)0x887a000a; /* WAS_STILL_DRAWING */
-#ifdef _WIN32
-        Sleep(1);
-#else
-        { struct timespec delay = {0, 1000000}; nanosleep(&delay, NULL); }
-#endif
-    } while (1);
+    vkdu_fence_event *event = NULL;
+    HRESULT hr = vkdu_fence_event_create(fence, value, &event);
+    if (FAILED(hr)) return hr;
+    hr = vkdu_fence_event_wait(event, timeout_ms);
+    vkdu_fence_event_destroy(event);
+    return hr;
 }

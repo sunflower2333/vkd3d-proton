@@ -104,6 +104,11 @@ static void test_destroy(vkdu_device *device) {
         ++destroys; delete peer;
     }
 }
+static unsigned backend_device_removals;
+static int32_t backend_removal_reason;
+static int32_t test_device_remove(vkdu_device *, int32_t reason) {
+    ++backend_device_removals; backend_removal_reason = reason; return reason;
+}
 static HRESULT APIENTRY test_query(HANDLE runtime, const D3DDDICB_QUERYADAPTERINFO *args) {
     if (runtime != expected_adapter || args->PrivateDriverDataSize != 160) fixture_abort(__LINE__);
     auto *bytes = static_cast<uint8_t *>(args->pPrivateDriverData);
@@ -161,6 +166,7 @@ static DWORD WINAPI test_event_wait(HANDLE event, DWORD timeout) {
 #define FreeLibrary test_unload
 #define vkdu_device_create_shared test_create
 #define vkdu_device_destroy test_destroy
+#define vkdu_device_remove test_device_remove
 #define vkdu_memory_heap_import test_import_heap
 #define vkdu_buffer_place test_place_buffer
 #define vkdu_texture2d_allocation test_texture_allocation
@@ -1084,9 +1090,11 @@ static int test_native_command_errors() {
     commands.pfnCloseCommandList(second_handle);
     REQUIRE(command_errors.size() == 3); // A successful sibling operation adds no error.
     command_close_result = DXGI_ERROR_DEVICE_REMOVED;
+    const unsigned before_backend_removal = backend_device_removals;
     commands.pfnCloseCommandList(second_handle);
     REQUIRE(command_errors.size() == 4 && command_errors.back() == std::make_pair(second_runtime, HRESULT(DXGI_ERROR_DEVICE_REMOVED)));
     REQUIRE(error_calls == before_errors + 1 && last_runtime.handle == expected_device && ctx->last_error == DXGI_ERROR_DEVICE_REMOVED);
+    REQUIRE(backend_device_removals == before_backend_removal + 1 && backend_removal_reason == DXGI_ERROR_DEVICE_REMOVED);
     table.pfnDestroyCommandList(create.hDrvDevice, first_handle);
     table.pfnDestroyCommandList(create.hDrvDevice, second_handle);
     table.pfnDestroyCommandAllocator(create.hDrvDevice, allocator.hDrvCommandAllocator);

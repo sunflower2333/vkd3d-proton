@@ -60,6 +60,7 @@ int32_t vkdu_test_device_create(PFN_vkGetInstanceProcAddr loader, vkdu_device **
 #endif
 void vkdu_device_destroy(vkdu_device *device);
 int32_t vkdu_device_status(vkdu_device *device);
+int32_t vkdu_device_remove(vkdu_device *device, int32_t reason);
 /* Caller already owns a live reference. A successful retain owns the wrapper
  * and its COM device/object until the matching vkdu_object_destroy. */
 int vkdu_object_retain(vkdu_object *object);
@@ -141,6 +142,12 @@ int32_t vkdu_queue_signal(vkdu_object *queue, vkdu_object *fence, uint64_t value
 int32_t vkdu_queue_wait(vkdu_object *queue, vkdu_object *fence, uint64_t value);
 int32_t vkdu_queue_clock(vkdu_object *queue, uint64_t *gpu, uint64_t *cpu);
 int32_t vkdu_fence_completed(vkdu_object *fence, uint64_t *value);
+int32_t vkdu_fence_signal_cpu(vkdu_object *fence, uint64_t value);
+typedef struct vkd3d_wddm_fence_event vkdu_fence_event;
+int32_t vkdu_fence_event_create(vkdu_object *fence, uint64_t value, vkdu_fence_event **out);
+int32_t vkdu_fence_event_wait(vkdu_fence_event *event, uint32_t timeout_ms);
+void vkdu_fence_event_cancel(vkdu_fence_event *event);
+void vkdu_fence_event_destroy(vkdu_fence_event *event);
 int32_t vkdu_fence_wait(vkdu_object *fence, uint64_t value, uint32_t timeout_ms);
 #ifdef __cplusplus
 }

@@ -156,6 +156,10 @@ void error(Context *value, HRESULT result) {
     {
         std::lock_guard<NativeCallbackMutex> lock(value->error_mutex);
         value->last_error = result;
+        if (value->backend && value->native_adapter &&
+                (result == DXGI_ERROR_DEVICE_REMOVED || result == DXGI_ERROR_DEVICE_RESET ||
+                 result == DXGI_ERROR_DEVICE_HUNG || result == DXGI_ERROR_DRIVER_INTERNAL_ERROR))
+            vkdu_device_remove(value->backend, result);
         if (value->report) value->report(value->report_context, result);
     }
     release(value);

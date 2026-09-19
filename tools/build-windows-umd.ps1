@@ -24,7 +24,7 @@ $crossArgs = @()
 if ($Architecture -eq 'arm64') { $crossArgs = @('--cross-file', 'tools/umd-arm64-msvc.ini') }
 meson setup $buildDir @crossArgs --buildtype release -Ddebug=true -Denable_umd_bridge=true -Denable_umd_bridge_tests=true
 if ($LASTEXITCODE) { exit $LASTEXITCODE }
-meson compile -C $buildDir -j 3 viogpud3d12 vkd3d-umd-ddi-abi-test vkd3d-umd-ddi-descriptor-test vkd3d-umd-gpu-probe vkd3d-umd-runtime-test vkd3d-umd-shared-gpu-probe vkd3d-system-d3d12-probe
+meson compile -C $buildDir -j 3 viogpud3d12 vkd3d-umd-ddi-abi-test vkd3d-umd-ddi-descriptor-test vkd3d-umd-gpu-probe vkd3d-umd-runtime-test vkd3d-umd-shared-gpu-probe vkd3d-system-d3d12-probe vkd3d-umd-fence-test
 if ($LASTEXITCODE) { exit $LASTEXITCODE }
 $dll = Join-Path $buildDir 'libs\vkd3d-umd\viogpud3d12.dll'
 $test = Join-Path $buildDir 'libs\vkd3d-umd\vkd3d-umd-ddi-abi-test.exe'

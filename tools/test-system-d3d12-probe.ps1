@@ -11,6 +11,7 @@ $output = Get-Content -LiteralPath $stdout -Raw
 $errors = Get-Content -LiteralPath $stderr -Raw
 Write-Host $output
 if ($process.ExitCode -ne 0 -or $errors -match 'FAIL|MISMATCH|NOT_PASSED' -or
+        $output -notmatch 'PASS PUBLIC_FENCE_LIFECYCLE delayed_queue_completion, CPU_rewind, final_release_event' -or
         $output -notmatch 'PASS CPU_WARP_HARNESS_ONLY 4x1024 words; no VIOGPU acceptance') {
     throw "Public D3D12 application harness failed: exit=$($process.ExitCode) $errors"
 }

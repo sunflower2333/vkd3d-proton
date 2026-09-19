@@ -24,6 +24,7 @@
 #include "vkd3d_swapchain_factory.h"
 #include "vkd3d_descriptor_debug.h"
 #include "vkd3d_timestamp_profiler.h"
+#include "vkd3d_wddm.h"
 #ifdef VKD3D_ENABLE_RENDERDOC
 #include "vkd3d_renderdoc.h"
 #endif
@@ -1577,6 +1578,8 @@ static UINT64 STDMETHODCALLTYPE d3d12_fence_GetCompletedValue(d3d12_fence_iface 
     uint64_t completed_value;
     int rc;
 
+    if (FAILED(d3d12_device_removed_reason(fence->device))) return UINT64_MAX;
+
     TRACE("iface %p.\n", iface);
 
     if ((rc = pthread_mutex_lock(&fence->mutex)))
@@ -1685,6 +1688,8 @@ static HRESULT STDMETHODCALLTYPE d3d12_fence_SetEventOnCompletion(d3d12_fence_if
 
     return d3d12_fence_set_event_on_completion(fence, value, event);
 }
+
+#include "wddm_fence_event.inc"
 
 static HRESULT STDMETHODCALLTYPE d3d12_fence_Signal(d3d12_fence_iface *iface, UINT64 value)
 {

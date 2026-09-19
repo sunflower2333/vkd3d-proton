@@ -32,6 +32,14 @@ if vkd3d_platform == 'windows'
 endif
 
 if get_option('enable_umd_bridge_tests')
+  umd_fence_test = executable('vkd3d-umd-fence-test', 'backend.c', 'debug_policy.c', 'fence_test.cpp',
+    c_args : ['-DVKDU_ENABLE_TEST_DEVICE'], cpp_args : ['-DVKDU_ENABLE_TEST_DEVICE', '-DNOMINMAX'],
+    dependencies : vkd3d_dep, include_directories : vkd3d_private_includes)
+  test('vkd3d-umd-fence-events', umd_fence_test, timeout : 60)
+  umd_fence_negative = executable('vkd3d-umd-fence-negative', 'backend.c', 'debug_policy.c', 'fence_test.cpp',
+    c_args : ['-DVKDU_ENABLE_TEST_DEVICE', '-DVKDU_TEST_FENCE_DROP_WAIT'],
+    cpp_args : ['-DVKDU_ENABLE_TEST_DEVICE', '-DNOMINMAX'],
+    dependencies : vkd3d_dep, include_directories : vkd3d_private_includes)
   # Separate object build. The CPU-only test entrypoint is not in production.
   umd_backend_test = executable('vkd3d-umd-backend-test', 'backend.c', 'debug_policy.c', 'backend_test.c',
     c_args : ['-DVKDU_ENABLE_TEST_DEVICE'],

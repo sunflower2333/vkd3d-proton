@@ -54,6 +54,38 @@ void describe(IDXGIAdapter1 *adapter) {
         static_cast<unsigned>(desc.AdapterLuid.HighPart), desc.AdapterLuid.LowPart,
         desc.VendorId, desc.DeviceId, !!(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE), desc.Description);
 }
+void fence_test(ID3D12Device *device) {
+    ComPtr<ID3D12CommandQueue> producer, consumer;
+    D3D12_COMMAND_QUEUE_DESC q{}; q.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    check(device->CreateCommandQueue(&q, IID_PPV_ARGS(&producer)), "fences: CreateCommandQueue(producer)");
+    check(device->CreateCommandQueue(&q, IID_PPV_ARGS(&consumer)), "fences: CreateCommandQueue(consumer)");
+    ComPtr<ID3D12Fence> gate, done;
+    check(device->CreateFence(3, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate)), "fences: CreateFence(initial=3)");
+    check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&done)), "fences: CreateFence(done)");
+    require(gate->GetCompletedValue() == 3 && done->GetCompletedValue() == 0, "fences: initial completed values");
+    HANDLE event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!event) check(HRESULT_FROM_WIN32(GetLastError()), "fences: CreateEvent");
+    struct Close { HANDLE event; ~Close() { CloseHandle(event); } } close{event};
+    check(done->SetEventOnCompletion(1, event), "fences: SetEventOnCompletion");
+    check(consumer->Wait(gate.Get(), 4), "fences: queue Wait(future)");
+    check(consumer->Signal(done.Get(), 1), "fences: queue Signal(behind wait)");
+    require(WaitForSingleObject(event, 30) == WAIT_TIMEOUT && done->GetCompletedValue() == 0,
+        "fences: future wait must prevent completion");
+    check(producer->Signal(gate.Get(), 4), "fences: producer Signal");
+    require(WaitForSingleObject(event, 10000) == WAIT_OBJECT_0, "fences: actual completion event");
+    check(device->GetDeviceRemovedReason(), "fences: device status");
+    require(done->GetCompletedValue() == 1, "fences: actual completed value");
+    check(done->Signal(0), "fences: CPU Signal rewind");
+    require(done->GetCompletedValue() == 0 && WaitForSingleObject(event, 0) == WAIT_OBJECT_0,
+        "fences: prior event stays signaled across rewind");
+    ResetEvent(event);
+    ComPtr<ID3D12Fence> orphan;
+    check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&orphan)), "fences: CreateFence(orphan)");
+    check(orphan->SetEventOnCompletion(100, event), "fences: arm orphan event");
+    orphan.Reset();
+    require(WaitForSingleObject(event, 10000) == WAIT_OBJECT_0, "fences: final fence release unblocks wait");
+    std::puts("PASS PUBLIC_FENCE_LIFECYCLE delayed_queue_completion, CPU_rewind, final_release_event");
+}
 void copy_test(ID3D12Device *device) {
     ComPtr<ID3D12CommandQueue> queue;
     D3D12_COMMAND_QUEUE_DESC q{}; q.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
@@ -131,10 +163,10 @@ int main(int argc, char **argv) {
     const bool warp = argc == 2 && !std::strcmp(argv[1], "--run-warp-ci");
     const bool selected = argc == 6 && !std::strcmp(argv[1], "--luid-low") && !std::strcmp(argv[3], "--luid-high") &&
         hex32(argv[2], low) && hex32(argv[4], high) && (low | high) &&
-        (!std::strcmp(argv[5], "--run-device") || !std::strcmp(argv[5], "--run-copy"));
+        (!std::strcmp(argv[5], "--run-device") || !std::strcmp(argv[5], "--run-copy") || !std::strcmp(argv[5], "--run-fences"));
     if (!list && !warp && !selected) {
         std::fputs("usage: vkd3d-system-d3d12-probe --list\n"
-            "       vkd3d-system-d3d12-probe --luid-low HEX --luid-high HEX --run-device|--run-copy\n"
+            "       vkd3d-system-d3d12-probe --luid-low HEX --luid-high HEX --run-device|--run-copy|--run-fences\n"
             "       --run-warp-ci is explicit CPU harness validation only; never target GPU acceptance\n", stderr);
         return 2;
     }
@@ -170,6 +202,7 @@ int main(int argc, char **argv) {
         const LUID actual = device->GetAdapterLuid();
         require(actual.LowPart == desc.AdapterLuid.LowPart && actual.HighPart == desc.AdapterLuid.HighPart, "device adapter LUID");
         std::puts("PASS PUBLIC_D3D12_DEVICE requested_feature_level=11_0");
+        if (warp || !std::strcmp(argv[5], "--run-fences")) fence_test(device.Get());
         if (warp || !std::strcmp(argv[5], "--run-copy")) {
             copy_test(device.Get());
             std::puts(warp ? "PASS CPU_WARP_HARNESS_ONLY 4x1024 words; no VIOGPU acceptance" :
