@@ -28,6 +28,24 @@ struct d3d12_command_queue {
    bool requested;
 };
 typedef struct d3d12_command_queue ID3D12CommandQueue;
+typedef int ID3D12CommandList;
+typedef struct {
+   int kind, closed, command_type;
+   struct d3d12_device *owner;
+   void *value;
+} vkdu_object;
+enum { VKDU_QUEUE = 1, VKDU_COMMAND_LIST = 2, E_INVALIDARG = -5 };
+#define VALID(o, k) ((o) && (o)->kind == (k))
+#define OBJ(t, o) ((t *)(o)->value)
+#define FAILED(hr) ((hr) < 0)
+static bool vkdu_same_device(vkdu_object *a, vkdu_object *b) { return a->owner == b->owner; }
+static HRESULT vkd3d_wddm_queue_drain_enqueue(ID3D12CommandQueue *queue);
+static HRESULT vkdu_queue_drain_enqueue(vkdu_object *queue) {
+   return vkd3d_wddm_queue_drain_enqueue(OBJ(ID3D12CommandQueue, queue));
+}
+static void ID3D12CommandQueue_ExecuteCommandLists(ID3D12CommandQueue *queue,
+       uint32_t count, ID3D12CommandList **commands) { (void)queue; (void)count; (void)commands; }
+static HRESULT ID3D12Device_GetDeviceRemovedReason(struct d3d12_device *device) { return device->removed; }
 #define VK_CALL(f) (vk_procs->f)
 #define ERR(...) ((void)0)
 static int failures, submissions, allocations, fail_allocation;
@@ -113,6 +131,23 @@ int main(void) {
    CHECK(vkd3d_wddm_queue_drain_enqueue(&first) == S_OK);
    CHECK(atomic_load(&enqueued));
    // Also allow the intentionally skipped-drain control to exit normally.
+   pthread_mutex_lock(&first.queue_lock); first.requested = true;
+   pthread_cond_broadcast(&first.queue_cond); pthread_mutex_unlock(&first.queue_lock);
+   pthread_join(thread, NULL);
+   first.requested = false; first.drain_count = first.queue_drain_count = 0;
+   atomic_store(&enqueued, false);
+   ID3D12CommandList list = 0;
+   vkdu_object queue_object = {.kind = VKDU_QUEUE, .owner = &device, .value = &first};
+   vkdu_object command_object = {.kind = VKDU_COMMAND_LIST, .closed = 1, .owner = &device, .value = &list};
+   vkdu_object *batch[] = {&command_object};
+   pthread_create(&thread, NULL, worker, &first);
+   CHECK(vkdu_queue_execute(&queue_object, 1, batch) == S_OK);
+   // This models the runtime placing its external signal/wait immediately on
+   // return from the production Execute wrapper. No GPU completion occurs.
+   if (!atomic_load(&enqueued)) {
+      fputs("FAIL runtime external fence packet overtook production Execute enqueue\n", stderr);
+      ++failures;
+   }
    pthread_mutex_lock(&first.queue_lock); first.requested = true;
    pthread_cond_broadcast(&first.queue_cond); pthread_mutex_unlock(&first.queue_lock);
    pthread_join(thread, NULL);

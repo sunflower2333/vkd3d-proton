@@ -15,6 +15,7 @@ struct NativeAdapter;
 struct NativeHeap;
 struct NativeSubmission;
 struct NativeRuntimeQueue;
+struct NativeFence;
 struct Context;
 struct Object;
 void native_heap_forget(Context *);
@@ -24,6 +25,7 @@ void native_runtime_queues_forget(Context *);
 HRESULT native_submission_reap(Context *);
 void native_heap_tables(D3D12DDI_DEVICE_FUNCS_CORE_0003 *);
 void native_graphics_tables(D3D12DDI_DEVICE_FUNCS_CORE_0003 *, D3D12DDI_COMMAND_LIST_FUNCS_3D_0003 *);
+void native_fence_tables(D3D12DDI_DEVICE_FUNCS_CORE_0003 *, D3D12DDI_COMMAND_QUEUE_FUNCS_CORE_0001 *);
 HRESULT native_graphics_pipeline(Context *, const D3D12DDIARG_CREATE_PIPELINE_STATE_0001 *);
 HRESULT native_command_create(Context *, const D3D12DDIARG_CREATE_COMMAND_LIST_0001 *);
 void native_command_destroy(Context *, Object *);
@@ -79,6 +81,7 @@ struct Context : NativeContextBuffers {
     Object *descriptor_heaps = nullptr;
     Object *native_queue_objects = nullptr;
     NativeRuntimeQueue *native_runtime_queues = nullptr;
+    NativeFence *native_fences = nullptr;
     Object *native_command_objects = nullptr;
     Object *indirect_signatures = nullptr; // protected by error_mutex
     Object *graphics_objects = nullptr;
@@ -754,8 +757,10 @@ extern "C" HRESULT APIENTRY VioGpuD3D12BridgeGetTables(D3D12DDI_DEVICE_FUNCS_COR
     commands->pfnSetDescriptorHeaps = set_heaps; commands->pfnSetComputeRootDescriptorTable = set_table;
     queue->pfnExecuteCommandLists = execute;
     native_graphics_tables(device, commands);
-    // Native heaps/import cover buffers and bounded non-RT/DS textures. OS monitored fences,
-    // residency, WDDM2 GPUVA, graphics and Present remain absent; no admission.
+    native_fence_tables(device, queue);
+    // Single-node fence metadata selects runtime external synchronization. It
+    // neither imports monitored-fence GPUVA nor admits a complete D3D12 device.
+    // Full graphics, residency, presentation and ordinary runtime proof remain.
     return S_OK;
 }
 

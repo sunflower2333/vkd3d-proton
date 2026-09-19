@@ -141,6 +141,7 @@ HRESULT native_load_vulkan(HMODULE *module, PFN_vkGetInstanceProcAddr *loader) {
 #include "native_samplers.inc"
 #include "native_textures.inc"
 #include "native_graphics.inc"
+#include "native_fences.inc"
 
 // error_mutex owns these lists. Compare opaque slots before dereferencing them.
 Object *native_submission_find(Object *head, void *slot) {
@@ -363,6 +364,7 @@ void APIENTRY native_destroy_device(D3D12DDI_HDEVICE handle) {
     // Runtime releases this storage immediately after return. Child objects may
     // keep Context alive, but must never call a retired runtime handle/callback.
     ctx->native_retiring = true;
+    native_fences_retire(ctx);
     native_heap_retire(ctx);
     ctx->runtime_device = {};
     ctx->runtime_callbacks = {};

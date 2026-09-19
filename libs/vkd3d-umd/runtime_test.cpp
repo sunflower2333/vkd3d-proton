@@ -52,6 +52,7 @@ static std::set<vkdu_object *> executing_objects;
 static std::vector<vkdu_object *> submitted_commands;
 static bool force_queue_unowned, queue_negative_active;
 static bool force_early_completion, completion_negative_active;
+static bool native_fence_ignore_owner, native_fence_drop_mask;
 static uint64_t generation = 7;
 static D3D12DDI_HRTDEVICE last_runtime{};
 static const HANDLE expected_adapter = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(0x13570));
@@ -196,6 +197,7 @@ static DWORD WINAPI test_event_wait(HANDLE event, DWORD timeout) {
 #define vkdu_dispatch_signature_create test_signature_create
 #define vkdu_command_execute_indirect test_execute_indirect
 #define WaitForSingleObject test_event_wait
+#define VKDU_TEST_NATIVE_FENCE_CONTROLS
 #include "ddi.cpp"
 #undef WaitForSingleObject
 
@@ -1550,6 +1552,7 @@ static int test_native_completion() {
 }
 
 #include "runtime_indirect_test.inc"
+#include "runtime_fences_test.inc"
 
 int main(int argc, char **argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -1559,6 +1562,8 @@ int main(int argc, char **argv) {
     else if (argc == 2 && !std::strcmp(argv[1], "--negative-control-queue-ownership")) force_queue_unowned = true;
     else if (argc == 2 && !std::strcmp(argv[1], "--negative-control-os-completion")) force_early_completion = true;
     else if (argc == 2 && !std::strcmp(argv[1], "--negative-control-indirect-count")) force_drop_indirect_count = true;
+    else if (argc == 2 && !std::strcmp(argv[1], "--negative-control-native-fence-owner")) native_fence_ignore_owner = true;
+    else if (argc == 2 && !std::strcmp(argv[1], "--negative-control-native-fence-mask")) native_fence_drop_mask = true;
     else if (argc != 1) return 2;
     REQUIRE(test_finalization_borrow() == 0);
     REQUIRE(OpenAdapter12(nullptr) == E_INVALIDARG);
@@ -1665,6 +1670,7 @@ int main(int argc, char **argv) {
     REQUIRE(test_native_queue_lifetime() == 0);
     REQUIRE(test_native_completion() == 0);
     REQUIRE(test_native_indirect() == 0);
+    REQUIRE(test_native_fences() == 0);
     std::printf("PASS native OpenAdapter12 WDK identity/negotiation/private memory/callback/lifetime/error cleanup (%zu-bit); no system-runtime or GPU acceptance\n", sizeof(void *) * 8);
     return 0;
 }

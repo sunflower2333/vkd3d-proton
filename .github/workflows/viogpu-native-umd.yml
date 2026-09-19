@@ -16,7 +16,7 @@ jobs:
       - name: Execute production logical queue routing and software enqueue ordering
         run: |
           python3 libs/vkd3d-umd/queue_worker_test.py
-          for control in drop-route shared-token skip-drain; do
+          for control in drop-route shared-token skip-drain skip-execute-drain; do
             python3 libs/vkd3d-umd/queue_worker_test.py --negative-control "$control"
           done
       - run: sudo apt-get update && sudo apt-get install -y meson ninja-build wine64-tools libwine-dev glslang-tools mesa-vulkan-drivers

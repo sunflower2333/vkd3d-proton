@@ -41,8 +41,9 @@ int main(int argc, char **argv) {
     REQUIRE(device.value.pfnCheckResourceAllocationInfo);
     REQUIRE(device.value.pfnCalcPrivateHeapAndResourceSizes && device.value.pfnCreateHeapAndResource &&
             device.value.pfnDestroyHeapAndResource && device.value.pfnMapHeap && device.value.pfnUnmapHeap);
-    REQUIRE(!device.value.pfnCreateFence && !device.value.pfnMakeResident);
-    REQUIRE(!queue.value.pfnSignalFence && !queue.value.pfnWaitForFence);
+    REQUIRE(device.value.pfnCalcPrivateFenceSize && device.value.pfnCreateFence && device.value.pfnDestroyFence);
+    REQUIRE(!device.value.pfnMakeResident);
+    REQUIRE(queue.value.pfnSignalFence && queue.value.pfnWaitForFence);
     REQUIRE(device.value.pfnCreateVertexShader && device.value.pfnCreatePixelShader && device.value.pfnCreateRenderTargetView);
     REQUIRE(device.value.pfnCreateBlendState && device.value.pfnCreateRasterizerState && device.value.pfnCreateDepthStencilState);
     REQUIRE(commands.value.pfnDrawInstanced && commands.value.pfnDrawIndexedInstanced && commands.value.pfnIaSetTopology &&

@@ -8,7 +8,7 @@ import tempfile
 
 
 def definition(source, name):
-    match = re.search(r'^(?:static )?(?:VkResult|void|HRESULT) ' + name + r'\([^;]*?\)\s*\{', source, re.M)
+    match = re.search(r'^(?:static )?(?:VkResult|void|HRESULT|int32_t) ' + name + r'\([^;]*?\)\s*\{', source, re.M)
     if not match:
         raise ValueError(name)
     depth = 0
@@ -20,7 +20,7 @@ def definition(source, name):
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--negative-control', choices=['drop-route', 'shared-token', 'skip-drain'])
+parser.add_argument('--negative-control', choices=['drop-route', 'shared-token', 'skip-drain', 'skip-execute-drain'])
 args = parser.parse_args()
 here = Path(__file__).resolve().parent
 root = here.parents[1]
@@ -29,6 +29,7 @@ names = ['d3d12_command_queue_submit_wddm', 'd3d12_command_queue_submit_split_lo
          'd3d12_command_queue_acquire_serialized', 'd3d12_command_queue_release_serialized',
          'vkd3d_wddm_queue_drain_enqueue']
 functions = '\n'.join(definition(source, name) for name in names)
+functions += '\n' + definition((here / 'backend.c').read_text(), 'vkdu_queue_execute')
 if args.negative_control == 'drop-route':
     functions = functions.replace('copies[i].pNext = &routes[i];', '/* lost metadata */')
 elif args.negative_control == 'shared-token':
@@ -39,6 +40,11 @@ elif args.negative_control == 'skip-drain':
                                   '    d3d12_command_queue_release_serialized(queue);',
                                   'if (0) { d3d12_command_queue_acquire_serialized(queue);\n'
                                   '    d3d12_command_queue_release_serialized(queue); }')
+elif args.negative_control == 'skip-execute-drain':
+    original = 'if (FAILED(hr = vkdu_queue_drain_enqueue(queue))) return hr;'
+    if functions.count(original) != 1:
+        raise ValueError('production Execute drain anchor changed')
+    functions = functions.replace(original, 'if (0 && FAILED(hr = vkdu_queue_drain_enqueue(queue))) return hr;')
 fixture = (here / 'queue_worker_test.c').read_text().replace('// PRODUCTION_FUNCTIONS', functions)
 with tempfile.TemporaryDirectory(prefix='vkd3d-queue-worker-') as output:
     output = Path(output)
