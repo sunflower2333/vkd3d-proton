@@ -1,10 +1,11 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "../../tests/shaders/render_target/headers/vs_flat_color.h"
 #include "../../tests/shaders/render_target/headers/ps_flat_color.h"
-const UINT *probe_graphics_tokens(const DWORD *code) {
+std::vector<UINT> probe_graphics_tokens(const DWORD *code) {
     for (UINT i = 0; i < code[7]; ++i) {
         const DWORD *chunk = code + code[8 + i] / 4;
-        if (chunk[0] == 0x58454853 || chunk[0] == 0x52444853) return chunk + 2;
+        if (chunk[0] == 0x58454853 || chunk[0] == 0x52444853)
+            return std::vector<UINT>(chunk + 2, chunk + 2 + chunk[1] / sizeof(DWORD));
     }
     throw ProbeFailure("graphics test shader has no tokens");
 }
@@ -36,10 +37,12 @@ void check_shared_graphics(NativeSession &native, ProbeRuntime &runtime) {
     D3D12DDIARG_STAGE_IO_SIGNATURES io{};
     io.NumInputSignatureEntries = io.NumOutputSignatureEntries = 1;
     io.pInputSignatureDeprecated = &input; io.pOutputSignatureDeprecated = &output;
-    native.table.pfnCreateVertexShader(h, probe_graphics_tokens(vs_flat_color_code_dxbc), {&root.slot}, {&vs.slot},
+    const auto vertex_tokens = probe_graphics_tokens(vs_flat_color_code_dxbc);
+    const auto pixel_tokens = probe_graphics_tokens(ps_flat_color_code_dxbc);
+    native.table.pfnCreateVertexShader(h, vertex_tokens.data(), {&root.slot}, {&vs.slot},
         &io, static_cast<D3D12DDI_CREATE_SHADER_FLAGS>(0));
     io.NumInputSignatureEntries = 0; output.SystemValue = static_cast<D3D10_SB_NAME>(0);
-    native.table.pfnCreatePixelShader(h, probe_graphics_tokens(ps_flat_color_code_dxbc), {&root.slot}, {&ps.slot},
+    native.table.pfnCreatePixelShader(h, pixel_tokens.data(), {&root.slot}, {&ps.slot},
         &io, static_cast<D3D12DDI_CREATE_SHADER_FLAGS>(0));
     check(VioGpuD3D12BridgeStatus(h), "native token-stream VS and PS");
     D3D12DDI_BLEND_DESC bs{}; bs.RenderTarget[0].RenderTargetWriteMask = 15;

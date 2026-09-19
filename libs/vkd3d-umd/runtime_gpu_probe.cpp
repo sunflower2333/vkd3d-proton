@@ -10,6 +10,7 @@
 #include <condition_variable>
 #include <thread>
 #include <map>
+#include <vector>
 #include <stdexcept>
 #include "ddi.cpp"
 
