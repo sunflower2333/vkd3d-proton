@@ -131,6 +131,11 @@ jobs:
       - name: Validate ordinary D3D12 app harness on explicit CPU WARP only
         shell: pwsh
         run: ./tools/test-system-d3d12-probe.ps1 -Executable candidate/package/vkd3d-system-d3d12-probe.exe
+      - name: Validate OS fence request configuration on ARM64 without device access
+        shell: pwsh
+        run: |
+          & candidate/package/vkd3d-umd-shared-gpu-probe.exe --validate-os-fence-controls
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - uses: actions/upload-artifact@v4
         if: always()
         with:

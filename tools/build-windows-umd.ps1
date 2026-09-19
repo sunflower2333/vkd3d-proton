@@ -38,6 +38,8 @@ if ($Architecture -ne 'arm64') {
     if ($LASTEXITCODE -ne 2) { throw 'GPU probe must require explicit adapter identity before loading Vulkan' }
     & (Join-Path $buildDir 'libs\vkd3d-umd\vkd3d-umd-shared-gpu-probe.exe')
     if ($LASTEXITCODE -ne 2) { throw 'Shared backing probe must require explicit LUID and execution switch' }
+    & (Join-Path $buildDir 'libs\vkd3d-umd\vkd3d-umd-shared-gpu-probe.exe') --validate-os-fence-controls
+    if ($LASTEXITCODE) { throw 'OS fence request construction violates documented flags/affinity contract' }
     & (Join-Path $buildDir 'libs\vkd3d-umd\vkd3d-system-d3d12-probe.exe')
     if ($LASTEXITCODE -ne 2) { throw 'System D3D12 probe must require explicit mode before loading graphics DLLs' }
     ./tools/test-system-d3d12-probe.ps1 -Executable (Join-Path $buildDir 'libs\vkd3d-umd\vkd3d-system-d3d12-probe.exe')

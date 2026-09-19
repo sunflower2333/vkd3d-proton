@@ -4,6 +4,11 @@ Status: interface proposal, not an implemented native fence provider. No KMD,
 Mesa, parent-tree or runtime-v1 ABI file is changed by this checkpoint. Ordinary
 D3D12 admission remains closed.
 
+The first target probe configuration had an invalid sharing flag pair. Its
+`STATUS_INVALID_PARAMETER` result is **not evidence** that monitored fences are
+unavailable. See the correction and control matrix below; GPUVA source gaps
+listed here are independently observed source facts.
+
 ## Exact source baseline
 
 Installed driver 58552 source, as identified by the main thread:
@@ -194,3 +199,59 @@ x64 `105900630554`, ARM64 runtime `105901454077`.
 Archive identities are from the GitHub API; this worker downloaded nothing.
 Root can stage only this executable for the OS mapping mode; replacing
 `viogpud3d12.dll`, installing a matched ICD or modifying 58552 is unnecessary.
+
+## Target result, probe correction and bounded controls
+
+Main-thread evidence for `candidate58552-os-fence-20260919a`: unchanged 58552,
+probe SHA256 `76a5161ebe51b2548a984b283ad6a80dcb97d22b890b76421d198296b9e40105`,
+LUID `00000000:01a9f9e3`, reset generation 2. Monitored-fence creation returned
+`c000000d`, object/CPU/GPUVA all zero; process exit 1 after 349 ms. The main thread
+reported retained DWM/Explorer and no new application faults. This worker did
+not run remote commands.
+
+The probe incorrectly set `NtSecuritySharing=1, Shared=0`. Microsoft's local
+`d3dukmdt/ns-d3dukmdt-_d3dddi_synchronizationobject_flags.md` explicitly says:
+"If NtSecuritySharing is set to 1, Shared must be set to 1."
+The same document specifies both bits zero for a nonshared object. The probe
+now constructs the correct pair and checks it before a positive OS call.
+
+The new `--run-os-fence-controls` mode uses the **same real KMT device** for
+seven bounded creation attempts; successful monitored objects also run the
+existing OS CPU mapping/event/signal/rewind test and are destroyed immediately.
+
+| Case | Shared / NT | EngineAffinity | NoGPUAccess | Purpose |
+| --- | --- | --- | --- | --- |
+| Legacy D3DDDI_FENCE | 0 / 0 | Not applicable | 0 | Check ordinary sync-object creation on this device |
+| Corrected monitored fence | 1 / 1 | 1 | 0 | Repeat initial request with the invalid pair fixed |
+| All-adapter monitored fence | 1 / 1 | 0 | 0 | Isolate affinity selection |
+| Private monitored fence | 0 / 0 | 1 | 0 | Isolate sharing policy |
+| Private all-adapter fence | 0 / 0 | 0 | 0 | Combine documented private/default-affinity form |
+| Packet/CPU-only monitored fence | 1 / 1 | 0 | 1 | Check monitored-fence support without GPU mapping |
+| Explicit historical negative | 0 / 1 | 1 | 0 | Record OS rejection of the original invalid flag pair |
+
+EngineAffinity 0 means all physical adapters; 1 selects physical adapter 0.
+NoGPUAccess explicitly prevents a GPUVA mapping and keeps a 64-bit CPU fence;
+zero GPUVA is expected and accepted for that control. It proves no GPU import.
+The real device creation result/handle and zero device flags are printed.
+LegacyMode is left unchanged: its documented meaning is legacy DirectDraw/D3D9
+residency/primary behavior, not selection of physical or virtual GPU mode.
+
+Interpret actual case results before drawing a capability conclusion. If the
+corrected shared request passes while the historical negative fails, the old
+failure is explained by flags. If only affinity 0 passes, investigate adapter
+affinity. If CPU-only passes while all four tested GPU-mapped variants fail,
+monitored CPU/packet support is demonstrated and the GPU mapping path remains
+unresolved. If the legacy object also fails, first investigate the device/OS
+sync-object path. Failure of these tested combinations is not proof that every
+possible monitored-fence configuration is unsupported.
+
+The matrix prints every creation status and a final category count. It exits
+nonzero if the same-device legacy control fails, no tested GPU-mapped variant
+succeeds, or an actual mapping/event contract fails. Thus CPU-only success is
+recorded without counting it as GPU mapping success.
+
+`--validate-os-fence-controls` constructs all requests without opening any
+device. CI executes it on x86/x64/ARM64, verifies documented flag combinations,
+input/output initialization and detects the original missing Shared-bit defect.
+This validation is a request-construction regression test, not OS acceptance.
+Corrected real-device runs remain pending.
