@@ -26,6 +26,7 @@ HRESULT native_submission_reap(Context *);
 void native_heap_tables(D3D12DDI_DEVICE_FUNCS_CORE_0003 *);
 void native_graphics_tables(D3D12DDI_DEVICE_FUNCS_CORE_0003 *, D3D12DDI_COMMAND_LIST_FUNCS_3D_0003 *);
 void native_fence_tables(D3D12DDI_DEVICE_FUNCS_CORE_0003 *, D3D12DDI_COMMAND_QUEUE_FUNCS_CORE_0001 *);
+void native_residency_tables(D3D12DDI_DEVICE_FUNCS_CORE_0003 *);
 HRESULT native_graphics_pipeline(Context *, const D3D12DDIARG_CREATE_PIPELINE_STATE_0001 *);
 HRESULT native_command_create(Context *, const D3D12DDIARG_CREATE_COMMAND_LIST_0001 *);
 void native_command_destroy(Context *, Object *);
@@ -758,6 +759,7 @@ extern "C" HRESULT APIENTRY VioGpuD3D12BridgeGetTables(D3D12DDI_DEVICE_FUNCS_COR
     queue->pfnExecuteCommandLists = execute;
     native_graphics_tables(device, commands);
     native_fence_tables(device, queue);
+    native_residency_tables(device);
     // Single-node fence metadata selects runtime external synchronization. It
     // neither imports monitored-fence GPUVA nor admits a complete D3D12 device.
     // Full graphics, residency, presentation and ordinary runtime proof remain.

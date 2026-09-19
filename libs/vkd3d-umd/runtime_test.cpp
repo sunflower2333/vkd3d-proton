@@ -198,6 +198,7 @@ static DWORD WINAPI test_event_wait(HANDLE event, DWORD timeout) {
 #define vkdu_command_execute_indirect test_execute_indirect
 #define WaitForSingleObject test_event_wait
 #define VKDU_TEST_NATIVE_FENCE_CONTROLS
+#define VKDU_TEST_NATIVE_RESIDENCY_CONTROLS
 #include "ddi.cpp"
 #undef WaitForSingleObject
 
@@ -424,6 +425,7 @@ static std::set<HANDLE> kernel_resources;
 static D3DKMT_HANDLE next_allocation = 101;
 static unsigned heap_context_creates, heap_context_destroys, allocations, deallocations, locks, unlocks;
 static unsigned fail_deallocate, fail_unlock;
+static std::function<void()> nested_deallocate;
 static unsigned fail_context_destroy;
 static bool fail_context_create, invalid_context_info, retire_lock;
 static bool fail_allocate, partial_allocate, partial_resource, null_map, reset_allocate, retire_allocate, rename_lock;
@@ -567,6 +569,7 @@ static HRESULT APIENTRY heap_deallocate(HANDLE runtime, const D3DDDICB_DEALLOCAT
         if (found == kernel_heaps.end() || found->second.locked || found->second.resource) fixture_abort(__LINE__);
         kernel_heaps.erase(found);
     }
+    if (nested_deallocate) nested_deallocate();
     return S_OK;
 }
 static HRESULT APIENTRY heap_lock(HANDLE runtime, D3DDDICB_LOCK *args) {
@@ -1553,6 +1556,7 @@ static int test_native_completion() {
 
 #include "runtime_indirect_test.inc"
 #include "runtime_fences_test.inc"
+#include "runtime_residency_test.inc"
 
 int main(int argc, char **argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -1564,6 +1568,8 @@ int main(int argc, char **argv) {
     else if (argc == 2 && !std::strcmp(argv[1], "--negative-control-indirect-count")) force_drop_indirect_count = true;
     else if (argc == 2 && !std::strcmp(argv[1], "--negative-control-native-fence-owner")) native_fence_ignore_owner = true;
     else if (argc == 2 && !std::strcmp(argv[1], "--negative-control-native-fence-mask")) native_fence_drop_mask = true;
+    else if (argc == 2 && !std::strcmp(argv[1], "--negative-control-native-residency-pending")) native_residency_drop_pending = true;
+    else if (argc == 2 && !std::strcmp(argv[1], "--negative-control-native-residency-evict")) native_residency_skip_evict = true;
     else if (argc != 1) return 2;
     REQUIRE(test_finalization_borrow() == 0);
     REQUIRE(OpenAdapter12(nullptr) == E_INVALIDARG);
@@ -1671,6 +1677,7 @@ int main(int argc, char **argv) {
     REQUIRE(test_native_completion() == 0);
     REQUIRE(test_native_indirect() == 0);
     REQUIRE(test_native_fences() == 0);
+    REQUIRE(test_native_residency() == 0);
     std::printf("PASS native OpenAdapter12 WDK identity/negotiation/private memory/callback/lifetime/error cleanup (%zu-bit); no system-runtime or GPU acceptance\n", sizeof(void *) * 8);
     return 0;
 }

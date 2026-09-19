@@ -2,7 +2,7 @@ param([Parameter(Mandatory)][string]$Executable)
 $ErrorActionPreference = 'Stop'
 $exe = (Resolve-Path -LiteralPath $Executable).Path
 $directory = Split-Path -Parent $exe
-foreach ($scenario in @('lifecycle', 'deferred-negative', 'command-owner-negative', 'uav-global-negative', 'queue-owner-negative', 'completion-negative', 'indirect-count-negative', 'fence-owner-negative', 'fence-mask-negative')) {
+foreach ($scenario in @('lifecycle', 'deferred-negative', 'command-owner-negative', 'uav-global-negative', 'queue-owner-negative', 'completion-negative', 'indirect-count-negative', 'fence-owner-negative', 'fence-mask-negative', 'residency-pending-negative', 'residency-evict-negative')) {
     $negative = $scenario -ne 'lifecycle'
     $name = 'runtime-' + $scenario
     $stdout = Join-Path $directory ($name + '.stdout.txt')
@@ -16,6 +16,8 @@ foreach ($scenario in @('lifecycle', 'deferred-negative', 'command-owner-negativ
     if ($scenario -eq 'indirect-count-negative') { $start.ArgumentList = '--negative-control-indirect-count' }
     if ($scenario -eq 'fence-owner-negative') { $start.ArgumentList = '--negative-control-native-fence-owner' }
     if ($scenario -eq 'fence-mask-negative') { $start.ArgumentList = '--negative-control-native-fence-mask' }
+    if ($scenario -eq 'residency-pending-negative') { $start.ArgumentList = '--negative-control-native-residency-pending' }
+    if ($scenario -eq 'residency-evict-negative') { $start.ArgumentList = '--negative-control-native-residency-evict' }
     $process = Start-Process @start
     $null = $process.Handle
     if (!$process.WaitForExit(90000)) {
@@ -39,6 +41,10 @@ foreach ($scenario in @('lifecycle', 'deferred-negative', 'command-owner-negativ
             'FAIL native fence accepted foreign or stale runtime ownership'
         } elseif ($scenario -eq 'fence-mask-negative') {
             'FAIL native fence omitted single-node runtime broadcast mask'
+        } elseif ($scenario -eq 'residency-pending-negative') {
+            'FAIL native residency lost accepted pending paging fence'
+        } elseif ($scenario -eq 'residency-evict-negative') {
+            'FAIL native residency omitted runtime eviction'
         } else { 'FAIL native command error escaped its runtime command-list owner' }
         if ($process.ExitCode -ne 1 -or $errors -notmatch $expected) {
             throw "$scenario negative control did not fail semantically: exit=$($process.ExitCode) $errors"
@@ -56,6 +62,7 @@ foreach ($scenario in @('lifecycle', 'deferred-negative', 'command-owner-negativ
                 $output -notmatch 'PASS native OS completion events, ordered DMA ownership, bounded pending retirement and callback cancellation' -or
                 $output -notmatch 'PASS native indirect signatures, GPU argument/count forwarding, rejected handles and reentrant ownership' -or
                 $output -notmatch 'PASS native single-node fence copies, runtime broadcast selection, foreign/stale rejection and reentrant callback retirement' -or
+                $output -notmatch 'PASS native heap residency identity, pending paging fences, atomic validation, callback retirement and cleanup retention' -or
                 $output -notmatch 'PASS native command-list runtime error ownership, device-loss forwarding, rejected creation and reentrant retirement') {
             throw "Runtime lifecycle fixture failed: exit=$($process.ExitCode) $errors"
         }

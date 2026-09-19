@@ -134,6 +134,7 @@ int32_t MWD_CALL native_runtime_unmap(void *owner, void *token) {
     NativeHeapOperation op(static_cast<Context *>(owner), true);
     auto *heap = native_token(op.ctx, token);
     if (!heap || heap->pending) return E_INVALIDARG;
+    if (heap->residency_operations) return DXGI_ERROR_WAS_STILL_DRAWING;
     if (!op.live()) return S_OK; // Kernel lock is retired with the device.
     if (!heap->map_count) return E_INVALIDARG;
     if (heap->map_count > 1) { --heap->map_count; return S_OK; }
@@ -197,6 +198,7 @@ int32_t native_runtime_submit_on_queue(void *owner, void *queue_token, uint32_t 
             !buffers->native_patch_list) return E_INVALIDARG;
     for (uint32_t i = 0; i < count; ++i) {
         auto *heap = native_token(ctx, refs[i].token);
+        if (heap && heap->residency_operations) return DXGI_ERROR_WAS_STILL_DRAWING;
         if (!heap || heap->pending || !heap->allocation || heap->users == UINT32_MAX ||
                 !refs[i].flags || (refs[i].flags & ~3u) ||
                 ((heap->flags & 8u) && (refs[i].flags & 2u)) || refs[i].offset > UINT32_MAX ||

@@ -42,6 +42,7 @@ struct NativeHeap {
     uint32_t map_count = 0;
     uint32_t users = 1, flags = 4;
     uint32_t submitted = 0;
+    uint32_t residency_operations = 0;
     uint64_t alignment = native_heap_alignment;
     bool cpu_visible = false, locked = false, pending = false, resource_created = false;
 };
@@ -164,7 +165,7 @@ HRESULT native_heap_unlock(Context *ctx, NativeHeap *heap) {
 }
 
 HRESULT native_heap_cleanup(Context *ctx, NativeHeap *heap, bool retirement = false) {
-    if (heap->pending) return DXGI_ERROR_WAS_STILL_DRAWING;
+    if (heap->pending || heap->residency_operations) return DXGI_ERROR_WAS_STILL_DRAWING;
     heap->pending = true;
     HRESULT hr = native_heap_unlock(ctx, heap);
     // During normal operation DestroyDevice may have run inside UnlockCb.
@@ -434,6 +435,7 @@ HRESULT native_heap_map_record(Context *value, NativeHeap *heap, void **out) {
     if (!op.live()) return DXGI_ERROR_DEVICE_REMOVED;
     auto *ctx = op.ctx;
     if (!heap || !(heap->flags & 2) || heap->pending || !heap->allocation) return E_INVALIDARG;
+    if (heap->residency_operations) return DXGI_ERROR_WAS_STILL_DRAWING;
     // A new LockCb can rename its allocation handle. Preserve the handle used
     // by every outstanding DMA packet until its OS completion event retires.
     if (heap->submitted && !heap->locked) return DXGI_ERROR_WAS_STILL_DRAWING;
@@ -474,6 +476,7 @@ void APIENTRY native_heap_unmap(D3D12DDI_HDEVICE h, D3D12DDI_HHEAP slot) {
     if (!op.live()) return;
     auto *heap = native_heap_find(op.ctx, slot.pDrvPrivate);
     if (!heap || heap->pending || !heap->map_count) { error(op.ctx, E_INVALIDARG); return; }
+    if (heap->residency_operations) { error(op.ctx, DXGI_ERROR_WAS_STILL_DRAWING); return; }
     if (heap->map_count > 1) { --heap->map_count; return; }
     heap->pending = true;
     HRESULT hr = native_heap_unlock(op.ctx, heap);
@@ -520,7 +523,7 @@ void native_heap_retire(Context *ctx) {
     if (ctx->native_backend_calls || ctx->native_submissions) return;
     bool pending = ctx->native_context_pending || ctx->native_submitting;
     for (auto *heap = ctx->native_heaps; heap; heap = heap->next) {
-        if (heap->pending || ctx->native_submitting) { pending = true; continue; }
+        if (heap->pending || heap->residency_operations || ctx->native_submitting) { pending = true; continue; }
         HRESULT hr = native_heap_cleanup(ctx, heap, true);
         if (FAILED(hr)) ctx->last_error = hr;
         pending |= heap->allocation != 0 || heap->resource_created;
