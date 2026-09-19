@@ -4,7 +4,7 @@ Root authorized full GPU-backed descriptor/query residency development after
 the bounded native-heap checkpoint40f7da3. Work is isolated from58557 and the
 runtime-v2 provider709ac5ef. Mesa branch work/d3d12-pageable-provider-20260920
 is based on709ac5ef in a separate workspace worktree. Source implementation is
-complete; consumer Windows validation is pending. No device or ordinary native
+complete; paired consumer Windows CI passes. No device or ordinary native
 D3D12 admission result is claimed.
 
 The existing runtime ABI2 and KMD wire ABI0 remain unchanged. A separate
@@ -43,7 +43,7 @@ returned unchanged. Query heap creation supports occlusion, timestamp, pipeline
 statistics and stream-output statistics, with generation checks before and
 after backend construction. BeginQuery/EndQuery/ResolveQuery remain absent.
 
-Validation so far:
+Validation:
 - Mesa `ecfb2b2e66edfd2577ad2de672d18f2aca89fda7`, CI35457230230:
   all three jobs pass, including real ARM64 Turnip SDK/WDK compile and DLL link,
   production provider sanitizer tests and three semantic negative controls.
@@ -58,7 +58,18 @@ Validation so far:
   tokens, shared backing, E_PENDING, real Evict dispatch/rejection, stale and
   foreign ownership, poisoned caller arrays, unmapped request storage during
   device retirement, and query constructor reset/cancellation. Their Windows
-  ARM64/x64/x86 execution remains pending until the paired consumer CI passes.
+  ARM64/x64/x86 execution passed in CI35458531649.
+- Consumer implementation `8014d7e022e3316290ac5e76791fa30c272ff244`, fixture
+  correction `479a3f9dc44cad955c69e686c671af3341a5ff79`, CI35458531649:
+  all five jobs PASS, including actual ARM64 runtime job105938905489 and the
+  existing ten semantic negative controls on ARM64/x64/x86. Initial8014d7e
+  compiled but its retirement mock freed one request twice under recursive
+  deallocation;479a3f9 models that runtime lifetime transition once while
+  preserving nested callback validation.
+  ARM64 artifact10588916722,13240448 bytes, archive SHA256
+  `058ecdbf063a7e604b7a6908710e0c71e418a058b740ccaf18926b0cc098314f`.
+  x64 artifact10589511257; x86 artifact10589376415;
+  ARM64 validation artifact10589501329.
 
 These two source revisions are isolated follow-ons, not substitutes for the
 root's target-tested graphicsa823c15 or58557 deployment candidate. Runtime-v2
