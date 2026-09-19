@@ -5,6 +5,10 @@ static D3D12DDI_VIEWPORT *graphics_view_input;
 static D3D12DDI_RECT *graphics_rect_input;
 static float *graphics_color_input;
 static bool graphics_locks_free;
+static HANDLE graphics_runtime_seen;
+static void APIENTRY graphics_command_error(D3D12DDI_HRTCOMMANDLIST runtime, HRESULT result) {
+    graphics_runtime_seen = runtime.handle; reported = result;
+}
 static void graphics_poison() {
     auto *ctx = graphics_context;
     graphics_locks_free = TryAcquireSRWLockExclusive(&ctx->resources_lock) != 0;
@@ -29,7 +33,8 @@ static int check_native_graphics() {
     Object root{}, vs{}, ps{}, wrong{}, blend{}, raster{}, depth{}, pipeline{}, command{}, texture{}, heap{}, buffer{};
     REQUIRE(bind(&ctx, &root, make_peer(ctx.backend, VKDU_ROOT), VKDU_ROOT) == S_OK);
     // Token validation and signature copying use the production DXBC builder.
-    UINT vertex[] = {0x10050, 3, 0x0100003e}, pixel[] = {0x50, 3, 0x0100003e};
+    UINT vertex[] = {0x10050, 11, 0x04000060, 0x00101012, 0, 6, 0x04000067, 0x001020f2, 0, 1, 0x0100003e};
+    UINT pixel[] = {0x50, 6, 0x03000065, 0x001020f2, 0, 0x0100003e};
     D3D12DDIARG_SIGNATURE_ENTRY input{}; input.SystemValue = static_cast<D3D10_SB_NAME>(6);
     input.Mask = 1; input.RegisterComponentType = static_cast<D3D10_SB_REGISTER_COMPONENT_TYPE>(1);
     D3D12DDIARG_SIGNATURE_ENTRY output{}; output.SystemValue = static_cast<D3D10_SB_NAME>(1);
@@ -119,9 +124,12 @@ static int check_native_graphics() {
     REQUIRE(graphics_locks_free && graphics_rect.left == 1 && graphics_rect.bottom == 8 && graphics_color[2] == 0.75f);
     graphics_rect_input = nullptr; graphics_color_input = nullptr;
     // Callback error reporting must not touch a destroyed runtime command slot.
+    command.runtime_command.handle = reinterpret_cast<HANDLE>(0x1357);
+    ctx.runtime_device.handle = &ctx; ctx.runtime_callbacks.pfnSetCommandListErrorCb = graphics_command_error;
     graphics_slots[0] = &command; next_result = E_INVALIDARG; reported = S_OK;
     commands.pfnDrawIndexedInstanced({&command}, 3, 1, 0, -7, 0);
-    REQUIRE(graphics_locks_free && reported == E_INVALIDARG && draw_base == -7);
+    REQUIRE(graphics_locks_free && reported == E_INVALIDARG && draw_base == -7 &&
+            graphics_runtime_seen == reinterpret_cast<HANDLE>(0x1357));
     graphics_hook = nullptr; graphics_slots[0] = nullptr; next_result = S_OK;
     VioGpuD3D12BridgeUnbindObject(&texture); VioGpuD3D12BridgeUnbindObject(&heap); VioGpuD3D12BridgeUnbindObject(&buffer);
     REQUIRE(ctx.references == 1 && foreign.references == 1 && !ctx.resources && !ctx.descriptor_heaps);

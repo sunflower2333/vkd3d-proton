@@ -97,7 +97,8 @@ static int test_native_textures(Context *ctx, D3D12DDI_HDEVICE device,
         test_object_destroy(alias);
         REQUIRE(!ctx->native_heaps && kernel_heaps.empty());
     }
-    puts("PASS native sampled/RT texture heap allocation/import, request poisoning, exact backing branch, alias lifetime and failure cleanup");
+    puts("PASS native texture heap allocation/import, request poisoning, format ownership, alias lifetime and failure cleanup");
+    puts("PASS native RT shared allocation/import/placement and retained alias backing");
     puts("PASS native allocation-info query, backend requirements, no allocation, rejected-output preservation and retirement");
     return 0;
 }

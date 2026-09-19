@@ -710,6 +710,7 @@ extern "C" void APIENTRY VioGpuD3D12BridgeUnbindObject(void *memory) {
         ReleaseSRWLockExclusive(&ctx->resources_lock);
     }
     if (value->native_graphics_tag) {
+        std::lock_guard<NativeCallbackMutex> lock(ctx->error_mutex);
         auto **link = &ctx->graphics_objects;
         while (*link && *link != value) link = &(*link)->next;
         if (*link) *link = value->next;

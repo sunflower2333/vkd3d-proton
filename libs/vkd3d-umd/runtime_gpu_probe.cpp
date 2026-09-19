@@ -509,6 +509,7 @@ void run_probe(LUID luid, bool runtime_queues = false) {
     std::puts("BOUNDARY emulated runtime callbacks + real KMT/GPU; NOT Microsoft D3D12CreateDevice acceptance");
 }
 #include "runtime_textures_probe.inc"
+#include "runtime_graphics_probe.inc"
 #include "os_fence_probe.inc"
 
 bool hex32(const char *text, uint32_t &value) {
@@ -528,10 +529,10 @@ int main(int argc, char **argv) {
     uint32_t low = 0, high = 0;
     if (argc != 6 || std::strcmp(argv[1], "--luid-low") || std::strcmp(argv[3], "--luid-high") ||
             (std::strcmp(argv[5], "--run-shared-backing") && std::strcmp(argv[5], "--run-shared-textures") &&
-             std::strcmp(argv[5], "--run-runtime-queues") &&
+             std::strcmp(argv[5], "--run-runtime-queues") && std::strcmp(argv[5], "--run-shared-graphics") &&
              std::strcmp(argv[5], "--run-os-fence-mapping") && std::strcmp(argv[5], "--run-os-fence-controls")) ||
             !hex32(argv[2], low) || !hex32(argv[4], high) || !(low | high)) {
-        std::fputs("usage: vkd3d-umd-shared-gpu-probe --luid-low HEX --luid-high HEX --run-shared-backing|--run-shared-textures|--run-runtime-queues|--run-os-fence-mapping|--run-os-fence-controls\n"
+        std::fputs("usage: vkd3d-umd-shared-gpu-probe --luid-low HEX --luid-high HEX --run-shared-backing|--run-shared-textures|--run-shared-graphics|--run-runtime-queues|--run-os-fence-mapping|--run-os-fence-controls\n"
             "       --validate-os-fence-controls checks request construction only, with no KMT calls.\n"
             "Requires exact VIOGPU LUID; shared modes also need matching private-import Turnip. No native runtime admission.\n", stderr);
         return 2;
@@ -545,6 +546,7 @@ int main(int argc, char **argv) {
         const LUID luid{low, static_cast<LONG>(high)};
         if (os_fence) run_os_fence_probe(luid, os_fence_controls);
         else if (!std::strcmp(argv[5], "--run-shared-textures")) run_texture_probe(luid);
+        else if (!std::strcmp(argv[5], "--run-shared-graphics")) run_graphics_probe(luid);
         else run_probe(luid, !std::strcmp(argv[5], "--run-runtime-queues"));
         return 0;
     }

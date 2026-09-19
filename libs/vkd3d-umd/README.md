@@ -9,8 +9,21 @@ and RGBA8 non-render-target images backed by the native runtime's allocation.
 It adds native texture SRVs and physical-pitched CopyTextureRegion, validates
 actual embedded image allocation requirements, and rejects separate committed
 or staging-memory fallbacks. It does not advertise native D3D12 admission,
-graphics, render-target/depth views, residency or Present. See
+depth views, residency or Present. See
 `docs/vkd3d-native-textures-20260919.md` for exact tests and limits.
+
+The bounded graphics continuation adds native SM5.0 vertex/pixel shaders,
+one RGBA8 render target, raster/blend/depth state handles, viewport/scissor,
+RTV clear/bind, and direct/indexed instanced triangle draws. Shader signatures
+are rebuilt from the native register contract and actual token declarations;
+unused entries in a runtime signature do not become required vertex attributes.
+Render targets use the same retained native allocation domain with no committed
+fallback. Depth, blending, input layouts, graphics descriptor bindings, MRT,
+multisampling and full feature-level/runtime acceptance remain unfinished.
+The controlled `--run-shared-graphics` probe requires runtime-v2 Mesa/KMD pairing
+and validates native DDI pixels, exact allocation references and runtime-context
+OS completion. It uses emulated runtime callbacks; it is not an ordinary
+`D3D12CreateDevice` test. See `docs/vkd3d-native-graphics-20260919.md`.
 
 The engine revision
 and every submodule are pinned by the driver parent repository.

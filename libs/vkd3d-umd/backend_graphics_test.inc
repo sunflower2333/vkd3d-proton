@@ -14,13 +14,24 @@ static void check_graphics(vkdu_device *device, vkdu_device *other)
 {
     vkdu_object *root = NULL, *pipeline = NULL, *target = NULL, *heap = NULL, *wrong_heap = NULL;
     vkdu_object *queue = NULL, *allocator = NULL, *command = NULL, *fence = NULL, *readback = NULL, *indices = NULL;
-    const struct vkdu_signature vertex_input = {6, 0, 1, 1}, vertex_output = {1, 0, 15, 3}, pixel_output = {0, 0, 15, 3};
+    /* Runtime signatures may be a superset of actual shader declarations. */
+    const struct vkdu_signature vertex_input[] = {{6, 0, 1, 1}, {0, 3, 15, 3}};
+    const struct vkdu_signature vertex_output[] = {{1, 0, 15, 3}, {0, 5, 15, 3}};
+    const struct vkdu_signature pixel_output = {0, 0, 15, 3};
     const uint32_t *vs_tokens = graphics_tokens(vs_flat_color_code_dxbc), *ps_tokens = graphics_tokens(ps_flat_color_code_dxbc);
     struct vkdu_graphics_desc desc = {DXGI_FORMAT_R8G8B8A8_UNORM, UINT32_MAX, 3, 1, 0, 1, 15};
     void *vs = NULL, *ps = NULL, *mapped; size_t vs_size = 0, ps_size = 0;
     uint32_t i, round;
-    CHECK(vkdu_shader_dxbc(1, vs_tokens, vs_tokens[1], &vertex_input, 1, &vertex_output, 1, &vs, &vs_size));
+    CHECK(vkdu_shader_dxbc(1, vs_tokens, vs_tokens[1], vertex_input, 2, vertex_output, 2, &vs, &vs_size));
     CHECK(vkdu_shader_dxbc(0, ps_tokens, ps_tokens[1], NULL, 0, &pixel_output, 1, &ps, &ps_size));
+    {
+        void *rejected = NULL; size_t rejected_size = 0;
+        struct vkdu_signature wrong = vertex_input[0]; wrong.system_value = 8;
+        REJECT(vkdu_shader_dxbc(1, vs_tokens, vs_tokens[1], &wrong, 1, vertex_output, 2, &rejected, &rejected_size));
+        REJECT(vkdu_shader_dxbc(1, vs_tokens, vs_tokens[1] - 1, vertex_input, 2, vertex_output, 2, &rejected, &rejected_size));
+        REJECT(vkdu_shader_dxbc(1, vs_tokens, vs_tokens[1], NULL, 0, vertex_output, 2, &rejected, &rejected_size));
+        if (rejected || rejected_size) { fprintf(stderr, "rejected shader published storage\n"); exit(1); }
+    }
     CHECK(vkdu_root_create(device, NULL, 0, 0, &root));
     CHECK(vkdu_graphics_pipeline_create(device, root, vs, vs_size, ps, ps_size, &desc, &pipeline));
     vkdu_shader_dxbc_free(vs); vkdu_shader_dxbc_free(ps);

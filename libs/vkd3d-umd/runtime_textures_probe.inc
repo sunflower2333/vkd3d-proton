@@ -23,18 +23,21 @@ struct ProbeTexture {
         if (heap.pDrvPrivate || resource.pDrvPrivate)
             native.table.pfnDestroyHeapAndResource(native.create.hDrvDevice, heap, resource);
     }
-    void create(DXGI_FORMAT format) {
+    void create(DXGI_FORMAT format, bool rt = false, UINT width = 4, UINT height = 4) {
         auto *ctx = context(native.create.hDrvDevice);
         uint64_t bytes = 0, alignment = 0;
-        check(vkdu_texture2d_allocation(ctx->backend, 4, 4, format, &bytes, &alignment), "actual image allocation requirements");
+        check(rt ? vkdu_render_target_allocation(ctx->backend, width, height, &bytes, &alignment) :
+            vkdu_texture2d_allocation(ctx->backend, width, height, format, &bytes, &alignment), "actual image allocation requirements");
         D3D12DDIARG_CREATEHEAP_0001 h{};
         h.ByteSize = bytes; h.Alignment = alignment; h.MemoryPool = D3D12DDI_MEMORY_POOL_L0;
         h.CPUPageProperty = D3D12DDI_CPU_PAGE_PROPERTY_NOT_AVAILABLE;
-        h.Flags = D3D12DDI_HEAP_FLAG_NON_RT_DS_TEXTURES; h.CreationNodeMask = h.VisibleNodeMask = 1;
+        h.Flags = rt ? D3D12DDI_HEAP_FLAG_RT_DS_TEXTURES : D3D12DDI_HEAP_FLAG_NON_RT_DS_TEXTURES;
+        h.CreationNodeMask = h.VisibleNodeMask = 1;
         D3D12DDIARG_CREATERESOURCE_0003 r{};
-        r.ResourceType = D3D12DDI_RT_TEXTURE2D; r.Width = r.Height = 4; r.Format = format;
+        r.ResourceType = D3D12DDI_RT_TEXTURE2D; r.Width = width; r.Height = height; r.Format = format;
         r.DepthOrArraySize = r.MipLevels = r.SampleDesc.Count = 1;
-        r.InitialResourceState = D3D12DDI_RESOURCE_STATE_COPY_DEST;
+        r.Flags = static_cast<D3D12DDI_RESOURCE_FLAGS_0003>(rt ? 1 : 0);
+        r.InitialResourceState = rt ? D3D12DDI_RESOURCE_STATE_RENDER_TARGET : D3D12DDI_RESOURCE_STATE_COPY_DEST;
         check(native.table.pfnCreateHeapAndResource(native.create.hDrvDevice, &h, {&heap_slot}, {}, &r,
                 nullptr, {&resource_slot}), "native paired texture/private import");
         heap = {&heap_slot}; resource = {&resource_slot};

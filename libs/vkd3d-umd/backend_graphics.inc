@@ -1,4 +1,57 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
+/* SM5.0 token encodings match dxbc-spirv/dxbc/dxbc_types.h. This scanner only
+ * selects declared VS/PS interface registers; the real compiler validates all
+ * executable instructions. Reject unsupported declaration encodings explicitly. */
+static HRESULT vkdu_graphics_declarations(const uint32_t *tokens, uint32_t words,
+        uint32_t masks[2][32], uint32_t systems[2][32])
+{
+    uint32_t pos = 2;
+    while (pos < words) {
+        const uint32_t opcode = tokens[pos] & 0x7ff;
+        uint32_t length = (tokens[pos] >> 24) & 0x7f;
+        if (opcode == 53) {
+            if (words - pos < 2) return E_INVALIDARG;
+            length = tokens[pos + 1];
+            if (length < 2) return E_INVALIDARG;
+        }
+        if (!length || length > words - pos) return E_INVALIDARG;
+        if (opcode >= 95 && opcode <= 103) {
+            const uint32_t output = opcode >= 101;
+            const uint32_t system = opcode != 95 && opcode != 98 && opcode != 101;
+            uint32_t operand, reg, mask, name;
+            if (length != 3 + system || (tokens[pos] & 0x80000000u)) return E_INVALIDARG;
+            operand = tokens[pos + 1]; reg = tokens[pos + 2]; name = system ? tokens[pos + 3] : 0;
+            /* One immediate register index, no operand extensions, mask mode. */
+            if ((operand & 0xffc00000u) || ((operand >> 20) & 3) != 1 ||
+                    ((operand >> 12) & 255) != (output ? 2u : 1u) || reg >= 32 ||
+                    ((operand & 3) != 1 && (operand & 3) != 2) || (operand & 12)) return E_INVALIDARG;
+            mask = (operand & 3) == 1 ? 1 : (operand >> 4) & 15;
+            if (!mask || (masks[output][reg] && systems[output][reg] != name)) return E_INVALIDARG;
+            masks[output][reg] |= mask; systems[output][reg] = name;
+        }
+        pos += length;
+    }
+    return S_OK;
+}
+static HRESULT vkdu_graphics_filter(const struct vkdu_signature *src, uint32_t count,
+        const uint32_t masks[32], const uint32_t systems[32], struct vkdu_signature *dst, uint32_t *out_count)
+{
+    uint32_t i, used[32] = {0}, seen[32] = {0};
+    *out_count = 0;
+    for (i = 0; i < count; ++i) {
+        struct vkdu_signature entry = src[i];
+        if (entry.reg >= 32 || !entry.mask || entry.mask > 15 || (seen[entry.reg] & entry.mask) ||
+                entry.component_type < 1 || entry.component_type > 3) return E_INVALIDARG;
+        seen[entry.reg] |= entry.mask;
+        entry.mask &= masks[entry.reg];
+        if (!entry.mask) continue;
+        if (entry.system_value != systems[entry.reg]) return E_INVALIDARG;
+        used[entry.reg] |= entry.mask;
+        dst[(*out_count)++] = entry;
+    }
+    for (i = 0; i < 32; ++i) if (used[i] != masks[i]) return E_INVALIDARG;
+    return S_OK;
+}
 static const char *vkdu_signature_name(uint32_t system, uint32_t stage, int output)
 {
     switch (system) {
@@ -39,13 +92,20 @@ int32_t vkdu_shader_dxbc(uint32_t stage, const uint32_t *tokens, uint32_t words,
         const struct vkdu_signature *outputs, uint32_t output_count, void **code, size_t *size)
 {
     uint32_t *container, offset, lengths[2], count;
+    uint32_t masks[2][32] = {{0}}, systems[2][32] = {{0}}, filtered_inputs, filtered_outputs;
+    struct vkdu_signature input_entries[32], output_entries[32];
     HRESULT hr;
     if (!code || !size) return E_POINTER;
     *code = NULL; *size = 0;
     if (stage > 1 || !tokens || words < 2 || words > 1024 * 1024 || tokens[1] != words ||
-            (tokens[0] >> 16) != stage || ((tokens[0] >> 4) & 15) != 5 ||
+            (tokens[0] >> 16) != stage || (tokens[0] & 255) != 0x50 ||
             input_count > 32 || output_count > 32 || (input_count && !inputs) || !output_count || !outputs)
         return E_INVALIDARG;
+    if (FAILED(hr = vkdu_graphics_declarations(tokens, words, masks, systems)) ||
+            FAILED(hr = vkdu_graphics_filter(inputs, input_count, masks[0], systems[0], input_entries, &filtered_inputs)) ||
+            FAILED(hr = vkdu_graphics_filter(outputs, output_count, masks[1], systems[1], output_entries, &filtered_outputs))) return hr;
+    if (!filtered_outputs) return E_INVALIDARG;
+    inputs = input_entries; outputs = output_entries; input_count = filtered_inputs; output_count = filtered_outputs;
     lengths[0] = 8 + input_count * 40; lengths[1] = 8 + output_count * 40;
     count = 11 + 2 + lengths[0] / 4 + 2 + lengths[1] / 4 + 2 + words;
     if (!(container = calloc(count, 4))) return E_OUTOFMEMORY;

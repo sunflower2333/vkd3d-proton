@@ -43,6 +43,7 @@ foreach ($scenario in @('lifecycle', 'deferred-negative', 'command-owner-negativ
         if ($process.ExitCode -ne 0 -or $errors -match 'FAIL' -or
                 $output -notmatch 'PASS ordinary backend completion/unmap/release before runtime retirement' -or
                 $output -notmatch 'PASS native texture heap allocation/import, request poisoning, format ownership, alias lifetime and failure cleanup' -or
+                $output -notmatch 'PASS native RT shared allocation/import/placement and retained alias backing' -or
                 $output -notmatch 'PASS native allocation-info query, backend requirements, no allocation, rejected-output preservation and retirement' -or
                 $output -notmatch 'PASS native UAV resource/global barriers, whole-batch rejection and command error ownership' -or
                 $output -notmatch 'PASS native queue identity, whole-batch ownership, reentrant execution retirement and constructor cancellation' -or
