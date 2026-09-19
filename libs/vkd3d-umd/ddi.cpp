@@ -80,6 +80,7 @@ struct Context : NativeContextBuffers {
     SRWLOCK resources_lock = SRWLOCK_INIT;
     Object *resources = nullptr;
     Object *descriptor_heaps = nullptr;
+    Object *query_heaps = nullptr;
     Object *native_queue_objects = nullptr;
     NativeRuntimeQueue *native_runtime_queues = nullptr;
     NativeFence *native_fences = nullptr;
@@ -221,9 +222,10 @@ HRESULT bind(Context *ctx, void *memory, vkdu_object *value, vkdu_kind kind) {
         AcquireSRWLockExclusive(&ctx->resources_lock);
         entry->next = ctx->resources; ctx->resources = entry;
         ReleaseSRWLockExclusive(&ctx->resources_lock);
-    } else if (kind == VKDU_DESCRIPTOR_HEAP) {
+    } else if (kind == VKDU_DESCRIPTOR_HEAP || kind == VKDU_QUERY_HEAP) {
         AcquireSRWLockExclusive(&ctx->resources_lock);
-        entry->next = ctx->descriptor_heaps; ctx->descriptor_heaps = entry;
+        auto **head = kind == VKDU_DESCRIPTOR_HEAP ? &ctx->descriptor_heaps : &ctx->query_heaps;
+        entry->next = *head; *head = entry;
         ReleaseSRWLockExclusive(&ctx->resources_lock);
     }
     ++ctx->references;
@@ -706,9 +708,10 @@ extern "C" void APIENTRY VioGpuD3D12BridgeUnbindObject(void *memory) {
     auto *value = object(memory);
     if (!value) return;
     auto *ctx = value->context;
-    if (value->kind == VKDU_BUFFER || value->kind == VKDU_TEXTURE2D || value->kind == VKDU_DESCRIPTOR_HEAP) {
+    if (value->kind == VKDU_BUFFER || value->kind == VKDU_TEXTURE2D || value->kind == VKDU_DESCRIPTOR_HEAP || value->kind == VKDU_QUERY_HEAP) {
         AcquireSRWLockExclusive(&ctx->resources_lock);
-        Object **p = value->kind == VKDU_DESCRIPTOR_HEAP ? &ctx->descriptor_heaps : &ctx->resources;
+        Object **p = value->kind == VKDU_DESCRIPTOR_HEAP ? &ctx->descriptor_heaps :
+            value->kind == VKDU_QUERY_HEAP ? &ctx->query_heaps : &ctx->resources;
         while (*p && *p != value) p = &(*p)->next;
         if (*p) *p = value->next;
         ReleaseSRWLockExclusive(&ctx->resources_lock);

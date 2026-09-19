@@ -27,6 +27,7 @@
 #include "vkd3d_rw_spinlock.h"
 #include "vkd3d_descriptor_debug.h"
 #include "hashmap.h"
+#include "wddm_pageable.inc"
 
 #define VKD3D_NULL_SRV_FORMAT DXGI_FORMAT_R8G8B8A8_UNORM
 #define VKD3D_NULL_UAV_FORMAT DXGI_FORMAT_R32_UINT

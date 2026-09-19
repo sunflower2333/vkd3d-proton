@@ -4287,8 +4287,10 @@ static HRESULT vkd3d_create_vk_device(struct d3d12_device *device,
     if (runtime)
     {
         struct mwd_support support = {MWD_STYPE_SUPPORT};
+        struct mwd_pageable_support pageable = {MWD_STYPE_PAGEABLE_SUPPORT};
         VkPhysicalDeviceProperties2 properties = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
         properties.pNext = &support;
+        support.pNext = &pageable;
         VK_CALL(vkGetPhysicalDeviceProperties2(physical_device, &properties));
         if (support.magic != MWD_RUNTIME_MAGIC || support.version != MWD_RUNTIME_ABI_VERSION ||
                 support.size != sizeof(struct mwd_callbacks) || support.flags != 1)
@@ -4297,6 +4299,9 @@ static HRESULT vkd3d_create_vk_device(struct d3d12_device *device,
             vkd3d_free(extensions);
             return DXGI_ERROR_UNSUPPORTED;
         }
+        if (pageable.magic == MWD_PAGEABLE_MAGIC && pageable.version == MWD_PAGEABLE_VERSION &&
+                pageable.size == sizeof(pageable) && !pageable.flags)
+            device->wddm_pageable_acquire = pageable.acquire;
         runtime_info = *runtime;
         runtime_info.pNext = device_info.pNext;
         device_info.pNext = &runtime_info;

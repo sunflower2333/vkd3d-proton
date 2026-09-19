@@ -9,7 +9,7 @@ and RGBA8 non-render-target images backed by the native runtime's allocation.
 It adds native texture SRVs and physical-pitched CopyTextureRegion, validates
 actual embedded image allocation requirements, and rejects separate committed
 or staging-memory fallbacks. It does not advertise native D3D12 admission,
-depth views, residency or Present. See
+depth views, complete residency or Present. See
 `docs/vkd3d-native-textures-20260919.md` for exact tests and limits.
 
 The bounded graphics continuation adds native SM5.0 vertex/pixel shaders,
@@ -39,9 +39,23 @@ The native heap residency continuation forwards MakeResident/Evict through the
 runtime's device and opaque paging queue, using existing owned allocation
 handles. E_PENDING preserves the complete paging fence and WaitMask; callbacks
 cannot rename, submit or free the borrowed handles. Device retirement suppresses
-later output writes. Only native heap objects are supported in this slice;
-descriptor/query backing, physical paging and ordinary runtime acceptance remain
-unproven. See `docs/vkd3d-native-residency-20260920.md`.
+later output writes. See `docs/vkd3d-native-residency-20260920.md` for the initial
+native-heap checkpoint.
+
+The optional pageable-provider continuation also enumerates descriptor/query
+backing: actual descriptor-buffer memory, auxiliary memory, descriptor pools,
+query result memory and query pools. It retains exact allocation tokens and
+backend owners, deduplicates backing, and forwards real runtime paging calls.
+CPU visibility never proves a descriptor heap has no GPU allocation. Old Mesa
+providers explicitly reject objects with backing; an actual empty backing set
+needs no paging callback. A mapped ICD allocation is offered to the runtime's
+eviction policy without discarding its mapping or overriding a rejection. Query
+heap create/destroy supports the first four native heap types with reset and
+retirement checks; query begin/end/resolve execution is still unimplemented.
+This requires the separate version1 Mesa provider on top of unchanged runtime
+ABI2; KMD wire ABI0 and public admission remain unchanged. Physical paging and
+ordinary runtime acceptance remain unproven. See
+`docs/vkd3d-pageable-provider-design-20260920.md` for pairing and validation.
 
 The engine revision
 and every submodule are pinned by the driver parent repository.

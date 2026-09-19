@@ -282,6 +282,26 @@ uint64_t vkdu_heap_start(vkdu_object *heap, int gpu)
     if (gpu) return heap->shader_visible ? ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(OBJ(ID3D12DescriptorHeap, heap)).ptr : 0;
     return ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(OBJ(ID3D12DescriptorHeap, heap)).ptr;
 }
+int32_t vkdu_query_heap_create(vkdu_device *device, uint32_t type, uint32_t count, vkdu_object **out)
+{
+    D3D12_QUERY_HEAP_DESC desc = {0}; ID3D12QueryHeap *heap = NULL; HRESULT hr;
+    if (!out) return E_POINTER;
+    *out = NULL;
+    if (!device || !count || type > D3D12_QUERY_HEAP_TYPE_SO_STATISTICS) return E_INVALIDARG;
+    desc.Type = type; desc.Count = count; desc.NodeMask = 1;
+    hr = ID3D12Device_CreateQueryHeap(device->object, &desc, &IID_ID3D12QueryHeap, (void **)&heap);
+    return wrap(device, VKDU_QUERY_HEAP, hr, (IUnknown *)heap, out);
+}
+int32_t vkdu_pageable_backing(vkdu_object *object, uint32_t *count, struct mwd_allocation *allocations)
+{
+    if (!count || !allocations) return E_POINTER;
+    *count = 0;
+    if (VALID(object, VKDU_DESCRIPTOR_HEAP))
+        return vkd3d_wddm_descriptor_backing(OBJ(ID3D12DescriptorHeap, object), count, allocations);
+    if (VALID(object, VKDU_QUERY_HEAP))
+        return vkd3d_wddm_query_backing(OBJ(ID3D12QueryHeap, object), count, allocations);
+    return E_INVALIDARG;
+}
 int vkdu_heap_resolve(vkdu_object *heap, uint64_t handle, int gpu, uint32_t *index)
 {
     uint64_t start = vkdu_heap_start(heap, gpu), offset;

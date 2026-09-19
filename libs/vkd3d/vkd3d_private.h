@@ -5978,6 +5978,7 @@ struct d3d12_device
     bool independent_device;
     void *wddm_runtime_owner;
     struct mwd_callbacks wddm_runtime_callbacks;
+    mwd_pageable_acquire_fn wddm_pageable_acquire;
 };
 
 HRESULT d3d12_device_create(struct vkd3d_instance *instance,

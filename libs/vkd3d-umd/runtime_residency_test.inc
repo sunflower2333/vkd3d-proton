@@ -129,7 +129,7 @@ static int test_native_residency() {
         REQUIRE(table.pfnMakeResident(create.hDrvDevice, &request) == E_INVALIDARG);
         REQUIRE(table.pfnEvict(create.hDrvDevice, &evict) == E_INVALIDARG);
     }
-    objects[1] = {&b, D3D12DDI_HT_DESCRIPTOR_HEAP};
+    objects[1] = {&b, D3D12DDI_HT_PIPELINE_STATE};
     REQUIRE(table.pfnMakeResident(create.hDrvDevice, &request) == DXGI_ERROR_UNSUPPORTED);
     REQUIRE(table.pfnEvict(create.hDrvDevice, &evict) == DXGI_ERROR_UNSUPPORTED);
     objects[1] = {&b, D3D12DDI_HT_HEAP};
@@ -175,6 +175,92 @@ static int test_native_residency() {
     ++first->submitted;
     REQUIRE(table.pfnEvict(create.hDrvDevice, &evict) == DXGI_ERROR_WAS_STILL_DRAWING);
     --first->submitted;
+
+    // Actual descriptor/query backing comes from a retained backend owner,
+    // never descriptor CPU/GPU visibility or an allocation-list snapshot.
+    Object descriptor_memory{}, host_memory{}, query_memory{};
+    auto *descriptor_peer = reinterpret_cast<vkdu_object *>(new ImportPeer{{}, ctx->backend, VKDU_DESCRIPTOR_HEAP, 0, 0});
+    auto *host_peer = reinterpret_cast<vkdu_object *>(new ImportPeer{{}, ctx->backend, VKDU_DESCRIPTOR_HEAP, 0, 0});
+    REQUIRE(VioGpuD3D12BridgeBindObject(create.hDrvDevice, &descriptor_memory, descriptor_peer, VKDU_DESCRIPTOR_HEAP) == S_OK);
+    REQUIRE(VioGpuD3D12BridgeBindObject(create.hDrvDevice, &host_memory, host_peer, VKDU_DESCRIPTOR_HEAP) == S_OK);
+    descriptor_memory.descriptor_flags = host_memory.descriptor_flags = D3D12DDI_DESCRIPTOR_HEAP_FLAG_CPU_VISIBLE;
+    D3D12DDIARG_CREATE_QUERY_HEAP_0001 query_desc{D3D12DDI_QUERY_HEAP_TYPE_TIMESTAMP, 16, 1};
+    D3D12DDI_HQUERYHEAP query_handle{&query_memory};
+    REQUIRE(table.pfnCalcPrivateQueryHeapSize(create.hDrvDevice, &query_desc) == sizeof(Object));
+    REQUIRE(table.pfnCreateQueryHeap(create.hDrvDevice, &query_desc, query_handle) == S_OK);
+    REQUIRE(table.pfnCreateQueryHeap(create.hDrvDevice, &query_desc, query_handle) == E_INVALIDARG);
+    auto *query_peer = query_memory.backend;
+    pageable_tokens[descriptor_peer] = {first, second, first};
+    pageable_tokens[query_peer] = {second}; pageable_tokens[host_peer] = {};
+    D3D12DDI_HANDLE_AND_TYPE pageables[] = {{&descriptor_memory, D3D12DDI_HT_DESCRIPTOR_HEAP},
+        {&query_memory, D3D12DDI_HT_QUERY_HEAP}, {&host_memory, D3D12DDI_HT_DESCRIPTOR_HEAP}};
+    request.pObjects = pageables; request.NumObjects = 3;
+    evict.pObjects = pageables; evict.NumObjects = 3;
+    make_result = E_PENDING; returned_paging = 0xfedcba9876543210ull;
+    REQUIRE(table.pfnMakeResident(create.hDrvDevice, &request) == E_PENDING &&
+        fence == returned_paging && request.WaitMask == 1);
+    REQUIRE(table.pfnEvict(create.hDrvDevice, &evict) == S_OK);
+    REQUIRE(first->users == 1 && second->users == 1 && !first->residency_operations && !second->residency_operations);
+    REQUIRE(reinterpret_cast<ImportPeer *>(descriptor_peer)->references == 1 &&
+        reinterpret_cast<ImportPeer *>(query_peer)->references == 1);
+    // A persistent ICD mapping is handed to the runtime's actual eviction
+    // policy. Its rejection must be returned unchanged, with no fake success.
+    REQUIRE(table.pfnMapHeap(create.hDrvDevice, ha, &mapped) == S_OK);
+    evict_result = DXGI_ERROR_WAS_STILL_DRAWING;
+    const auto before_pinned_evict = evict_calls;
+    REQUIRE(table.pfnEvict(create.hDrvDevice, &evict) == DXGI_ERROR_WAS_STILL_DRAWING &&
+        evict_calls == before_pinned_evict + 1);
+    evict_result = S_OK; table.pfnUnmapHeap(create.hDrvDevice, ha);
+    make_result = S_OK;
+    const auto before_backing_make = make_calls, before_backing_evict = evict_calls;
+    pageable_result = DXGI_ERROR_UNSUPPORTED;
+    REQUIRE(table.pfnMakeResident(create.hDrvDevice, &request) == DXGI_ERROR_UNSUPPORTED);
+    REQUIRE(table.pfnEvict(create.hDrvDevice, &evict) == DXGI_ERROR_UNSUPPORTED);
+    pageable_result = S_OK; corrupt_pageable_reply = true;
+    REQUIRE(table.pfnMakeResident(create.hDrvDevice, &request) == E_INVALIDARG);
+    corrupt_pageable_reply = false;
+    REQUIRE(first->users == 1 && second->users == 1);
+    REQUIRE(make_calls == before_backing_make && evict_calls == before_backing_evict);
+    // An explicit zero-backing descriptor requires no residency callback.
+    request.NumObjects = evict.NumObjects = 1; request.pObjects = evict.pObjects = &pageables[2];
+    ctx->runtime_callbacks.pfnMakeResidentCb = nullptr; ctx->runtime_callbacks.pfnEvictCb = nullptr;
+    REQUIRE(table.pfnMakeResident(create.hDrvDevice, &request) == S_OK && !fence && !request.WaitMask);
+    REQUIRE(table.pfnEvict(create.hDrvDevice, &evict) == S_OK);
+    ctx->runtime_callbacks.pfnMakeResidentCb = residency_make; ctx->runtime_callbacks.pfnEvictCb = residency_evict;
+    // Reentrant destruction poisons the runtime slot and caller's input array,
+    // while the copied request and independently retained backend stay valid.
+    request.NumObjects = 1; request.pObjects = pageables;
+    pageable_callback = [&] {
+        table.pfnDestroyDescriptorHeap(create.hDrvDevice, {&descriptor_memory});
+        std::memset(&descriptor_memory, 0xa5, sizeof(descriptor_memory));
+        pageables[0].Handle = reinterpret_cast<void *>(uintptr_t(1));
+        request.NumObjects = UINT32_MAX; request.pObjects = nullptr;
+    };
+    REQUIRE(table.pfnMakeResident(create.hDrvDevice, &request) == S_OK);
+    pageable_callback = {};
+    REQUIRE(first->users == 1 && second->users == 1);
+    pageables[0] = {&descriptor_memory, D3D12DDI_HT_DESCRIPTOR_HEAP};
+    request.NumObjects = 1; request.pObjects = pageables;
+    REQUIRE(table.pfnMakeResident(create.hDrvDevice, &request) == E_INVALIDARG);
+    table.pfnDestroyQueryHeap(create.hDrvDevice, query_handle);
+    std::memset(&query_memory, 0xa5, sizeof(query_memory));
+    request.pObjects = &pageables[1];
+    REQUIRE(table.pfnMakeResident(create.hDrvDevice, &request) == E_INVALIDARG);
+    table.pfnDestroyDescriptorHeap(create.hDrvDevice, {&host_memory});
+    pageable_tokens.clear();
+    REQUIRE(!ctx->query_heaps && !ctx->descriptor_heaps);
+    Object rejected_query{}; D3D12DDI_HQUERYHEAP rejected_handle{&rejected_query};
+    query_desc.Count = 0;
+    REQUIRE(!table.pfnCalcPrivateQueryHeapSize(create.hDrvDevice, &query_desc));
+    REQUIRE(table.pfnCreateQueryHeap(create.hDrvDevice, &query_desc, rejected_handle) == E_INVALIDARG);
+    query_desc.Count = 1; query_desc.Type = static_cast<D3D12DDI_QUERY_HEAP_TYPE>(4);
+    REQUIRE(table.pfnCreateQueryHeap(create.hDrvDevice, &query_desc, rejected_handle) == DXGI_ERROR_UNSUPPORTED);
+    query_desc.Type = D3D12DDI_QUERY_HEAP_TYPE_TIMESTAMP; query_heap_result = E_OUTOFMEMORY;
+    REQUIRE(table.pfnCreateQueryHeap(create.hDrvDevice, &query_desc, rejected_handle) == E_OUTOFMEMORY);
+    query_heap_result = S_OK;
+    REQUIRE(!rejected_query.magic);
+    request = original; evict.NumObjects = 2; evict.pObjects = objects;
+    std::puts("PASS native descriptor/query backing residency, deduplication, host-only proof, runtime eviction policy and retained object retirement");
 
     partial_residency = true;
     fence = UINT64_MAX; request.WaitMask = 0xdeadbeefu;
@@ -233,6 +319,68 @@ static int test_native_residency() {
         release(ctx);
         kernel_heaps.clear(); kernel_resources.clear(); heap_callbacks_retired = false;
     }
+    // Backing enumeration can retire the query, request storage and entire
+    // device before returning. Both paging DDIs must unwind retained tokens
+    // without touching that storage or calling a retired runtime callback.
+    for (unsigned mode = 0; mode < 2; ++mode) {
+        REQUIRE(adapter.pfnCreateDevice(open.hAdapter, &create) == S_OK);
+        ctx = context(create.hDrvDevice);
+        REQUIRE(allocate(ha) == S_OK && allocate(hb) == S_OK);
+        first = native_heap_find(ctx, &a); second = native_heap_find(ctx, &b);
+        auto *page = static_cast<unsigned char *>(VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        REQUIRE(page);
+        auto *slot = new (page) Object{};
+        D3D12DDI_HQUERYHEAP heap{slot};
+        REQUIRE(table.pfnCreateQueryHeap(create.hDrvDevice, &query_desc, heap) == S_OK);
+        pageable_tokens[slot->backend] = {first, second};
+        auto *entry = new (page + 512) D3D12DDI_HANDLE_AND_TYPE{slot, D3D12DDI_HT_QUERY_HEAP};
+        auto *args = new (page + 1024) D3D12DDIARG_MAKERESIDENT_0001(original);
+        args->NumObjects = 1; args->pObjects = entry; args->pPagingFenceValue = reinterpret_cast<UINT64 *>(page + 2048);
+        D3D12DDIARG_EVICT eviction{}; eviction.NumObjects = 1; eviction.pObjects = entry;
+        const auto before_make = make_calls, before_evict = evict_calls;
+        ++ctx->references;
+        pageable_callback = [&] {
+            table.pfnDestroyQueryHeap(create.hDrvDevice, heap);
+            adapter.pfnDestroyDevice(create.hDrvDevice);
+            memory.fill(0xa5);
+            heap_callbacks_retired = true;
+            if (!VirtualFree(page, 0, MEM_RELEASE)) fixture_abort(__LINE__);
+        };
+        const HRESULT result = mode ? table.pfnEvict(create.hDrvDevice, &eviction)
+            : table.pfnMakeResident(create.hDrvDevice, args);
+        pageable_callback = {}; pageable_tokens.clear();
+        REQUIRE(result == DXGI_ERROR_DEVICE_REMOVED && ctx->native_retiring && !query_peers && !ctx->query_heaps);
+        REQUIRE(make_calls == before_make && evict_calls == before_evict);
+        REQUIRE(first->users == 1 && second->users == 1 && !first->residency_operations && !second->residency_operations);
+        release(ctx);
+        kernel_heaps.clear(); kernel_resources.clear(); heap_callbacks_retired = false;
+    }
+    // Constructor callbacks may reset the adapter, or retire both the device
+    // and query slot before the backend returns. Never publish into that slot.
+    for (unsigned mode = 0; mode < 2; ++mode) {
+        REQUIRE(adapter.pfnCreateDevice(open.hAdapter, &create) == S_OK);
+        ctx = context(create.hDrvDevice); ++ctx->references;
+        auto *page = static_cast<unsigned char *>(VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        REQUIRE(page);
+        auto *slot = new (page) Object{};
+        query_create_callback = [&] {
+            if (!mode) { ++generation; return; }
+            adapter.pfnDestroyDevice(create.hDrvDevice);
+            memory.fill(0xa5); heap_callbacks_retired = true;
+            if (!VirtualFree(page, 0, MEM_RELEASE)) fixture_abort(__LINE__);
+        };
+        REQUIRE(table.pfnCreateQueryHeap(create.hDrvDevice, &query_desc, {slot}) == DXGI_ERROR_DEVICE_REMOVED);
+        query_create_callback = {};
+        REQUIRE(!query_peers && !ctx->query_heaps);
+        if (!mode) {
+            REQUIRE(!slot->magic);
+            REQUIRE(VirtualFree(page, 0, MEM_RELEASE));
+            --generation;
+            adapter.pfnDestroyDevice(create.hDrvDevice);
+        }
+        release(ctx); heap_callbacks_retired = false;
+    }
+    std::puts("PASS native query constructor reset and pageable enumeration device retirement without stale runtime access");
     REQUIRE(adapter.pfnCloseAdapter(open.hAdapter) == S_OK && !native_contract_complete());
     std::puts("PASS native heap residency identity, pending paging fences, atomic validation, callback retirement and cleanup retention");
     return 0;

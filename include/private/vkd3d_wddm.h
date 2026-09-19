@@ -3,6 +3,12 @@
 #define VKD3D_WDDM_PRIVATE_H
 #include "vkd3d.h"
 #include "mesa_wddm_runtime.h"
+#include "mesa_wddm_pageable.h"
+/* Outputs transfer at most three retained runtime tokens on success. */
+HRESULT vkd3d_wddm_descriptor_backing(ID3D12DescriptorHeap *heap,
+        uint32_t *count, struct mwd_allocation *allocations);
+HRESULT vkd3d_wddm_query_backing(ID3D12QueryHeap *heap,
+        uint32_t *count, struct mwd_allocation *allocations);
 /* Separate private entrypoints leave the public create_info ABI unchanged. */
 HRESULT vkd3d_create_device_wddm(const struct vkd3d_device_create_info *info,
         const struct mwd_device_create_info *runtime, REFIID iid, void **device);

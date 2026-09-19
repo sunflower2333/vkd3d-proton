@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <vulkan/vulkan.h>
 struct mwd_callbacks;
+struct mwd_allocation;
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -12,7 +13,7 @@ extern "C" {
 /* No Windows SDK or generated COM types cross this internal ABI. */
 typedef struct vkdu_device vkdu_device;
 typedef struct vkdu_object vkdu_object;
-enum vkdu_kind { VKDU_BUFFER, VKDU_QUEUE, VKDU_ALLOCATOR, VKDU_COMMAND_LIST, VKDU_ROOT, VKDU_PIPELINE, VKDU_FENCE, VKDU_DESCRIPTOR_HEAP, VKDU_MEMORY_HEAP, VKDU_COMMAND_SIGNATURE, VKDU_TEXTURE2D };
+enum vkdu_kind { VKDU_BUFFER, VKDU_QUEUE, VKDU_ALLOCATOR, VKDU_COMMAND_LIST, VKDU_ROOT, VKDU_PIPELINE, VKDU_FENCE, VKDU_DESCRIPTOR_HEAP, VKDU_MEMORY_HEAP, VKDU_COMMAND_SIGNATURE, VKDU_TEXTURE2D, VKDU_QUERY_HEAP };
 struct vkdu_adapter { uint8_t luid[8]; uint32_t vendor_id, device_id; };
 struct vkdu_descriptor_range { uint32_t type, count, shader_register, register_space, offset; };
 struct vkdu_descriptor_span { vkdu_object *heap; uint32_t first, count; };
@@ -122,6 +123,8 @@ int32_t vkdu_command_texture_upload(vkdu_object *command, vkdu_object *texture,
         vkdu_object *upload, uint64_t offset, uint32_t row_pitch);
 int32_t vkdu_sampler_create(vkdu_object *heap, uint32_t index, const struct vkdu_sampler_desc *desc);
 int32_t vkdu_heap_create(vkdu_device *device, uint32_t type, uint32_t count, int shader_visible, vkdu_object **out);
+int32_t vkdu_query_heap_create(vkdu_device *device, uint32_t type, uint32_t count, vkdu_object **out);
+int32_t vkdu_pageable_backing(vkdu_object *object, uint32_t *count, struct mwd_allocation *allocations);
 uint32_t vkdu_descriptor_size(vkdu_device *device, uint32_t type);
 uint64_t vkdu_heap_start(vkdu_object *heap, int gpu);
 int vkdu_heap_resolve(vkdu_object *heap, uint64_t handle, int gpu, uint32_t *index);

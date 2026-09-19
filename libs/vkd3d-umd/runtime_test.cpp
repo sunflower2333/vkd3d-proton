@@ -33,6 +33,7 @@ static bool force_device_command_error;
 static bool force_drop_global_barrier;
 static bool force_drop_indirect_count;
 static unsigned signature_creates, indirect_calls;
+static unsigned query_peers;
 static uint32_t recorded_indirect_stride, recorded_indirect_maximum;
 static uint64_t recorded_argument_offset, recorded_count_offset;
 static vkdu_object *recorded_arguments, *recorded_count, *recorded_signature;
@@ -160,6 +161,8 @@ static int32_t test_queue_create(vkdu_device *, uint32_t, vkdu_object **);
 static int32_t test_queue_bind(vkdu_object *, void *, void *);
 static int32_t test_queue_execute(vkdu_object *, uint32_t, vkdu_object *const *);
 static int32_t test_signature_create(vkdu_device *, uint32_t, vkdu_object **);
+static int32_t test_query_heap_create(vkdu_device *, uint32_t, uint32_t, vkdu_object **);
+static int32_t test_pageable_backing(vkdu_object *, uint32_t *, mwd_allocation *);
 static int32_t test_execute_indirect(vkdu_object *, vkdu_object *, uint32_t, vkdu_object *, uint64_t, vkdu_object *, uint64_t);
 static DWORD WINAPI test_event_wait(HANDLE event, DWORD timeout) {
     if (force_early_completion && completion_negative_active && timeout == 0) return WAIT_OBJECT_0;
@@ -195,6 +198,8 @@ static DWORD WINAPI test_event_wait(HANDLE event, DWORD timeout) {
 #define vkdu_queue_bind_runtime test_queue_bind
 #define vkdu_queue_execute test_queue_execute
 #define vkdu_dispatch_signature_create test_signature_create
+#define vkdu_query_heap_create test_query_heap_create
+#define vkdu_pageable_backing test_pageable_backing
 #define vkdu_command_execute_indirect test_execute_indirect
 #define WaitForSingleObject test_event_wait
 #define VKDU_TEST_NATIVE_FENCE_CONTROLS
@@ -312,6 +317,7 @@ static void test_object_destroy(vkdu_object *object) {
         if (peer->runtime_route && FAILED(device->callbacks->queue_release(device->owner, peer->runtime_route)))
             fixture_abort(__LINE__);
     }
+    if (peer && peer->kind == VKDU_QUERY_HEAP) --query_peers;
     delete peer;
 }
 static int test_object_retain(vkdu_object *object) {
@@ -354,6 +360,40 @@ static int test_object_belongs(vkdu_device *device, vkdu_object *object) {
 }
 static uint64_t test_buffer_address(vkdu_object *object) { return object ? reinterpret_cast<ImportPeer *>(object)->address : 0; }
 static uint64_t test_buffer_size(vkdu_object *object) { return object ? reinterpret_cast<ImportPeer *>(object)->bytes : 0; }
+static std::map<vkdu_object *, std::vector<void *>> pageable_tokens;
+static std::function<void()> pageable_callback, query_create_callback;
+static HRESULT pageable_result = S_OK, query_heap_result = S_OK;
+static bool corrupt_pageable_reply;
+static int32_t test_query_heap_create(vkdu_device *device, uint32_t type, uint32_t count, vkdu_object **out) {
+    *out = nullptr;
+    if (type > 3 || !count) return E_INVALIDARG;
+    if (FAILED(query_heap_result)) return query_heap_result;
+    *out = reinterpret_cast<vkdu_object *>(new ImportPeer{{}, device, VKDU_QUERY_HEAP, type, count});
+    ++query_peers;
+    if (query_create_callback) query_create_callback();
+    return S_OK;
+}
+static int32_t test_pageable_backing(vkdu_object *object, uint32_t *count, mwd_allocation *out) {
+    *count = 0;
+    if (FAILED(pageable_result)) return pageable_result;
+    auto *peer = reinterpret_cast<ImportPeer *>(object);
+    if (peer->references < 2 || (peer->kind != VKDU_DESCRIPTOR_HEAP && peer->kind != VKDU_QUERY_HEAP))
+        fixture_abort(__LINE__);
+    auto *device = reinterpret_cast<TestDevice *>(peer->device);
+    const auto tokens = pageable_tokens[object];
+    if (tokens.size() > 3) fixture_abort(__LINE__);
+    for (auto *token : tokens) {
+        HRESULT hr = native_runtime_retain(device->owner, token, &out[*count]);
+        if (FAILED(hr)) {
+            while (*count) native_runtime_release(device->owner, out[--*count].token);
+            return hr;
+        }
+        ++*count;
+    }
+    if (corrupt_pageable_reply && *count) ++out[0].handle;
+    if (pageable_callback) pageable_callback();
+    return S_OK;
+}
 static int32_t test_allocator_create(vkdu_device *device, uint32_t type, vkdu_object **out) {
     if (!device || type != 0 || !out) return E_INVALIDARG;
     *out = reinterpret_cast<vkdu_object *>(new ImportPeer{{}, device, VKDU_ALLOCATOR, 0, 0});
