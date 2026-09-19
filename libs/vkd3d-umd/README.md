@@ -51,7 +51,11 @@ providers explicitly reject objects with backing; an actual empty backing set
 needs no paging callback. A mapped ICD allocation is offered to the runtime's
 eviction policy without discarding its mapping or overriding a rejection. Query
 heap create/destroy supports the first four native heap types with reset and
-retirement checks; query begin/end/resolve execution is still unimplemented.
+retirement checks. The bounded query continuation adds actual Begin/End/Resolve
+recording and GPU result copies, retaining query/result backing on the real
+submission allocator through GPU completion or reset. Its result/lifetime
+validation and remaining acceptance boundary are recorded in
+`docs/vkd3d-native-query-execution-20260920.md`.
 This requires the separate version1 Mesa provider on top of unchanged runtime
 ABI2; KMD wire ABI0 and public admission remain unchanged. Physical paging and
 ordinary runtime acceptance remain unproven. See
