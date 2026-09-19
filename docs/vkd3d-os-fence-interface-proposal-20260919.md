@@ -1,8 +1,12 @@
 # OS monitored-fence producer and import proposal
 
-Status: interface proposal, not an implemented native fence provider. No KMD,
-Mesa, parent-tree or runtime-v1 ABI file is changed by this checkpoint. Ordinary
-D3D12 admission remains closed.
+Status: direct GPU fence-import proposal and OS probe record. **The proposed
+GPUVA producer is not a universal prerequisite for ordinary single-adapter
+D3D12.** Microsoft's physical-mode compute sample associates command queues
+through the runtime's CreateContext callback and leaves external fence packet
+scheduling to the runtime. The later queue audit supersedes that broad earlier
+assumption; see `vkd3d-runtime-queue-association-20260919.md`. Ordinary admission
+remains closed for actual incomplete runtime/graphics/residency/Present paths.
 
 The corrected target matrix creates all five valid monitored-fence variants
 with real CPU mappings, but all return GPUVA zero. The initial invalid sharing
@@ -309,5 +313,49 @@ Additional exact Microsoft sources:
 - `d3dkmthk/nf-d3dkmthk-d3dkmtsignalsynchronizationobjectfromcpu.md`
 - [WDK KMT header](https://github.com/tpn/winsdk-10/blob/master/Include/10.0.16299.0/km/d3dkmthk.h)
 
-The flagged-rewind revision is awaiting CI and root-owned target execution.
-No production UMD, KMD, Mesa or shared runtime ABI changed.
+## Current flagged-rewind probe validation and handoff
+
+Source commit `6fdbcede1d12954de0b5d0b40cabcbaea26bf90c` passed all five jobs of
+[CI 35446236355](https://github.com/sunflower2333/vkd3d-proton/actions/runs/35446236355).
+Actual x86/x64/native ARM64 execution logs show
+`PASS OS_FENCE_CONFIGURATION_ONLY ... explicit_AllowFenceRewind; no KMT calls`.
+Existing native ownership/negative controls and explicit CPU-WARP public fence
+and copy regressions pass on all three Windows architectures. Linux real CPU
+Vulkan backend and semantic negative controls pass as well.
+
+| Architecture | Artifact ID | Archive SHA256 |
+| --- | --- | --- |
+| ARM64 | 10584414800 | 4d076bbca99a20c7e7c5da872a41bd332609ad1a8ba717316700b0a14559f373 |
+| x64 | 10584904892 | ccb87fdcf3e6fe3396ff4299945fc217c2ad2fa5b7ea492cdae5c1501596e25e |
+| x86 | 10584864835 | 2a4a1ecee7f6855c2e6ad6ccbd1c6f49d1dc55e57a043fae87a9a51c5ffa05d6 |
+
+ARM64 `package/vkd3d-umd-shared-gpu-probe.exe` SHA256 from actual build log:
+`11509ae3be0a0540376f5f3cb2e8aaa4a97e3ca451e0d8021d57a4b0b89f0e6f`.
+Actual jobs: Linux `105905523327`, ARM64 build `105905523421`,
+x64 `105905523436`, x86 `105905523660`, ARM64 runtime `105906249617`.
+ARM64 runtime log artifact `10584934845` archive SHA256
+`0bee5966c56a1399c32d52ad0d348d62b2343b1c13df093c435f69d6725ebb35`.
+
+Root can transfer only this EXE and use the same fresh-LUID
+`--run-os-fence-controls` command with a 60-second outer deadline. A nonzero
+exit is still required if the GPU-access variants return GPUVA zero; successful
+CPU events or explicitly allowed rewind do not satisfy the GPU mapping gate.
+Root executed `candidate58552-os-fence-rewind-20260919a` on unchanged 58552:
+1802 ms, exit 1 only at the absent GPU mapping gate, no timeout or new faults,
+DWM/driver retained, task cleaned. LUID `00000000:01a9f9e3`, generation 2.
+
+```text
+legacy=1 GPU_mapped=0 NoGPUAccess_CPU=1 rejected=1 missing_GPUVA=4
+behavior_failures=0 created=6 CPU_mapped=5 CPU_event_pass=5 rewind_pass=5
+```
+
+All five valid requests have successful CPU events and explicitly allowed
+rewinds (`flags=4, status=0`). Four GPU-access requests still return GPUVA 0;
+NoGPUAccess intentionally returns 0; the invalid flag pair returns `c000000d`.
+This proves these CPU operations on probe-owned OS fences. It does not prove
+ordinary runtime queue submission, and it does not prove that runtime software
+fence scheduling requires GPUVA.
+
+No production UMD, KMD, Mesa or shared runtime ABI changed in the probe commit; no artifact download
+or remote action by this worker. The shared runtime-v1 header SHA256 remains
+`c072169e380f14fd4f967dd0ea765e4c0ac8f671136e93baedce8cd2dadbed34`.
