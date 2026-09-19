@@ -123,3 +123,19 @@ Admission must remain zero until ordinary runtime scheduling plus the mandatory
 graphics, residency and Present contracts are implemented and validated. Current
 CPU fixtures, cross-compilation and controlled KMT probes cannot satisfy that
 acceptance condition on their own.
+
+## Exact remaining native admission blockers
+
+Source review at implementation `25d1a6c`:
+
+| Area | Current source behavior | Required next evidence or implementation |
+| --- | --- | --- |
+| Negotiation | `native_contract_complete()` returns `prerequisites && false`; supported versions are zero, GetCaps refuses, and FillDDITable does not publish partial tables. | Implement and validate one complete negotiated feature-level contract before changing admission. |
+| Graphics | Pipeline creation rejects VS/PS/HS/DS/GS; only compute shaders/pipelines are implemented. DrawInstanced/DrawIndexedInstanced and RTV/DSV/graphics-state paths are absent. | Native graphics pipeline, draw/state/view DDIs and required format behavior backed by actual GPU pixel tests. |
+| Memory | MakeResident is unassigned; heaps accept L0 buffers and bounded single-mip/layer/sample R32_FLOAT/RGBA8 non-RT textures. | Required residency, placement, heap/resource and descriptor contracts for the advertised feature level. |
+| Synchronization | Runtime queues route real contexts, but CreateFence and queue SignalFence/WaitForFence table slots are unassigned; target queue execution and ordinary runtime external scheduling are not proven. | Implement exact physical-mode/single-adapter callbacks and validate real runtime signal/wait/teardown ordering. The Microsoft sample's LDA-only signal/wait callbacks do not imply universal GPUVA import. |
+| Display and recovery | No ordinary D3D12 Present/shared-surface path, final runtime teardown or TDR acceptance. | Integrated KMD/UMD presentation and recovery under real application/runtime operation. |
+
+The new controlled two-queue probe narrows the scheduling uncertainty; it cannot
+close the missing graphics, residency or Present paths. Windows D3D12 device
+creation is still intentionally rejected at public negotiation.

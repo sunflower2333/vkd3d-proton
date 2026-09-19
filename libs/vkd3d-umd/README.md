@@ -154,10 +154,13 @@ gates. Controlled retirement fixtures do not access a map after DestroyDevice.
 
 Still required for a native system driver: complete negotiated feature levels;
 full device/core and graphics DDIs; remaining resource/heap types and placement,
-residency and WDDM2 GPUVA mapping; remaining descriptor views;
-monitored fences referring to the runtime's actual GPU backing; shared surfaces,
-presentation, device-removal/TDR recovery and WDDM KMD integration. The backend
-fences used by the test are not the runtime's monitored-fence contract.
+residency and remaining descriptor views; the runtime's actual synchronization
+contract; shared surfaces, presentation and device-removal/TDR recovery. The
+runtime-associated physical contexts implemented here are a valid single-adapter
+direction; GPUVA/application-fence import is not a universal requirement for
+that mode. The backend fences used by the tests do not validate the Microsoft
+runtime's external scheduling and synchronization. WDDM2 GPUVA remains absent
+and must be implemented if a negotiated mode or feature actually requires it.
 Caller must keep resources, shaders and command allocators alive until submitted
 work has retired and reset allocators only after completion, as required by D3D12.
 
