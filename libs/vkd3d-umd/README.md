@@ -35,6 +35,14 @@ placements as CPU addresses. This remains a partial contract with ordinary
 admission disabled. See `docs/vkd3d-native-fences-20260920.md` for evidence and
 the explicit runtime/target acceptance boundary.
 
+The native heap residency continuation forwards MakeResident/Evict through the
+runtime's device and opaque paging queue, using existing owned allocation
+handles. E_PENDING preserves the complete paging fence and WaitMask; callbacks
+cannot rename, submit or free the borrowed handles. Device retirement suppresses
+later output writes. Only native heap objects are supported in this slice;
+descriptor/query backing, physical paging and ordinary runtime acceptance remain
+unproven. See `docs/vkd3d-native-residency-20260920.md`.
+
 The engine revision
 and every submodule are pinned by the driver parent repository.
 

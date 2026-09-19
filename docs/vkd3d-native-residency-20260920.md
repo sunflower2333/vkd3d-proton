@@ -57,6 +57,25 @@ and submission exclusion, nested callbacks, device/request unmapping and failed
 cleanup retention. Two deliberate mutations misclassify pending completion or
 omit eviction; the wrapper requires specific semantic failures.
 
-Windows ARM64/x64/x86 compile and runtime CI validation are pending for this
-checkpoint. These fixtures emulate the runtime callbacks and do not prove an
-ordinary D3D12 application, physical paging, Present or target acceptance.
+Implementation `40f7da3b18d7279718353a5a822861541db5f0f7` passed all five jobs
+of [CI 35456189312](https://github.com/sunflower2333/vkd3d-proton/actions/runs/35456189312).
+Windows x64 and x86 built and executed the actual-WDK fixtures; the ARM64 build
+was executed by the separate native ARM64 job `105932575964`. Each reports the
+residency PASS token and both semantic-negative PASS tokens. Existing lifecycle
+coverage and all eight previous semantic controls remain green. Linux backend
+graphics/compute regressions and all four queue-ordering controls also pass.
+
+| Artifact | ID | Archive bytes |
+| --- | --- | --- |
+| vkd3d-native-ddi-arm64 | 10588547648 | 13233681 |
+| vkd3d-native-ddi-x64 | 10588138281 | 13574839 |
+| vkd3d-native-ddi-x86 | 10588402953 | 13435368 |
+| vkd3d-runtime-arm64-validation | 10587434937 | 10845 |
+
+The ARM64 artifact archive digest reported by GitHub is
+`sha256:6a882f0c6700e44a5c7156c3b01ef40aa7e1684ab04f01e8a4f194397dddde97`.
+This residency candidate is distinct from fence source `353263d` and the
+separately target-tested graphics source `a823c15`. These fixtures emulate the
+runtime callbacks and do not prove an ordinary D3D12 application, physical
+paging, Present or target acceptance. The explicit admission gate stays closed
+even though the small prerequisite expression now has nonnull function slots.
