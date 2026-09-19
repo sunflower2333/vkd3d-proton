@@ -301,7 +301,13 @@ static int test_native_residency() {
         args->pObjects = owned_objects; args->pPagingFenceValue = reinterpret_cast<UINT64 *>(page + 1024);
         D3D12DDIARG_EVICT eviction{}; eviction.NumObjects = 2; eviction.pObjects = owned_objects;
         ++ctx->references;
+        bool retirement_started = false;
         auto retire = [&] {
+            // DestroyDevice may synchronously deallocate another unguarded
+            // batch member. Model the one runtime lifetime transition once,
+            // while still checking every nested kernel callback is legal.
+            if (retirement_started) return;
+            retirement_started = true;
             adapter.pfnDestroyDevice(create.hDrvDevice);
             memory.fill(0xa5); a.magic = b.magic = 0xa5a5a5a5u;
             heap_callbacks_retired = true;
