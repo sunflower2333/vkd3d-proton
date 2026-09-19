@@ -273,8 +273,23 @@ and124 timeout. CI compiles the probe and checks its no-argument gate; target
 GPU execution remains a separate required test. This is emulated-runtime plus
 actual KMT/GPU proof only, never ordinary Microsoft D3D12CreateDevice acceptance.
 
-Driver-parent packaging must build from `external/vkd3d-proton`, retain Mesa4ace
-and KMD7648b72f or explicit validated successors, copy this candidate before PE
+The `--run-runtime-queues` mode adds two native command queues with separate
+runtime-associated KMT scheduling contexts sharing the allocation domain.
+Eight alternating GPU copies must appear on the selected context before Execute
+returns, and completion events must use that context. Readback checks all16384
+words per round; both child contexts must close while the allocation owner stays
+live. This is still emulated-runtime plus real KMT/GPU, not ordinary D3D12.
+
+This queue implementation requires runtime ABI **2** on both VKD3D and Mesa.
+The coordinated source set is Mesa709ac5ef plus KMD00d851e5 (retained domains)
+and its build/fixture repairs through89f4061c, or validated successors. Older
+runtime-v1 artifacts are incompatible. The paired protocol headers have SHA256
+`facd7a43c42b227b9bc9cc44d184b4801b3e5201168028fb9ae9700f8abd1999`.
+See `docs/vkd3d-runtime-queue-association-20260919.md` for build evidence and
+remaining target/runtime acceptance gates.
+
+Driver-parent packaging must build from `external/vkd3d-proton`, retain the
+coordinated Mesa/KMD interface set above, copy this candidate before PE
 signing/catalog generation, preserve matching PDB identity, and record parent,
 Mesa and vkd3d source hashes. A signed candidate still does not establish native
 runtime acceptance; no active driver registration is changed by this milestone.

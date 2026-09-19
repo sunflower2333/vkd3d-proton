@@ -85,8 +85,10 @@ Do not pair these artifacts with runtime-v1 Mesa or VKD3D.
   races, three semantic controls, Render/prepatch 54/54 and private ABI pass.
   Inherited Advanced Color fixture repair `23aef2df`, disposable Windows fixture
   cleanup `8b3d09b4`, and default-build guards `89f4061c` are separate commits.
-  Contract and all 47 Advanced Color negatives pass locally. ARM64 driver build
-  run 35450586472 is pending; do not claim this KMD is compiled yet.
+  Contract and all 47 Advanced Color negatives pass locally. ARM64 driver run
+  35450586472 passes default, Advanced Color and opt-in variants, all export and
+  INF/PE gates, and publishes unsigned default/HDR artifacts with link maps.
+  This is not a jointly signed installable package or target acceptance.
 - Mesa `709ac5ef`: run 35450196385 passes regression, ARM64 SDK/WDK compilation
   and full Turnip linking. Production queue metadata/drain passes ASan/UBSan;
   reread-token, double-release and skip-drain semantic controls are caught.
@@ -95,6 +97,10 @@ Do not pair these artifacts with runtime-v1 Mesa or VKD3D.
   logical-worker routing/split/drain tests and drop-route/shared-token/skip-drain
   controls pass. Actual DDI lifecycle tests verify two distinct runtime contexts,
   shared allocation, per-context Render/events, FIFO completion and teardown.
+- VKD3D `25d1a6c`: run 35450875839 passes all five jobs again with the new
+  controlled target probe below. Its ARM64, x86 and x64 binaries compile, the
+  no-argument gate passes, and actual ARM64 lifecycle tests remain green. CI
+  does not execute the real VIOGPU/KMT GPU probe on the target.
 
 ## Controlled target probe
 
