@@ -18,12 +18,21 @@ RTV clear/bind, and direct/indexed instanced triangle draws. Shader signatures
 are rebuilt from the native register contract and actual token declarations;
 unused entries in a runtime signature do not become required vertex attributes.
 Render targets use the same retained native allocation domain with no committed
-fallback. Depth, blending, input layouts, graphics descriptor bindings, MRT,
+fallback. Depth, blending, graphics descriptor bindings, MRT,
 multisampling and full feature-level/runtime acceptance remain unfinished.
 The controlled `--run-shared-graphics` probe requires runtime-v2 Mesa/KMD pairing
 and validates native DDI pixels, exact allocation references and runtime-context
 OS completion. It uses emulated runtime callbacks; it is not an ordinary
 `D3D12CreateDevice` test. See `docs/vkd3d-native-graphics-20260919.md`.
+
+The vertex-input continuation adds copied native element layouts and multi-slot
+vertex-buffer views, mapping InputRegister to the reconstructed shader register
+contract. Per-vertex/per-instance fetch, divisors, offsets, zero strides and
+null bindings are validated by real pixel readback. Vertex and index resources
+join query/result owners on the embedded submission allocator, so wrapper
+destruction or unbinding cannot release pending GPU backing. Native range,
+ownership, reset and recursive retirement checks preserve the closed admission
+gate. See `docs/vkd3d-native-vertex-input-20260920.md` for exact limits and proof.
 
 The single-node fence continuation owns copied native fence descriptions and
 implements CreateFence/DestroyFence plus SignalFence/WaitForFence broadcast
