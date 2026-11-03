@@ -222,6 +222,10 @@ int32_t vkdu_device_create(PFN_vkGetInstanceProcAddr loader, const struct vkdu_a
 int32_t vkdu_device_create_runtime(PFN_vkGetInstanceProcAddr loader, const uint8_t luid[8], vkdu_device **out);
 int32_t vkdu_device_create_shared(PFN_vkGetInstanceProcAddr loader, const struct vkdu_memory_expectation *expected,
         const struct mwd_callbacks *callbacks, void *owner, struct vkdu_memory_facts *facts, vkdu_device **out);
+/* SM6 DDI shader code: the DXIL program part ('DXIL' bitcode header at word 2). */
+int vkdu_shader_is_dxil(const uint32_t *tokens, uint32_t words);
+/* Highest D3D_SHADER_MODEL the embedded device (dxil-spirv on this ICD) supports. */
+uint32_t vkdu_device_shader_model(vkdu_device *device);
 int32_t vkdu_device_create_shared_native_facts(PFN_vkGetInstanceProcAddr loader, const struct vkdu_memory_expectation *expected,
         const struct mwd_callbacks *callbacks, void *owner, struct vkdu_memory_facts *facts, vkdu_device **out);
 int32_t vkdu_memory_heap_import(vkdu_device *device, void *owner, void *token, uint64_t bytes,

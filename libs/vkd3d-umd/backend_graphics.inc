@@ -116,6 +116,43 @@ static HRESULT vkdu_signature_write(uint32_t *chunk, uint32_t stage, int output,
     }
     return S_OK;
 }
+/* SM6: the DDI hands over the DXIL program part (version, size, 'DXIL'
+ * bitcode header, bitcode). Wrap it with the runtime's signatures; the
+ * embedded vkd3d-proton selects dxil-spirv by the DXIL chunk. Interstage
+ * locations come from the bitcode's own signature metadata. */
+int vkdu_shader_is_dxil(const uint32_t *tokens, uint32_t words)
+{
+    return tokens && words >= 6 && ((tokens[0] >> 4) & 15) >= 6 && tokens[2] == 0x4c495844;
+}
+int32_t vkdu_dxil_container(uint32_t stage, const uint32_t *tokens, uint32_t words,
+        const struct vkdu_signature *inputs, uint32_t input_count,
+        const struct vkdu_signature *outputs, uint32_t output_count, void **code, size_t *size)
+{
+    uint32_t *container, offset, lengths[2], count;
+    HRESULT hr;
+    if (!code || !size) return E_POINTER;
+    *code = NULL; *size = 0;
+    if (!vkdu_shader_is_dxil(tokens, words) || tokens[1] != words || words > 16 * 1024 * 1024 ||
+            (tokens[0] >> 16) != stage || input_count > 32 || output_count > 32 ||
+            (input_count && !inputs) || (output_count && !outputs))
+        return E_INVALIDARG;
+    lengths[0] = 8 + input_count * 40; lengths[1] = 8 + output_count * 40;
+    count = 11 + 2 + lengths[0] / 4 + 2 + lengths[1] / 4 + 2 + words;
+    if (!(container = calloc(count, 4))) return E_OUTOFMEMORY;
+    container[0] = 0x43425844; container[5] = 1; container[6] = count * 4; container[7] = 3;
+    offset = 11; container[8] = offset * 4; container[offset] = 0x4e475349; container[offset + 1] = lengths[0];
+    hr = vkdu_signature_write(container + offset + 2, stage, 0, inputs, input_count);
+    offset += 2 + lengths[0] / 4; container[9] = offset * 4;
+    container[offset] = 0x4e47534f; container[offset + 1] = lengths[1];
+    if (SUCCEEDED(hr)) hr = vkdu_signature_write(container + offset + 2, stage, 1, outputs, output_count);
+    offset += 2 + lengths[1] / 4; container[10] = offset * 4;
+    container[offset] = 0x4c495844; container[offset + 1] = words * 4;
+    memcpy(container + offset + 2, tokens, words * 4);
+    if (FAILED(hr)) { vkdu_trace("dxil: signature write hr=%08x stage=%u", (unsigned)hr, stage); free(container); return hr; }
+    vkd3d_compute_dxbc_checksum(container, count * 4, container + 1);
+    *code = container; *size = count * 4;
+    return S_OK;
+}
 #include "backend_shader_stages.inc"
 #include "backend_tessellation.inc"
 int32_t vkdu_shader_dxbc(uint32_t stage, const uint32_t *tokens, uint32_t words,
@@ -128,6 +165,8 @@ int32_t vkdu_shader_dxbc(uint32_t stage, const uint32_t *tokens, uint32_t words,
     HRESULT hr;
     if (!code || !size) return E_POINTER;
     *code = NULL; *size = 0;
+    if (vkdu_shader_is_dxil(tokens, words))
+        return vkdu_dxil_container(stage, tokens, words, inputs, input_count, outputs, output_count, code, size);
     if (stage == 2) return vkdu_geometry_dxbc(tokens, words, inputs, input_count, outputs, output_count, code, size);
     if (stage > 1 || !tokens || words < 2 || words > 1024 * 1024 || tokens[1] != words ||
             (tokens[0] >> 16) != stage || ((tokens[0] & 255) != 0x50 && (tokens[0] & 255) != 0x51 &&
