@@ -330,6 +330,13 @@ void *vkdu_test_command_iface(vkdu_object *command)
 #endif
 void vkdu_device_destroy(vkdu_device *device)
 { if (device) { ID3D12Device_Release(device->object); free(device); } }
+uint32_t vkdu_device_shader_model(vkdu_device *device)
+{
+    D3D12_FEATURE_DATA_SHADER_MODEL data = {D3D_SHADER_MODEL_6_8};
+    if (!device || FAILED(ID3D12Device_CheckFeatureSupport(device->object, D3D12_FEATURE_SHADER_MODEL, &data, sizeof(data))))
+        return D3D_SHADER_MODEL_5_1;
+    return data.HighestShaderModel;
+}
 int32_t vkdu_device_status(vkdu_device *device)
 { return device ? ID3D12Device_GetDeviceRemovedReason(device->object) : E_INVALIDARG; }
 int32_t vkdu_device_remove(vkdu_device *device, int32_t reason)
@@ -1195,7 +1202,9 @@ int32_t vkdu_pipeline_create_tokens(vkdu_device *device, vkdu_object *root, cons
     bytes = (size_t)(11 + words) * 4;
     if (!(container = calloc(1, bytes))) return E_OUTOFMEMORY;
     container[0] = 0x43425844; container[5] = 1; container[6] = (uint32_t)bytes;
-    container[7] = 1; container[8] = 36; container[9] = 0x58454853; container[10] = words * 4;
+    /* SM6 compute arrives as the DXIL program part: same single-chunk shape. */
+    container[7] = 1; container[8] = 36; container[9] = vkdu_shader_is_dxil(tokens, words) ? 0x4c495844 : 0x58454853;
+    container[10] = words * 4;
     memcpy(container + 11, tokens, words * 4);
     vkd3d_compute_dxbc_checksum(container, bytes, container + 1);
     hr = vkdu_pipeline_create(device, root, container, bytes, out);

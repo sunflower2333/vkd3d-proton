@@ -98,6 +98,9 @@ struct NativeAdapter : NativeAdapterFacts {
     // Runtime handles of the filled command-list table copies; a driver
     // selects one per command list with pfnSetCommandListDDITableCb.
     std::array<D3D12DDI_HRTTABLE, 4> command_list_tables{};
+    // Highest D3D_SHADER_MODEL of the embedded device, learnt at CreateDevice
+    // (the runtime asks SHADER_MODELS only after a device exists).
+    std::atomic<uint32_t> shader_model{0};
 };
 std::mutex native_adapters_lock;
 std::unordered_map<void *, std::shared_ptr<NativeAdapter>> native_adapters;
@@ -213,7 +216,7 @@ HRESULT native_caps_impl(D3D12DDI_HADAPTER handle, const D3D12DDIARG_GETCAPS *ar
 // Bring-up answers for the R0 base capability families. Conservative: FL11_0,
 // binding/heap tier 1, no optional shader features, no tiled resources.
 // Returns S_FALSE for types handled by the regular path.
-HRESULT native_experimental_caps(const D3D12DDIARG_GETCAPS &request) {
+HRESULT native_experimental_caps(const D3D12DDIARG_GETCAPS &request, uint32_t shader_model) {
     auto put = [&](const void *value, size_t size) -> HRESULT {
         if (request.DataSize != size) return E_INVALIDARG;
         std::memcpy(request.pData, value, size);
@@ -300,11 +303,23 @@ HRESULT native_experimental_caps(const D3D12DDIARG_GETCAPS &request) {
         D3D12DDI_D3D12_SHADER_MODELS_DATA_0011 data;
         std::memcpy(&data, request.pData, sizeof(data));
         if (!data.pNumShaderModelsSupported) return E_INVALIDARG;
+        // DXIL reaches the embedded vkd3d-proton (dxil-spirv) in a container;
+        // list every released model up to what that device supports.
+        static const D3D12DDI_SHADER_MODEL models[] = {D3D12DDI_SHADER_MODEL_5_1_RELEASE_0011,
+            D3D12DDI_SHADER_MODEL_6_0_RELEASE_0011, D3D12DDI_SHADER_MODEL_6_1_RELEASE_0033,
+            D3D12DDI_SHADER_MODEL_6_2_RELEASE_0042, D3D12DDI_SHADER_MODEL_6_3_RELEASE_0054,
+            D3D12DDI_SHADER_MODEL_6_4_RELEASE_0062, D3D12DDI_SHADER_MODEL_6_5_RELEASE_0071,
+            D3D12DDI_SHADER_MODEL_6_6_RELEASE_0082, D3D12DDI_SHADER_MODEL_6_7_RELEASE_0093,
+            D3D12DDI_SHADER_MODEL_6_8_RELEASE_0108};
+        static const uint32_t api[] = {0x51, 0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68};
+        UINT count = 1;
+        while (count < ARRAYSIZE(models) && shader_model >= api[count]) ++count;
         if (data.pShaderModelsSupported) {
-            if (*data.pNumShaderModelsSupported < 1) return E_INVALIDARG;
-            data.pShaderModelsSupported[0] = D3D12DDI_SHADER_MODEL_5_1_RELEASE_0011;
+            if (*data.pNumShaderModelsSupported < count) return E_INVALIDARG;
+            for (UINT i = 0; i < count; ++i) data.pShaderModelsSupported[i] = models[i];
         }
-        *data.pNumShaderModelsSupported = 1;
+        *data.pNumShaderModelsSupported = count;
+        native_trace("SHADER_MODELS backend=%x count=%u", shader_model, count);
         return S_OK;
     }
     case D3D12DDICAPS_TYPE_0022_TEXTURE_LAYOUT: {
@@ -380,7 +395,7 @@ HRESULT native_caps_impl(D3D12DDI_HADAPTER handle, const D3D12DDIARG_GETCAPS *ar
     const auto request = *args;
     if (!request.pData || !request.DataSize) return E_INVALIDARG;
     if (native_experimental()) {
-        HRESULT experimental = native_experimental_caps(request);
+        HRESULT experimental = native_experimental_caps(request, native_adapter(handle)->shader_model.load());
         if (experimental != S_FALSE) return experimental;
     }
     if (request.Type != D3D12DDICAPS_TYPE_MEMORY_ARCHITECTURE) return DXGI_ERROR_UNSUPPORTED;
@@ -904,6 +919,10 @@ HRESULT native_create_device_impl(D3D12DDI_HADAPTER handle, const D3D12DDIARG_CR
             vkdu_device_create_shared(loader, &expected, &native_runtime_callbacks, ctx,
                 &ctx->native_memory_facts, &ctx->backend);
         native_trace("CreateDevice: vkdu_device_create_shared hr=%08x", (unsigned)hr);
+        if (SUCCEEDED(hr) && ctx->backend) {
+            NativeBackendCall call(ctx);
+            adapter->shader_model.store(vkdu_device_shader_model(ctx->backend));
+        }
         if (hr != S_OK && SUCCEEDED(hr)) hr = E_FAIL;
     }
     if (native_adapter(handle) != adapter || ctx->native_retiring) hr = DXGI_ERROR_DEVICE_REMOVED;
