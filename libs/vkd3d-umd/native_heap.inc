@@ -403,14 +403,36 @@ D3D12DDI_HEAP_AND_RESOURCE_SIZES APIENTRY native_heap_sizes(D3D12DDI_HDEVICE h,
     NativeHeapOperation op(context(h));
     D3D12DDI_HEAP_AND_RESOURCE_SIZES sizes{};
     if (op.live() && !heap) return native_child_sizes(op.ctx, resource);
-    if (op.live() && op.ctx->kernel_callbacks.pfnDeallocate2Cb && SUCCEEDED(native_heap_desc(heap, resource))) {
-        sizes.Heap = sizeof(NativeHeapSlot);
-        if (resource) sizes.Resource = sizeof(Object);
-    }
+    // Private storage must always fit the driver objects: the runtime
+    // allocates exactly what is reported here before CreateHeapAndResource,
+    // which performs all descriptor validation (including driver-sized
+    // committed heaps whose ByteSize is UINT64_MAX).
+    sizes.Heap = sizeof(NativeHeapSlot);
+    if (resource) sizes.Resource = sizeof(Object);
     return sizes;
 }
 
+HRESULT native_heap_create_impl(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATEHEAP_0001 *args,
+        D3D12DDI_HHEAP slot, D3D12DDI_HRTRESOURCE runtime_resource,
+        const D3D12DDIARG_CREATERESOURCE_0003 *resource, const D3D12DDI_CLEAR_VALUES *clear,
+        D3D12DDI_HRESOURCE resource_slot);
 HRESULT APIENTRY native_heap_create(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATEHEAP_0001 *args,
+        D3D12DDI_HHEAP slot, D3D12DDI_HRTRESOURCE runtime_resource,
+        const D3D12DDIARG_CREATERESOURCE_0003 *resource, const D3D12DDI_CLEAR_VALUES *clear,
+        D3D12DDI_HRESOURCE resource_slot) {
+    if (args) native_trace("CreateHeapAndResource heap bytes=%llu align=%llu pool=%u cpu=%u flags=%x nodes=%u/%u",
+        (unsigned long long)args->ByteSize, (unsigned long long)args->Alignment, (unsigned)args->MemoryPool,
+        (unsigned)args->CPUPageProperty, (unsigned)args->Flags, args->CreationNodeMask, args->VisibleNodeMask);
+    if (resource) native_trace("  resource type=%u w=%llu h=%u d=%u mips=%u fmt=%u samples=%u/%u layout=%u flags=%x state=%x rowmajor=%p",
+        (unsigned)resource->ResourceType, (unsigned long long)resource->Width, resource->Height, resource->DepthOrArraySize,
+        resource->MipLevels, (unsigned)resource->Format, resource->SampleDesc.Count, resource->SampleDesc.Quality,
+        (unsigned)resource->Layout, (unsigned)resource->Flags, (unsigned)resource->InitialResourceState,
+        (const void *)resource->pRowMajorLayout);
+    const HRESULT hr = native_heap_create_impl(h, args, slot, runtime_resource, resource, clear, resource_slot);
+    native_trace("CreateHeapAndResource hr=%08x", (unsigned)hr);
+    return hr;
+}
+HRESULT native_heap_create_impl(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATEHEAP_0001 *args,
         D3D12DDI_HHEAP slot, D3D12DDI_HRTRESOURCE runtime_resource,
         const D3D12DDIARG_CREATERESOURCE_0003 *resource, const D3D12DDI_CLEAR_VALUES *clear,
         D3D12DDI_HRESOURCE resource_slot) {
@@ -419,6 +441,36 @@ HRESULT APIENTRY native_heap_create(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATE
     if (!args) return native_child_create(h, slot, resource, clear, resource_slot);
     NativeHeapOperation op(context(h));
     if (!op.live()) return DXGI_ERROR_DEVICE_REMOVED;
+    D3D12DDIARG_CREATEHEAP_0001 implicit_heap;
+    if (args->ByteSize == UINT64_MAX && resource) {
+        // Committed resource: the runtime leaves the heap size to the driver.
+        // Size the implicit heap to the resource's own allocation.
+        const bool is_texture = resource->ResourceType == D3D12DDI_RT_TEXTURE2D;
+        const bool is_rt = is_texture && (resource->Flags & D3D12DDI_RESOURCE_FLAG_0003_RENDER_TARGET);
+        const bool is_depth = is_texture && (resource->Flags & D3D12DDI_RESOURCE_FLAG_0003_DEPTH_STENCIL);
+        const auto implicit_shape = native_texture_shape(*resource);
+        uint64_t bytes = 0, alignment = 0;
+        HRESULT size_hr;
+        {
+            NativeBackendCall call(op.ctx);
+            size_hr = native_texture_subresources(*resource) ?
+                vkdu_texture2d_shape_allocation(op.ctx->backend, &implicit_shape, &bytes, &alignment) :
+                is_depth ? vkdu_depth_allocation(op.ctx->backend, static_cast<UINT>(resource->Width), resource->Height,
+                    resource->Format, &bytes, &alignment) :
+                is_rt ? vkdu_render_target_allocation_format(op.ctx->backend, static_cast<UINT>(resource->Width),
+                    resource->Height, resource->Format, &bytes, &alignment) :
+                is_texture ? vkdu_texture2d_allocation(op.ctx->backend, static_cast<UINT>(resource->Width), resource->Height,
+                    resource->Format, &bytes, &alignment) :
+                vkdu_buffer_allocation(op.ctx->backend, resource->Width, &bytes, &alignment);
+        }
+        if (!op.live()) return DXGI_ERROR_DEVICE_REMOVED;
+        if (FAILED(size_hr)) return size_hr;
+        if (!bytes || !alignment) return E_INVALIDARG;
+        implicit_heap = *args;
+        implicit_heap.Alignment = alignment;
+        implicit_heap.ByteSize = (bytes + alignment - 1) / alignment * alignment;
+        args = &implicit_heap;
+    }
     HRESULT hr = native_heap_desc(args, resource);
     if (FAILED(hr)) return hr;
     if (!op.ctx->kernel_callbacks.pfnDeallocate2Cb) return DXGI_ERROR_UNSUPPORTED;

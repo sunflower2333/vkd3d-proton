@@ -23,6 +23,9 @@ template<UINT Stage> void APIENTRY native_graphics_shader(D3D12DDI_HDEVICE h, co
     if (!sampler_operation_live(op)) { error(ctx, DXGI_ERROR_DEVICE_REMOVED); return; }
     if (!tokens || !signatures || flags || !belongs(ctx, root.pDrvPrivate) || !backend(root.pDrvPrivate, VKDU_ROOT) ||
             signatures->NumInputSignatureEntries > 32 || signatures->NumOutputSignatureEntries > 32) {
+        native_trace("CreateShader stage=%u rejected: tokens=%p sig=%p flags=%x root=%p belongs=%d",
+            Stage, (const void *)tokens, (const void *)signatures, (unsigned)flags, root.pDrvPrivate,
+            (int)belongs(ctx, root.pDrvPrivate));
         error(ctx, E_INVALIDARG); return;
     }
     const auto request = *signatures;
@@ -31,18 +34,28 @@ template<UINT Stage> void APIENTRY native_graphics_shader(D3D12DDI_HDEVICE h, co
         if (count && !src) return false;
         for (UINT i = 0; i < count; ++i) {
             if (src[i].MinPrecision != D3D11_SB_OPERAND_MIN_PRECISION_DEFAULT) return false;
-            dst[i] = {static_cast<UINT>(src[i].SystemValue), src[i].Register, src[i].Mask,
-                static_cast<UINT>(src[i].RegisterComponentType)};
+            UINT component = static_cast<UINT>(src[i].RegisterComponentType);
+            if (!component) {
+                // The runtime's own internal shaders leave the type UNKNOWN;
+                // derive it from the system value (D3D_NAME): index/ID values
+                // are uint32, everything else float32.
+                const UINT sv = static_cast<UINT>(src[i].SystemValue);
+                component = (sv == 4 || sv == 5 || sv == 6 || sv == 7 || sv == 8 || sv == 9 || sv == 10) ? 1u : 3u;
+            }
+            dst[i] = {static_cast<UINT>(src[i].SystemValue), src[i].Register, src[i].Mask, component};
         }
         return true;
     };
     if (!translate(request.pInputSignatureDeprecated, request.NumInputSignatureEntries, inputs) ||
             !translate(request.pOutputSignatureDeprecated, request.NumOutputSignatureEntries, outputs)) {
+        native_trace("CreateShader stage=%u rejected: signature min precision", Stage);
         error(ctx, E_INVALIDARG); return;
     }
     void *code = nullptr; size_t bytes = 0;
     HRESULT hr = vkdu_shader_dxbc(Stage, tokens, tokens[1], inputs, request.NumInputSignatureEntries,
             outputs, request.NumOutputSignatureEntries, &code, &bytes);
+    if (FAILED(hr)) native_trace("CreateShader stage=%u version=%08x words=%u in=%u out=%u: dxbc translate hr=%08x",
+        Stage, tokens[0], tokens[1], request.NumInputSignatureEntries, request.NumOutputSignatureEntries, (unsigned)hr);
     if (SUCCEEDED(hr)) hr = native_graphics_store(ctx, shader.pDrvPrivate, Stage == 1 ? 1 : Stage == 2 ? 7 : 2, code, bytes);
     vkdu_shader_dxbc_free(code); error(ctx, hr);
 }

@@ -12,13 +12,14 @@ static_assert(VKDU_FORMAT_SAMPLE == D3D12DDI_FORMAT_SUPPORT_SHADER_SAMPLE &&
     VKDU_FORMAT_UAV_READ == D3D12DDI_FORMAT_SUPPORT_UAV_READS, "WDK format contract");
 template<class Query> void native_format_query(D3D12DDI_HDEVICE h, UINT *out, Query query) {
     NativeHeapOperation op(context(h));
-    if (!out) { error(op.ctx, E_INVALIDARG); return; }
-    if (!sampler_operation_live(op)) { error(op.ctx, DXGI_ERROR_DEVICE_REMOVED); return; }
+    if (!out) { native_trace("format query: null output"); error(op.ctx, E_INVALIDARG); return; }
+    if (!sampler_operation_live(op)) { native_trace("format query: operation not live"); error(op.ctx, DXGI_ERROR_DEVICE_REMOVED); return; }
     uint32_t value = 0; HRESULT hr;
     { NativeBackendCall call(op.ctx); hr = query(op.ctx->backend, &value); }
     if (SUCCEEDED(hr) && op.ctx->native_adapter) hr = native_heap_generation(op.ctx);
     if (!sampler_operation_live(op)) hr = DXGI_ERROR_DEVICE_REMOVED;
     if (SUCCEEDED(hr)) *out = value;
+    else native_trace("format query failed hr=%08x", (unsigned)hr);
     error(op.ctx, hr);
 }
 void APIENTRY native_format_support(D3D12DDI_HDEVICE h, DXGI_FORMAT format, UINT *out) {

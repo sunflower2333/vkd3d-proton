@@ -4,7 +4,36 @@
 #include <mutex>
 #include <unordered_map>
 
+#include <cstdarg>
+#include <cstdio>
+
 namespace {
+// Experimental public admission for bring-up against the real D3D12 runtime.
+// Default stays closed; VIOGPU_D3D12_EXPERIMENTAL=1 opens the version/table gate
+// and enables OutputDebugString tracing of runtime negotiation.
+bool native_env_flag(const char *name) {
+    char value[8]{};
+    const DWORD n = GetEnvironmentVariableA(name, value, sizeof(value));
+    return n && n < sizeof(value) && value[0] == '1';
+}
+bool native_experimental() {
+    static const bool enabled = native_env_flag("VIOGPU_D3D12_EXPERIMENTAL");
+    return enabled;
+}
+void native_trace(const char *format, ...) {
+    if (!native_experimental()) return;
+    char line[512];
+    va_list args;
+    va_start(args, format);
+    const int n = std::vsnprintf(line, sizeof(line) - 2, format, args);
+    va_end(args);
+    if (n < 0) return;
+    size_t len = std::strlen(line);
+    line[len] = '\n'; line[len + 1] = 0;
+    OutputDebugStringA("[viogpud3d12] ");
+    OutputDebugStringA(line);
+}
+
 struct NativeAdapter : NativeAdapterFacts {
     D3D12DDI_HRTADAPTER runtime{};
     D3DDDI_ADAPTERCALLBACKS callbacks{};
@@ -31,7 +60,7 @@ HRESULT native_query_adapter_facts(const NativeAdapter &adapter, NativeAdapterFa
     args.pPrivateDriverData = reply.data();
     args.PrivateDriverDataSize = expected_size;
     HRESULT hr = adapter.callbacks.pfnQueryAdapterInfoCb(adapter.runtime.handle, &args);
-    if (FAILED(hr)) return hr;
+    if (FAILED(hr)) { native_trace("QueryAdapterInfoCb size=%u hr=%08x", expected_size, (unsigned)hr); return hr; }
     if (args.PrivateDriverDataSize != expected_size || args.pPrivateDriverData != reply.data())
         return DXGI_ERROR_UNSUPPORTED;
     auto u32 = [&](size_t i) {
@@ -91,13 +120,16 @@ bool native_contract_complete() {
     const bool prerequisites = device.pfnCreateHeapAndResource && device.pfnCreateFence &&
         device.pfnMakeResident && queue.pfnSignalFence && queue.pfnWaitForFence &&
         commands.pfnDrawInstanced && commands.pfnDrawIndexedInstanced;
-    return prerequisites && false; // No complete native feature-level contract yet.
+    // No complete native feature-level contract yet; only the explicit
+    // experimental opt-in may publish the partial tables for bring-up.
+    return prerequisites && native_experimental();
 }
 
 HRESULT APIENTRY native_versions(D3D12DDI_HADAPTER handle, UINT32 *count, UINT64 *versions) {
     if (!native_adapter(handle) || !count) return E_INVALIDARG;
     const UINT32 capacity = *count;
     *count = native_contract_complete() ? 1u : 0u;
+    native_trace("GetSupportedVersions capacity=%u count=%u versions=%p", capacity, *count, (void *)versions);
     if (!versions || !*count) return S_OK;
     if (capacity < *count) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
     versions[0] = D3D12DDI_SUPPORTED_0003;
@@ -106,18 +138,113 @@ HRESULT APIENTRY native_versions(D3D12DDI_HADAPTER handle, UINT32 *count, UINT64
 
 HRESULT APIENTRY native_optional_tables(D3D12DDI_HADAPTER handle, UINT32 *count, D3D12DDI_TABLE_REQUEST *) {
     if (!native_adapter(handle) || !count) return E_INVALIDARG;
+    native_trace("GetOptionalDDITables capacity=%u", *count);
     *count = 0;
     return S_OK;
 }
 
 HRESULT native_adapter_memory_facts(D3D12DDI_HADAPTER handle, vkdu_memory_facts *output);
 
+HRESULT native_caps_impl(D3D12DDI_HADAPTER handle, const D3D12DDIARG_GETCAPS *args);
+// Bring-up answers for the R0 base capability families. Conservative: FL11_0,
+// binding/heap tier 1, no optional shader features, no tiled resources.
+// Returns S_FALSE for types handled by the regular path.
+HRESULT native_experimental_caps(const D3D12DDIARG_GETCAPS &request) {
+    auto put = [&](const void *value, size_t size) -> HRESULT {
+        if (request.DataSize != size) return E_INVALIDARG;
+        std::memcpy(request.pData, value, size);
+        return S_OK;
+    };
+    switch (static_cast<UINT>(request.Type)) {
+    case D3D12DDICAPS_TYPE_3DPIPELINESUPPORT: {
+        const D3D12DDI_3DPIPELINELEVEL level = D3D12DDI_3DPIPELINELEVEL_11_0;
+        return put(&level, sizeof(level));
+    }
+    case D3D12DDICAPS_TYPE_0081_3DPIPELINESUPPORT1: {
+        if (request.DataSize != sizeof(D3D12DDI_3DPIPELINESUPPORT1_DATA_0081)) return E_INVALIDARG;
+        D3D12DDI_3DPIPELINESUPPORT1_DATA_0081 data;
+        std::memcpy(&data, request.pData, sizeof(data));
+        data.MaximumDriverSupportedFeatureLevel = D3D12DDI_3DPIPELINELEVEL_11_0;
+        return put(&data, sizeof(data));
+    }
+    case D3D12DDICAPS_TYPE_SHADER: {
+        const D3D12DDI_SHADER_CAPS_0003 caps{};
+        return put(&caps, sizeof(caps));
+    }
+    case D3D12DDICAPS_TYPE_ARCHITECTURE_INFO: {
+        D3D12DDI_ARCHITECTURE_INFO_DATA info{};
+        info.TileBasedDeferredRenderer = TRUE;
+        return put(&info, sizeof(info));
+    }
+    case D3D12DDICAPS_TYPE_D3D12_OPTIONS: {
+        D3D12DDI_D3D12_OPTIONS_DATA_0003 options{};
+        options.ResourceBindingTier = D3D12DDI_RESOURCE_BINDING_TIER_1;
+        options.ConservativeRasterizationTier = D3D12DDI_CONSERVATIVE_RASTERIZATION_TIER_NOT_SUPPORTED;
+        options.TiledResourcesTier = D3D12DDI_TILED_RESOURCES_TIER_NOT_SUPPORTED;
+        options.CrossNodeSharingTier = D3D12DDI_CROSS_NODE_SHARING_TIER_NOT_SUPPORTED;
+        options.ResourceHeapTier = D3D12DDI_RESOURCE_HEAP_TIER_1;
+        return put(&options, sizeof(options));
+    }
+    case D3D12DDICAPS_TYPE_TEXTURE_LAYOUT: {
+        // Only the opaque UNDEFINED layout: no device-dependent or standard
+        // swizzles exposed to applications, no row-major textures.
+        if (request.DataSize == sizeof(D3D12DDI_TEXTURE_LAYOUT_CAPS_0001)) {
+            const D3D12DDI_TEXTURE_LAYOUT_CAPS_0001 caps{};
+            return put(&caps, sizeof(caps));
+        }
+        const D3D12DDI_TEXTURE_LAYOUT_CAPS caps{};
+        return put(&caps, sizeof(caps));
+    }
+    case D3D12DDICAPS_TYPE_TEXTURE_LAYOUT_SETS: {
+        // Row-major copy footprints: the API's own placement rules
+        // (512-byte offset, 256-byte pitch) are what vkCmdCopyBufferToImage
+        // paths are built for; report them for every functional unit.
+        if (!request.pInfo) return E_INVALIDARG;
+        UINT info[2];
+        std::memcpy(info, request.pInfo, sizeof(info));
+        if (info[0] != D3D12DDI_TL_ROW_MAJOR) return DXGI_ERROR_UNSUPPORTED;
+        D3D12DDI_ROW_MAJOR_LAYOUT_CAPS caps{};
+        for (auto &sub : caps.SubCaps) {
+            sub.MaxElementSize = 16;
+            sub.BaseOffsetAlignment = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
+            sub.PitchAlignment = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+            sub.DepthPitchAlignment = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+        }
+        caps.Flags = D3D12DDI_ROW_MAJOR_LAYOUT_FLAG_NONE;
+        return put(&caps, sizeof(caps));
+    }
+    case D3D12DDICAPS_TYPE_GPUVA_CAPS: {
+        D3D12DDI_GPUVA_CAPS_0004 caps{};
+        caps.MaxGPUVirtualAddressBitsPerResource = 40;
+        return put(&caps, sizeof(caps));
+    }
+    default:
+        return S_FALSE;
+    }
+}
 HRESULT APIENTRY native_caps(D3D12DDI_HADAPTER handle, const D3D12DDIARG_GETCAPS *args) {
+    const HRESULT hr = native_caps_impl(handle, args);
+    if (args) {
+        UINT first = 0;
+        if (args->pInfo) std::memcpy(&first, args->pInfo, sizeof(first));
+        UINT second = 0;
+        if (args->pInfo && args->Type == D3D12DDICAPS_TYPE_TEXTURE_LAYOUT_SETS)
+            std::memcpy(&second, static_cast<const UINT *>(args->pInfo) + 1, sizeof(second));
+        native_trace("GetCaps type=%u info=%u,%u size=%u hr=%08x", (unsigned)args->Type, first, second,
+            (unsigned)args->DataSize, (unsigned)hr);
+    }
+    return hr;
+}
+HRESULT native_caps_impl(D3D12DDI_HADAPTER handle, const D3D12DDIARG_GETCAPS *args) {
     if (!native_adapter(handle) || !args) return E_INVALIDARG;
     // Runtime callbacks may invalidate the request and node storage. Retain
     // only entry snapshots; the facts query separately validates registration.
     const auto request = *args;
     if (!request.pData || !request.DataSize) return E_INVALIDARG;
+    if (native_experimental()) {
+        HRESULT experimental = native_experimental_caps(request);
+        if (experimental != S_FALSE) return experimental;
+    }
     if (request.Type != D3D12DDICAPS_TYPE_MEMORY_ARCHITECTURE) return DXGI_ERROR_UNSUPPORTED;
     static_assert(sizeof(D3D12DDI_MEMORY_ARCHITECTURE_CAPS) == 12, "original R0 memory caps");
     if (!request.pInfo || request.DataSize != sizeof(D3D12DDI_MEMORY_ARCHITECTURE_CAPS)) return E_INVALIDARG;
@@ -143,7 +270,12 @@ HRESULT APIENTRY native_caps(D3D12DDI_HADAPTER handle, const D3D12DDIARG_GETCAPS
 HRESULT APIENTRY native_fill_table(D3D12DDI_HADAPTER handle, D3D12DDI_TABLE_TYPE type,
         void *table, SIZE_T bytes, UINT index, D3D12DDI_HRTTABLE) {
     if (!native_adapter(handle) || !table) return E_INVALIDARG;
-    if (index) return E_INVALIDARG;
+    // The runtime fills multi-instance tables (command lists) once per index;
+    // every instance receives the same entry points.
+    if (index && !(native_experimental() && type == D3D12DDI_TABLE_TYPE_COMMAND_LIST_3D)) {
+        native_trace("FillDDITable type=%u index=%u rejected", (unsigned)type, index);
+        return E_INVALIDARG;
+    }
     SIZE_T expected = 0;
     switch (type) {
         case D3D12DDI_TABLE_TYPE_DEVICE_CORE: expected = sizeof(D3D12DDI_DEVICE_FUNCS_CORE_0003); break;
@@ -151,6 +283,7 @@ HRESULT APIENTRY native_fill_table(D3D12DDI_HADAPTER handle, D3D12DDI_TABLE_TYPE
         case D3D12DDI_TABLE_TYPE_COMMAND_QUEUE_3D: expected = sizeof(D3D12DDI_COMMAND_QUEUE_FUNCS_CORE_0001); break;
         default: return DXGI_ERROR_UNSUPPORTED;
     }
+    native_trace("FillDDITable type=%u index=%u bytes=%zu expected=%zu", (unsigned)type, index, (size_t)bytes, (size_t)expected);
     if (bytes != expected) return E_INVALIDARG;
     // Leave caller memory untouched on failure, including tables with a newer
     // layout. Never let the runtime call a partially initialized callback table.
@@ -159,6 +292,16 @@ HRESULT APIENTRY native_fill_table(D3D12DDI_HADAPTER handle, D3D12DDI_TABLE_TYPE
     D3D12DDI_COMMAND_LIST_FUNCS_3D_0003 commands{};
     D3D12DDI_COMMAND_QUEUE_FUNCS_CORE_0001 queue{};
     VioGpuD3D12BridgeGetTables(&device, &commands, &queue);
+    if (native_experimental()) {
+        const void *source = type == D3D12DDI_TABLE_TYPE_DEVICE_CORE ? static_cast<const void *>(&device) :
+            type == D3D12DDI_TABLE_TYPE_COMMAND_LIST_3D ? static_cast<const void *>(&commands) : &queue;
+        const auto *slots = static_cast<void *const *>(source);
+        char nulls[400] = {};
+        size_t used = 0;
+        for (size_t i = 0; i < bytes / sizeof(void *) && used + 6 < sizeof(nulls); ++i)
+            if (!slots[i]) used += std::snprintf(nulls + used, sizeof(nulls) - used, " %zu", i);
+        native_trace("FillDDITable type=%u null slots:%s", (unsigned)type, nulls);
+    }
     if (type == D3D12DDI_TABLE_TYPE_DEVICE_CORE) std::memcpy(table, &device, bytes);
     else if (type == D3D12DDI_TABLE_TYPE_COMMAND_LIST_3D) std::memcpy(table, &commands, bytes);
     else std::memcpy(table, &queue, bytes);
@@ -166,12 +309,15 @@ HRESULT APIENTRY native_fill_table(D3D12DDI_HADAPTER handle, D3D12DDI_TABLE_TYPE
 }
 
 SIZE_T APIENTRY native_device_size(D3D12DDI_HADAPTER handle, const D3D12DDIARG_CALCPRIVATEDEVICESIZE *args) {
+    if (args) native_trace("CalcPrivateDeviceSize interface=%u version=%08x flags=%x", (unsigned)args->Interface,
+        (unsigned)args->Version, (unsigned)args->Flags);
     return native_adapter(handle) && args && native_version(args->Interface, args->Version, args->Flags)
         ? sizeof(NativeDevice) : 0;
 }
 
 void APIENTRY native_report(void *opaque, HRESULT hr) {
     auto *ctx = static_cast<Context *>(opaque);
+    native_trace("SetErrorCb hr=%08x caller=%p", (unsigned)hr, __builtin_return_address(0));
     if (ctx->runtime_device.handle && ctx->runtime_callbacks.pfnSetErrorCb)
         ctx->runtime_callbacks.pfnSetErrorCb(ctx->runtime_device, hr);
 }
@@ -240,6 +386,7 @@ HRESULT native_adapter_memory_facts(D3D12DDI_HADAPTER handle, vkdu_memory_facts 
 #include "native_query_heap.inc"
 #include "native_residency.inc"
 #include "native_present.inc"
+#include "native_aux.inc"
 
 // error_mutex owns these lists. Compare opaque slots before dereferencing them.
 Object *native_submission_find(Object *head, void *slot) {
@@ -261,12 +408,15 @@ HRESULT native_queue_create(Context *ctx, const D3D12DDIARG_CREATECOMMANDQUEUE_0
     // R0 has no priority field. Never reinterpret a later queue revision.
     const auto request = *args;
     const auto type = command_type(request.QueueFlags);
+    native_trace("CreateCommandQueue enter flags=%x type=%x node=%x drv=%p rt=%p", (unsigned)request.QueueFlags, type,
+        request.NodeMask, request.hDrvCommandQueue.pDrvPrivate, request.hRTCommandQueue.handle);
     if (!request.hDrvCommandQueue.pDrvPrivate || !request.hRTCommandQueue.handle || type == UINT32_MAX ||
         native_submission_find(ctx->native_queue_objects, request.hDrvCommandQueue.pDrvPrivate) ||
         native_submission_find(ctx->native_command_objects, request.hDrvCommandQueue.pDrvPrivate)) return E_INVALIDARG;
     vkdu_object *value = nullptr;
     NativeRuntimeQueue *route = nullptr;
     HRESULT hr = native_runtime_queue_open(ctx, request.hRTCommandQueue, &route);
+    native_trace("CreateCommandQueue flags=%x runtime queue open hr=%08x", (unsigned)request.QueueFlags, (unsigned)hr);
     if (FAILED(hr)) return hr;
     {
         NativeBackendCall call(ctx);
@@ -397,12 +547,20 @@ void native_command_destroy(Context *ctx, Object *cmd) {
     release(ctx); // Drop the command-list owner; op still retains Context.
 }
 
+HRESULT native_create_device_impl(D3D12DDI_HADAPTER handle, const D3D12DDIARG_CREATEDEVICE_0003 *args);
 HRESULT APIENTRY native_create_device(D3D12DDI_HADAPTER handle, const D3D12DDIARG_CREATEDEVICE_0003 *args) {
+    if (args) native_trace("CreateDevice interface=%u version=%08x flags=%x", (unsigned)args->Interface,
+        (unsigned)args->Version, (unsigned)args->Flags);
+    const HRESULT hr = native_create_device_impl(handle, args);
+    native_trace("CreateDevice hr=%08x", (unsigned)hr);
+    return hr;
+}
+HRESULT native_create_device_impl(D3D12DDI_HADAPTER handle, const D3D12DDIARG_CREATEDEVICE_0003 *args) {
     auto adapter = native_adapter(handle);
     if (!adapter || !args || !args->hDrvDevice.pDrvPrivate || !args->hRTDevice.handle ||
             !args->pKTCallbacks || !args->p12UMCallbacks || !args->p12UMCallbacks->pfnSetErrorCb)
         return E_INVALIDARG;
-    if (!native_version(args->Interface, args->Version, args->Flags)) return DXGI_ERROR_UNSUPPORTED;
+    if (!native_version(args->Interface, args->Version, args->Flags)) { native_trace("CreateDevice: version rejected"); return DXGI_ERROR_UNSUPPORTED; }
     // The callback may close the adapter and invalidate the original inputs.
     const auto request = *args;
     const auto kernel_callbacks = *args->pKTCallbacks;
@@ -411,15 +569,21 @@ HRESULT APIENTRY native_create_device(D3D12DDI_HADAPTER handle, const D3D12DDIAR
     NativeAdapterFacts current_facts{};
     HRESULT hr = native_query_adapter_facts(*adapter, current_facts, true);
     if (native_adapter(handle) != adapter) return DXGI_ERROR_DEVICE_REMOVED;
-    if (FAILED(hr)) return hr;
+    if (FAILED(hr)) { native_trace("CreateDevice: queue-protocol facts hr=%08x", (unsigned)hr); return hr; }
     // The current owned-allocation KMD path requires cached-coherent memory;
     // a valid false fact is not permission to silently use another cache mode.
-    if (!native_owned_facts_valid(current_facts)) return DXGI_ERROR_UNSUPPORTED;
+    if (!native_owned_facts_valid(current_facts)) {
+        native_trace("CreateDevice: owned facts invalid coherent=%d/%d owned=%d/%d",
+            current_facts.has_cached_coherent_memory.known, current_facts.has_cached_coherent_memory.value,
+            current_facts.owned_allocations_only.known, current_facts.owned_allocations_only.value);
+        return DXGI_ERROR_UNSUPPORTED;
+    }
     if (!native_same_identity_facts(current_facts, *adapter)) return DXGI_ERROR_DEVICE_REMOVED;
     auto *ctx = new (std::nothrow) Context;
     if (!ctx) return E_OUTOFMEMORY;
     PFN_vkGetInstanceProcAddr loader = nullptr;
     hr = native_load_vulkan(&ctx->vulkan_module, &loader);
+    if (FAILED(hr)) native_trace("CreateDevice: load vulkan hr=%08x", (unsigned)hr);
     if (native_adapter(handle) != adapter) hr = DXGI_ERROR_DEVICE_REMOVED;
     ctx->native_adapter = adapter;
     ctx->native_facts = current_facts;
@@ -435,6 +599,7 @@ HRESULT APIENTRY native_create_device(D3D12DDI_HADAPTER handle, const D3D12DDIAR
         const auto expected = native_memory_expectation(current_facts);
         hr = vkdu_device_create_shared(loader, &expected, &native_runtime_callbacks, ctx,
                 &ctx->native_memory_facts, &ctx->backend);
+        native_trace("CreateDevice: vkdu_device_create_shared hr=%08x", (unsigned)hr);
         if (hr != S_OK && SUCCEEDED(hr)) hr = E_FAIL;
     }
     if (native_adapter(handle) != adapter || ctx->native_retiring) hr = DXGI_ERROR_DEVICE_REMOVED;
@@ -519,6 +684,7 @@ extern "C" HRESULT APIENTRY OpenAdapter12(D3D12DDIARG_OPENADAPTER *args) {
         adapter->runtime = args->hRTAdapter;
         adapter->callbacks = *args->pAdapterCallbacks;
         HRESULT hr = native_query_adapter_facts(*adapter, *adapter);
+        native_trace("OpenAdapter12 facts hr=%08x", (unsigned)hr);
         if (FAILED(hr)) return hr;
         {
             std::lock_guard<std::mutex> lock(native_adapters_lock);

@@ -8,6 +8,8 @@
 #include "vkd3d_shader.h"
 #include "backend.h"
 #include <stdlib.h>
+#include <stdio.h>
+#include <stdarg.h>
 #include <string.h>
 #include <math.h>
 #ifndef _WIN32
@@ -107,6 +109,25 @@ static int32_t wrap(vkdu_device *device, enum vkdu_kind kind, HRESULT hr, IUnkno
     return S_OK;
 }
 
+#ifdef _WIN32
+static void vkdu_trace(const char *format, ...)
+{
+    char value[8] = {0}, line[512];
+    va_list args;
+    int n;
+    DWORD len = GetEnvironmentVariableA("VIOGPU_D3D12_EXPERIMENTAL", value, sizeof(value));
+    if (!len || len >= sizeof(value) || value[0] != '1') return;
+    va_start(args, format);
+    n = vsnprintf(line, sizeof(line) - 2, format, args);
+    va_end(args);
+    if (n < 0) return;
+    strcat(line, "\n");
+    OutputDebugStringA("[viogpud3d12:backend] ");
+    OutputDebugStringA(line);
+}
+#else
+static void vkdu_trace(const char *format, ...) { (void)format; }
+#endif
 #include "backend_memory_profile.inc"
 
 static int32_t select_physical_device(PFN_vkGetInstanceProcAddr loader, const struct vkdu_adapter *adapter,
@@ -183,7 +204,10 @@ static int32_t create_device(PFN_vkGetInstanceProcAddr loader, const struct vkdu
     HRESULT hr;
     if (!out) return E_POINTER;
     *out = NULL;
-    if (FAILED(hr = select_physical_device(loader, adapter, test_cpu, runtime_identity, &instance, &selected))) return hr;
+    if (FAILED(hr = select_physical_device(loader, adapter, test_cpu, runtime_identity, &instance, &selected))) {
+        vkdu_trace("create_device: select_physical_device hr=%08x", (unsigned)hr);
+        return hr;
+    }
     if (expected) {
         hr = vkdu_memory_facts_for_device(loader, vkd3d_instance_get_vk_instance(instance), selected, expected, &current);
         if (FAILED(hr)) goto done;
@@ -197,6 +221,7 @@ static int32_t create_device(PFN_vkGetInstanceProcAddr loader, const struct vkdu
     if (adapter) memcpy(&device_info.adapter_luid, adapter->luid, 8);
     hr = runtime ? vkd3d_create_device_wddm(&device_info, runtime, &IID_ID3D12Device, (void **)&device->object) :
                    vkd3d_create_device(&device_info, &IID_ID3D12Device, (void **)&device->object);
+    vkdu_trace("create_device: vkd3d_create_device%s hr=%08x", runtime ? "_wddm" : "", (unsigned)hr);
     if (SUCCEEDED(hr) && vkd3d_get_vk_physical_device(device->object) != selected) {
         ID3D12Device_Release(device->object); device->object = NULL; hr = DXGI_ERROR_NOT_FOUND;
     }

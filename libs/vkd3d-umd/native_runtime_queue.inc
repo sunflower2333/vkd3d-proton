@@ -70,7 +70,7 @@ HRESULT native_runtime_queue_open(Context *ctx, D3D12DDI_HRTCOMMANDQUEUE runtime
             !native_same_identity_facts(current_facts, ctx->native_facts))
         return DXGI_ERROR_DEVICE_REMOVED;
     hr = native_heap_open_context(ctx);
-    if (FAILED(hr)) return hr;
+    if (FAILED(hr)) { native_trace("queue_open: heap context hr=%08x", (unsigned)hr); return hr; }
     auto *queue = new (std::nothrow) NativeRuntimeQueue;
     if (!queue) return E_OUTOFMEMORY;
     queue->runtime = runtime;
@@ -82,6 +82,9 @@ HRESULT native_runtime_queue_open(Context *ctx, D3D12DDI_HRTCOMMANDQUEUE runtime
     D3DDDICB_CREATECONTEXT args{};
     args.EngineAffinity = 1; args.pPrivateDriverData = &data; args.PrivateDriverDataSize = sizeof(data);
     hr = ctx->runtime_callbacks.pfnCreateContextCb(runtime, &args);
+    native_trace("queue_open: CreateContextCb hr=%08x ctx=%x cmd=%p/%u alloc=%p/%u patch=%p/%u", (unsigned)hr,
+        (unsigned)args.hContext, args.pCommandBuffer, args.CommandBufferSize, (void *)args.pAllocationList,
+        args.AllocationListSize, (void *)args.pPatchLocationList, args.PatchLocationListSize);
     queue->native_heap_context = args.hContext;
     if (ctx->native_retiring) hr = DXGI_ERROR_DEVICE_REMOVED;
     if (SUCCEEDED(hr) && (!args.hContext || !args.pCommandBuffer || !args.pAllocationList ||
@@ -96,6 +99,7 @@ HRESULT native_runtime_queue_open(Context *ctx, D3D12DDI_HRTCOMMANDQUEUE runtime
         escape.hDevice = ctx->runtime_device.handle; escape.hContext = args.hContext;
         escape.pPrivateDriverData = &info; escape.PrivateDriverDataSize = sizeof(info);
         hr = ctx->kernel_callbacks.pfnEscapeCb(ctx->native_adapter->runtime.handle, &escape);
+        native_trace("queue_open: context info escape hr=%08x", (unsigned)hr);
         if (ctx->native_retiring) hr = DXGI_ERROR_DEVICE_REMOVED;
     }
     if (SUCCEEDED(hr) && (!native_header_valid(info.header, sizeof(info)) || info.opcode != 1 || info.flags ||

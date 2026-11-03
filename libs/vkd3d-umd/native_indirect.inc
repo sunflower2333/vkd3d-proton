@@ -12,7 +12,7 @@ HRESULT indirect_signature_desc(const D3D12DDIARG_CREATE_COMMAND_SIGNATURE_0001 
 
 SIZE_T APIENTRY indirect_signature_size(D3D12DDI_HDEVICE h,
         const D3D12DDIARG_CREATE_COMMAND_SIGNATURE_0001 *args) {
-    return context(h) && SUCCEEDED(indirect_signature_desc(args)) ? sizeof(Object) : 0;
+    (void)h; (void)args; return sizeof(Object); // Create validates.
 }
 
 HRESULT APIENTRY indirect_signature_create(D3D12DDI_HDEVICE h,
