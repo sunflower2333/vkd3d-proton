@@ -33,8 +33,7 @@ NativeFence *native_fence_find(Context *ctx, void *slot) {
 
 SIZE_T APIENTRY native_fence_size(D3D12DDI_HDEVICE device,
         const D3D12DDIARG_CREATE_FENCE *args) {
-    NativeHeapOperation op(context(device));
-    return op.live() && SUCCEEDED(native_fence_description(args, nullptr)) ? sizeof(NativeFenceSlot) : 0;
+    (void)device; (void)args; return sizeof(NativeFenceSlot); // Create validates.
 }
 
 HRESULT APIENTRY native_fence_create(D3D12DDI_HDEVICE device,

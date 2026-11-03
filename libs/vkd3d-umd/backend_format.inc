@@ -7,8 +7,11 @@ int32_t vkdu_format_support(vkdu_device *device, uint32_t format, uint32_t *flag
     HRESULT hr;
     if (!device || !flags) return E_INVALIDARG;
     info.Format = format;
-    if (FAILED(hr = ID3D12Device_CheckFeatureSupport(device->object, D3D12_FEATURE_FORMAT_SUPPORT, &info, sizeof(info)))) return hr;
-    if (FAILED(hr = ID3D12Device_GetDeviceRemovedReason(device->object))) return hr;
+    hr = ID3D12Device_CheckFeatureSupport(device->object, D3D12_FEATURE_FORMAT_SUPPORT, &info, sizeof(info));
+    if (FAILED(ID3D12Device_GetDeviceRemovedReason(device->object))) return ID3D12Device_GetDeviceRemovedReason(device->object);
+    /* The embedded engine rejects formats it cannot translate. For the DDI
+     * that is "no support", not a device error. */
+    if (FAILED(hr)) { *flags = 0; return S_OK; }
     // Intersect the actual typed resource/view/copy implementation with Vulkan.
     if (format == DXGI_FORMAT_R32_FLOAT || vkdu_color_target_format(format)) {
         if (info.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE) value |= VKDU_FORMAT_SAMPLE;
@@ -39,9 +42,10 @@ int32_t vkdu_multisample_quality(vkdu_device *device, uint32_t format, uint32_t 
     if (!device || !levels || !samples || samples > 32 || flags > D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_TILED_RESOURCE)
         return E_INVALIDARG;
     info.Format = format; info.SampleCount = samples; info.Flags = flags;
-    if (FAILED(hr = ID3D12Device_CheckFeatureSupport(device->object, D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
-            &info, sizeof(info)))) return hr;
-    if (FAILED(hr = ID3D12Device_GetDeviceRemovedReason(device->object))) return hr;
+    hr = ID3D12Device_CheckFeatureSupport(device->object, D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
+            &info, sizeof(info));
+    if (FAILED(ID3D12Device_GetDeviceRemovedReason(device->object))) return ID3D12Device_GetDeviceRemovedReason(device->object);
+    if (FAILED(hr)) { *levels = 0; return S_OK; }
     *levels = !flags && samples == 1 && (format == DXGI_FORMAT_R32_FLOAT || vkdu_color_resource_format(format) ||
         vkdu_depth_format(format))
         ? info.NumQualityLevels : 0;

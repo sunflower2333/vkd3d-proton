@@ -50,9 +50,9 @@ HRESULT native_child_request(Context *ctx, const D3D12DDIARG_CREATERESOURCE_0003
 
 D3D12DDI_HEAP_AND_RESOURCE_SIZES native_child_sizes(Context *ctx,
         const D3D12DDIARG_CREATERESOURCE_0003 *resource) {
-    NativeBufferChild child;
-    if (!resource || FAILED(native_child_request(ctx, *resource, child, false))) return {};
-    return {0, sizeof(Object)};
+    // Fixed storage size; CreateHeapAndResource validates the request.
+    (void)ctx;
+    return {0, resource ? sizeof(Object) : 0};
 }
 
 bool native_child_slot_free(Context *ctx, void *slot) {

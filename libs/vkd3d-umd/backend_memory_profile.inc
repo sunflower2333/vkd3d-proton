@@ -33,7 +33,11 @@ int32_t vkdu_memory_facts_for_device(PFN_vkGetInstanceProcAddr loader, VkInstanc
             support.sType != MWD_STYPE_SUPPORT_V2 || support.pNext || !id.deviceLUIDValid ||
             id.deviceNodeMask != 1 || driver.driverID != VK_DRIVER_ID_MESA_TURNIP ||
             support.magic != MWD_RUNTIME_MAGIC || support.version != MWD_RUNTIME_ABI_VERSION ||
-            support.size != sizeof(struct mwd_callbacks) || support.flags != 1) return DXGI_ERROR_UNSUPPORTED;
+            support.size != sizeof(struct mwd_callbacks) || support.flags != 1) {
+        vkdu_trace("memory facts: properties chain rejected driverID=%u lluidValid=%u node=%u support.sType=%u magic=%x version=%u size=%u flags=%u",
+            driver.driverID, id.deviceLUIDValid, id.deviceNodeMask, support.sType, support.magic, support.version, support.size, support.flags);
+        return DXGI_ERROR_UNSUPPORTED;
+    }
     if (memcmp(id.deviceLUID, expected->luid, 8)) return DXGI_ERROR_DEVICE_REMOVED;
     mem.pNext = &raw;
     memory(physical, &mem);
@@ -42,7 +46,12 @@ int32_t vkdu_memory_facts_for_device(PFN_vkGetInstanceProcAddr loader, VkInstanc
             raw.version != MWD_MEMORY_PROFILE_VERSION || raw.size != sizeof(raw) ||
             raw.profile != MWD_MEMORY_PROFILE_OWNED_RUNTIME2 || raw.reserved[0] || raw.reserved[1] ||
             (raw.known_mask & ~MWD_MEMORY_KNOWN_MASK) || (raw.value_mask & ~raw.known_mask) ||
-            !raw.reset_generation || !memcmp(raw.luid, zero_luid, 8)) return DXGI_ERROR_UNSUPPORTED;
+            !raw.reset_generation || !memcmp(raw.luid, zero_luid, 8)) {
+        vkdu_trace("memory facts: profile rejected sType=%u magic=%x version=%u size=%u profile=%u known=%x value=%x gen=%llu",
+            raw.sType, raw.magic, raw.version, raw.size, raw.profile, raw.known_mask, raw.value_mask,
+            (unsigned long long)raw.reset_generation);
+        return DXGI_ERROR_UNSUPPORTED;
+    }
     if (memcmp(raw.luid, expected->luid, 8) || raw.reset_generation != expected->generation ||
             (expected->cached_coherent.known && (raw.known_mask & MWD_MEMORY_CACHED_COHERENT_AVAILABLE) &&
              !!(raw.value_mask & MWD_MEMORY_CACHED_COHERENT_AVAILABLE) != expected->cached_coherent.value))
@@ -70,6 +79,10 @@ int32_t vkdu_memory_facts_for_device(PFN_vkGetInstanceProcAddr loader, VkInstanc
         result.io_coherent.known = result.io_coherent.value = 1;
         result.cache_coherent.known = result.cache_coherent.value = 1;
     }
+    vkdu_trace("memory facts: known=%x value=%x expected coherent=%u/%u owned=%u/%u coherent_types=%x qualified=%d",
+        raw.known_mask, raw.value_mask, expected->cached_coherent.known, expected->cached_coherent.value,
+        expected->owned_allocations_only.known, expected->owned_allocations_only.value, result.coherent_cached_types,
+        vkdu_memory_facts_qualified(&result));
     *out = result;
     return S_OK;
 }

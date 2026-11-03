@@ -130,15 +130,28 @@ int32_t vkdu_shader_dxbc(uint32_t stage, const uint32_t *tokens, uint32_t words,
     *code = NULL; *size = 0;
     if (stage == 2) return vkdu_geometry_dxbc(tokens, words, inputs, input_count, outputs, output_count, code, size);
     if (stage > 1 || !tokens || words < 2 || words > 1024 * 1024 || tokens[1] != words ||
-            (tokens[0] >> 16) != stage || ((tokens[0] & 255) != 0x50 && (tokens[0] & 255) != 0x51) ||
+            (tokens[0] >> 16) != stage || ((tokens[0] & 255) != 0x50 && (tokens[0] & 255) != 0x51 &&
+             (tokens[0] & 255) != 0x40 && (tokens[0] & 255) != 0x41) ||
             input_count > 32 || output_count > 32 || (input_count && !inputs) || (output_count && !outputs))
         return E_INVALIDARG;
-    if (FAILED(hr = vkdu_graphics_declarations(tokens, words, masks, systems)) ||
-            FAILED(hr = vkdu_graphics_filter(inputs, input_count, masks[0], systems[0], input_entries, &filtered_inputs)) ||
-            FAILED(hr = vkdu_graphics_filter(outputs, output_count, masks[1], systems[1], output_entries, &filtered_outputs))) return hr;
+    if (FAILED(hr = vkdu_graphics_declarations(tokens, words, masks, systems))) {
+        uint32_t k; char dump[400]; size_t used = 0;
+        for (k = 0; k < words && k < 40 && used + 10 < sizeof(dump); ++k) used += snprintf(dump + used, sizeof(dump) - used, " %08x", tokens[k]);
+        vkdu_trace("shader_dxbc: declarations hr=%08x tokens:%s", (unsigned)hr, dump);
+        return hr;
+    }
+    if (FAILED(hr = vkdu_graphics_filter(inputs, input_count, masks[0], systems[0], input_entries, &filtered_inputs)) ||
+            FAILED(hr = vkdu_graphics_filter(outputs, output_count, masks[1], systems[1], output_entries, &filtered_outputs))) {
+        uint32_t k; char dump[400]; size_t used = 0;
+        for (k = 0; k < words && k < 40 && used + 10 < sizeof(dump); ++k) used += snprintf(dump + used, sizeof(dump) - used, " %08x", tokens[k]);
+        vkdu_trace("shader_dxbc: signature filter hr=%08x out0 sv=%u reg=%u mask=%x type=%u tokens:%s", (unsigned)hr,
+            output_count ? outputs[0].system_value : 0, output_count ? outputs[0].reg : 0,
+            output_count ? outputs[0].mask : 0, output_count ? outputs[0].component_type : 0, dump);
+        return hr;
+    }
     /* A UAV-only pixel shader legitimately has no output signature. Vertex
      * shaders still need their position output for this rasterization path. */
-    if (stage == 1 && !filtered_outputs) return E_INVALIDARG;
+    if (stage == 1 && !filtered_outputs) { vkdu_trace("shader_dxbc: VS without outputs"); return E_INVALIDARG; }
     inputs = input_entries; outputs = output_entries; input_count = filtered_inputs; output_count = filtered_outputs;
     lengths[0] = 8 + input_count * 40; lengths[1] = 8 + output_count * 40;
     count = 11 + 2 + lengths[0] / 4 + 2 + lengths[1] / 4 + 2 + words;
@@ -150,9 +163,10 @@ int32_t vkdu_shader_dxbc(uint32_t stage, const uint32_t *tokens, uint32_t words,
     container[offset] = 0x4e47534f; container[offset + 1] = lengths[1];
     if (SUCCEEDED(hr)) hr = vkdu_signature_write(container + offset + 2, stage, 1, outputs, output_count);
     offset += 2 + lengths[1] / 4; container[10] = offset * 4;
-    container[offset] = 0x58454853; container[offset + 1] = words * 4;
+    /* SM4.x token streams live in an SHDR chunk, SM5.x in SHEX. */
+    container[offset] = (tokens[0] & 255) >= 0x50 ? 0x58454853 : 0x52444853; container[offset + 1] = words * 4;
     memcpy(container + offset + 2, tokens, words * 4);
-    if (FAILED(hr)) { free(container); return hr; }
+    if (FAILED(hr)) { vkdu_trace("shader_dxbc: signature write hr=%08x", (unsigned)hr); free(container); return hr; }
     vkd3d_compute_dxbc_checksum(container, count * 4, container + 1);
     *code = container; *size = count * 4;
     return S_OK;

@@ -6,6 +6,7 @@
 #include <new>
 #include <memory>
 #include <mutex>
+#include <cstdio>
 #include <limits>
 #include "mesa_wddm_runtime.h"
 
@@ -46,6 +47,7 @@ void native_node_metadata_tables(D3D12DDI_DEVICE_FUNCS_CORE_0003 *);
 void native_residency_tables(D3D12DDI_DEVICE_FUNCS_CORE_0003 *);
 void native_present_tables(D3D12DDI_DEVICE_FUNCS_CORE_0003 *, D3D12DDI_COMMAND_LIST_FUNCS_3D_0003 *);
 void native_query_tables(D3D12DDI_COMMAND_LIST_FUNCS_3D_0003 *);
+void native_aux_tables(D3D12DDI_DEVICE_FUNCS_CORE_0003 *, D3D12DDI_COMMAND_LIST_FUNCS_3D_0003 *);
 HRESULT native_graphics_pipeline(Context *, const D3D12DDIARG_CREATE_PIPELINE_STATE_0001 *);
 HRESULT native_command_create(Context *, const D3D12DDIARG_CREATE_COMMAND_LIST_0001 *);
 void native_command_destroy(Context *, Object *);
@@ -219,6 +221,11 @@ void error(Object *value, HRESULT result) {
             const bool removed = result == DXGI_ERROR_DEVICE_REMOVED || result == DXGI_ERROR_DEVICE_RESET ||
                 result == DXGI_ERROR_DEVICE_HUNG || result == DXGI_ERROR_DRIVER_INTERNAL_ERROR;
             if (removed) ctx->last_error = result;
+            if (char flag[4]{}; GetEnvironmentVariableA("VIOGPU_D3D12_EXPERIMENTAL", flag, 4) == 1 && flag[0] == '1') {
+                char line[96];
+                std::snprintf(line, sizeof(line), "[viogpud3d12] SetCommandListErrorCb hr=%08x\n", (unsigned)result);
+                OutputDebugStringA(line);
+            }
             ctx->runtime_callbacks.pfnSetCommandListErrorCb(runtime, result);
             // The callback can retire the device as well as the command list.
             // error(Context) consults the retained, possibly detached report.
@@ -266,14 +273,20 @@ HRESULT finish(Context *ctx, void *memory, vkdu_object *value, vkdu_kind kind, H
     return result;
 }
 uint32_t command_type(D3D12DDI_COMMAND_QUEUE_FLAGS flags) {
-    if (flags == D3D12DDI_COMMAND_QUEUE_FLAG_3D) return 0;
-    if (flags == D3D12DDI_COMMAND_QUEUE_FLAG_COMPUTE) return 2;
-    if (flags == D3D12DDI_COMMAND_QUEUE_FLAG_COPY) return 3;
-    return UINT32_MAX;
+    // The runtime describes a queue by every engine class it can run: a
+    // DIRECT queue arrives as 3D|COMPUTE|COPY, a COMPUTE queue as
+    // COMPUTE|COPY. Select by the most capable class present.
+    const UINT engines = static_cast<UINT>(D3D12DDI_COMMAND_QUEUE_FLAG_3D) |
+        static_cast<UINT>(D3D12DDI_COMMAND_QUEUE_FLAG_COMPUTE) | static_cast<UINT>(D3D12DDI_COMMAND_QUEUE_FLAG_COPY);
+    const UINT value = static_cast<UINT>(flags);
+    if (!value || (value & ~engines)) return UINT32_MAX;
+    if (value & D3D12DDI_COMMAND_QUEUE_FLAG_3D) return 0;
+    if (value & D3D12DDI_COMMAND_QUEUE_FLAG_COMPUTE) return 2;
+    return 3;
 }
 uint32_t command_list_type(D3D12DDI_COMMAND_LIST_TYPE type, D3D12DDI_COMMAND_QUEUE_FLAGS flags) {
     if (type == D3D12DDI_COMMAND_LIST_TYPE_DIRECT) return command_type(flags);
-    if (type == D3D12DDI_COMMAND_LIST_TYPE_BUNDLE && flags == D3D12DDI_COMMAND_QUEUE_FLAG_3D) return 1;
+    if (type == D3D12DDI_COMMAND_LIST_TYPE_BUNDLE && (static_cast<UINT>(flags) & D3D12DDI_COMMAND_QUEUE_FLAG_3D)) return 1;
     return UINT32_MAX;
 }
 bool belongs(Context *ctx, void *memory) { auto *o = object(memory); return o && o->context == ctx; }
@@ -462,6 +475,12 @@ void APIENTRY set_table(D3D12DDI_HCOMMANDLIST c, UINT index, D3D12DDI_GPU_DESCRI
 SIZE_T APIENTRY queue_size(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATECOMMANDQUEUE_0001 *) { return sizeof(Object); }
 HRESULT APIENTRY queue_create(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATECOMMANDQUEUE_0001 *args) {
     auto *ctx = context(h); vkdu_object *value = nullptr;
+    if (char flag[4]{}; GetEnvironmentVariableA("VIOGPU_D3D12_EXPERIMENTAL", flag, 4) == 1 && flag[0] == '1') {
+        char line[200];
+        std::snprintf(line, sizeof(line), "[viogpud3d12] queue_create ctx=%p args=%p flags=%x node=%x\n", (void *)ctx,
+            (const void *)args, args ? (unsigned)args->QueueFlags : 0u, args ? args->NodeMask : 0u);
+        OutputDebugStringA(line);
+    }
     if (!ctx || !args || args->NodeMask > 1) return E_INVALIDARG;
     if (ctx->native_adapter) return native_queue_create(ctx, args);
     HRESULT hr = vkdu_queue_create(ctx->backend, command_type(args->QueueFlags), &value);
@@ -756,6 +775,7 @@ extern "C" HRESULT APIENTRY VioGpuD3D12BridgeGetTables(D3D12DDI_DEVICE_FUNCS_COR
     native_residency_tables(device);
     native_present_tables(device, commands);
     native_query_tables(commands);
+    native_aux_tables(device, commands);
     // Single-node fence metadata selects runtime external synchronization. It
     // neither imports monitored-fence GPUVA nor admits a complete D3D12 device.
     // Full graphics, residency, presentation and ordinary runtime proof remain.

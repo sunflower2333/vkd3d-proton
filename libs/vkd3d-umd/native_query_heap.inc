@@ -6,7 +6,7 @@ HRESULT native_query_desc(const D3D12DDIARG_CREATE_QUERY_HEAP_0001 *args) {
 }
 SIZE_T APIENTRY native_query_size(D3D12DDI_HDEVICE device,
         const D3D12DDIARG_CREATE_QUERY_HEAP_0001 *args) {
-    return context(device) && SUCCEEDED(native_query_desc(args)) ? sizeof(Object) : 0;
+    (void)device; (void)args; return sizeof(Object); // Create validates.
 }
 HRESULT APIENTRY native_query_create(D3D12DDI_HDEVICE device,
         const D3D12DDIARG_CREATE_QUERY_HEAP_0001 *args, D3D12DDI_HQUERYHEAP slot) {
