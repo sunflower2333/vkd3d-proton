@@ -267,6 +267,12 @@ int32_t vkdu_device_create_shared(PFN_vkGetInstanceProcAddr loader, const struct
     if (!expected || !facts) { if (out) *out = NULL; return E_INVALIDARG; }
     return create_shared(loader, expected->luid, callbacks, owner, 0, expected, facts, out);
 }
+int32_t vkdu_device_create_shared_native_facts(PFN_vkGetInstanceProcAddr loader, const struct vkdu_memory_expectation *expected,
+        const struct mwd_callbacks *callbacks, void *owner, struct vkdu_memory_facts *facts, vkdu_device **out)
+{
+    if (!expected || !facts) { if (out) *out = NULL; return E_INVALIDARG; }
+    return create_shared(loader, expected->luid, callbacks, owner, 1, expected, facts, out);
+}
 int32_t vkdu_device_create_shared_native(PFN_vkGetInstanceProcAddr loader, const uint8_t luid[8],
         const struct mwd_callbacks *callbacks, void *owner, vkdu_device **out)
 { return create_shared(loader, luid, callbacks, owner, 1, NULL, NULL, out); }
@@ -852,6 +858,27 @@ int32_t vkdu_allocator_reset(vkdu_object *allocator)
     HRESULT hr;
     if (!VALID(allocator, VKDU_ALLOCATOR) || allocator->bundle_recordings || allocator->bundle_users)
         return E_INVALIDARG;
+    /* The runtime signals application fences on its own queue context, so an
+     * application can legally reset after its fence completes but before the
+     * embedded fence worker has observed the same GPU completion. Give that
+     * worker a bounded chance to retire, or the reset is skipped and the
+     * allocator keeps every command buffer and upload chunk. */
+    {
+        ID3D12CommandAllocator *native = OBJ(ID3D12CommandAllocator, allocator);
+        if (vkd3d_wddm_allocator_pending(native))
+        {
+            LARGE_INTEGER freq, start, now;
+            unsigned int spins = 0;
+            QueryPerformanceFrequency(&freq); QueryPerformanceCounter(&start);
+            do {
+                Sleep(spins++ < 16 ? 0 : 1);
+                QueryPerformanceCounter(&now);
+            } while (vkd3d_wddm_allocator_pending(native) && now.QuadPart - start.QuadPart < freq.QuadPart / 4);
+            vkdu_trace("allocator reset waited %.3f ms pending=%u",
+                1000.0 * (double)(now.QuadPart - start.QuadPart) / (double)freq.QuadPart,
+                vkd3d_wddm_allocator_pending(native));
+        }
+    }
     hr = ID3D12CommandAllocator_Reset(OBJ(ID3D12CommandAllocator, allocator));
     if (SUCCEEDED(hr)) ++allocator->allocator_generation;
     return hr;

@@ -222,6 +222,8 @@ int32_t vkdu_device_create(PFN_vkGetInstanceProcAddr loader, const struct vkdu_a
 int32_t vkdu_device_create_runtime(PFN_vkGetInstanceProcAddr loader, const uint8_t luid[8], vkdu_device **out);
 int32_t vkdu_device_create_shared(PFN_vkGetInstanceProcAddr loader, const struct vkdu_memory_expectation *expected,
         const struct mwd_callbacks *callbacks, void *owner, struct vkdu_memory_facts *facts, vkdu_device **out);
+int32_t vkdu_device_create_shared_native_facts(PFN_vkGetInstanceProcAddr loader, const struct vkdu_memory_expectation *expected,
+        const struct mwd_callbacks *callbacks, void *owner, struct vkdu_memory_facts *facts, vkdu_device **out);
 int32_t vkdu_memory_heap_import(vkdu_device *device, void *owner, void *token, uint64_t bytes,
         int cpu_visible, vkdu_object **out);
 /* Buffer read states can be combined; write states must remain exclusive. */

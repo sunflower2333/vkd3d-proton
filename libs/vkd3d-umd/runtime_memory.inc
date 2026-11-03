@@ -186,7 +186,7 @@ int32_t native_runtime_submit_on_queue(void *owner, void *queue_token, uint32_t 
         QueueHold(Context *c, NativeRuntimeQueue *q) : ctx(c), queue(q) { if (queue) ++queue->users; }
         ~QueueHold() { if (queue) native_runtime_queue_release_record(ctx, queue); }
     } queue_hold(ctx, queue);
-    NativeContextBuffers *buffers = queue ? static_cast<NativeContextBuffers *>(queue) : ctx;
+    NativeContextBuffers *buffers = queue && !queue->proxy ? static_cast<NativeContextBuffers *>(queue) : ctx;
     if (!stream || size < 8 || size > 65536 || !refs || !count || count > 1024 ||
             !fence || ctx->native_submitting || !ctx->kernel_callbacks.pfnRenderCb) return E_INVALIDARG;
     if (ctx->native_reaping) return DXGI_ERROR_WAS_STILL_DRAWING;
@@ -318,7 +318,11 @@ int32_t native_runtime_submit_on_queue(void *owner, void *queue_token, uint32_t 
     if (queue) { ++queue->users; ++queue->submissions; }
     ctx->native_last_submitted = fence;
     ctx->native_submitting = true;
+    const bool hops = queue && queue->proxy;
+    HRESULT hop_hr = hops ? native_queue_hop(ctx, queue, true) : S_OK;
     hr = ctx->kernel_callbacks.pfnRenderCb(ctx->runtime_device.handle, &args);
+    if (hops && SUCCEEDED(hr)) hop_hr = native_queue_hop(ctx, queue, false);
+    if (SUCCEEDED(hr) && FAILED(hop_hr)) hr = hop_hr;
     native_trace("submit: RenderCb hr=%08x bytes=%u allocations=%u patches=%u", (unsigned)hr, (unsigned)bytes,
         allocation_count, owned_count);
     ctx->native_submitting = false;

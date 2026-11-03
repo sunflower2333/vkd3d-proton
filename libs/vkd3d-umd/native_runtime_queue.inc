@@ -5,7 +5,51 @@ struct NativeRuntimeQueue : NativeContextBuffers {
     D3D12DDI_HRTCOMMANDQUEUE runtime{};
     uint32_t users = 1, submissions = 0;
     bool pending = true, closing = false, preparing_present = false;
+    // Proxy queues (native surfaces): the runtime's queue owns a standard
+    // sync-only context. Native work runs on the single owner context, which
+    // the KMD requires for host-surface imports (no domain children). Two
+    // monitored fences order the runtime's queue packets against that work.
+    bool proxy = false;
+    D3DKMT_HANDLE hop_in = 0, hop_out = 0;
+    uint64_t hop_value = 0;
 };
+HRESULT native_queue_hop(Context *ctx, NativeRuntimeQueue *queue, bool before) {
+    // before: work already queued on the proxy (runtime waits) precedes ours.
+    // after: the runtime's following signals/presents follow our work.
+    auto &cb = ctx->kernel_callbacks;
+    if (!cb.pfnSignalSynchronizationObjectFromGpuCb || !cb.pfnWaitForSynchronizationObjectFromGpuCb)
+        return DXGI_ERROR_UNSUPPORTED;
+    const uint64_t value = ++queue->hop_value;
+    const D3DKMT_HANDLE fence = before ? queue->hop_in : queue->hop_out;
+    D3DDDICB_SIGNALSYNCHRONIZATIONOBJECTFROMGPU signal{};
+    signal.hContext = before ? queue->native_heap_context : ctx->native_heap_context;
+    signal.ObjectCount = 1; signal.ObjectHandleArray = &fence; signal.MonitoredFenceValueArray = &value;
+    HRESULT hr = cb.pfnSignalSynchronizationObjectFromGpuCb(ctx->runtime_device.handle, &signal);
+    if (FAILED(hr)) { native_trace("queue hop signal before=%d hr=%08x", before, (unsigned)hr); return hr; }
+    D3DDDICB_WAITFORSYNCHRONIZATIONOBJECTFROMGPU wait{};
+    wait.hContext = before ? ctx->native_heap_context : queue->native_heap_context;
+    wait.ObjectCount = 1; wait.ObjectHandleArray = &fence; wait.MonitoredFenceValueArray = &value;
+    hr = cb.pfnWaitForSynchronizationObjectFromGpuCb(ctx->runtime_device.handle, &wait);
+    if (FAILED(hr)) native_trace("queue hop wait before=%d hr=%08x", before, (unsigned)hr);
+    return hr;
+}
+HRESULT native_queue_hop_fence(Context *ctx, D3DKMT_HANDLE *out) {
+    if (!ctx->kernel_callbacks.pfnCreateSynchronizationObject2Cb) return DXGI_ERROR_UNSUPPORTED;
+    D3DDDICB_CREATESYNCHRONIZATIONOBJECT2 args{};
+    args.Info.Type = D3DDDI_MONITORED_FENCE;
+    args.Info.MonitoredFence.InitialFenceValue = 0;
+    args.Info.MonitoredFence.EngineAffinity = 0;
+    const HRESULT hr = ctx->kernel_callbacks.pfnCreateSynchronizationObject2Cb(ctx->runtime_device.handle, &args);
+    *out = SUCCEEDED(hr) ? args.hSyncObject : 0;
+    return SUCCEEDED(hr) && !*out ? E_FAIL : hr;
+}
+void native_queue_hop_destroy(Context *ctx, NativeRuntimeQueue *queue) {
+    for (auto *fence : {&queue->hop_in, &queue->hop_out}) {
+        if (!*fence || !ctx->kernel_callbacks.pfnDestroySynchronizationObjectCb) continue;
+        D3DDDICB_DESTROYSYNCHRONIZATIONOBJECT args{}; args.hSyncObject = *fence;
+        if (SUCCEEDED(ctx->kernel_callbacks.pfnDestroySynchronizationObjectCb(ctx->runtime_device.handle, &args))) *fence = 0;
+    }
+}
 
 NativeRuntimeQueue *native_runtime_queue_token(Context *ctx, void *token) {
     for (auto *queue = ctx->native_runtime_queues; queue; queue = queue->next)
@@ -51,6 +95,7 @@ HRESULT native_runtime_queue_close(Context *ctx, NativeRuntimeQueue *queue) {
     args.hContext = queue->native_heap_context;
     HRESULT hr = ctx->runtime_callbacks.pfnDestroyContextCb(runtime, &args);
     if (SUCCEEDED(hr)) queue->native_heap_context = nullptr;
+    if (queue->proxy) native_queue_hop_destroy(ctx, queue);
     return hr;
 }
 
@@ -75,6 +120,27 @@ HRESULT native_runtime_queue_open(Context *ctx, D3D12DDI_HRTCOMMANDQUEUE runtime
     if (!queue) return E_OUTOFMEMORY;
     queue->runtime = runtime;
     queue->next = ctx->native_runtime_queues; ctx->native_runtime_queues = queue;
+    if (ctx->native_surfaces) {
+        // No private data selects the KMD's standard context: never a domain
+        // child, so the owner context stays eligible for host-surface sharing.
+        queue->proxy = true;
+        D3DDDICB_CREATECONTEXT args{};
+        args.EngineAffinity = 1;
+        hr = ctx->runtime_callbacks.pfnCreateContextCb(runtime, &args);
+        native_trace("queue_open: proxy CreateContextCb hr=%08x ctx=%x", (unsigned)hr, (unsigned)(uintptr_t)args.hContext);
+        queue->native_heap_context = args.hContext;
+        if (ctx->native_retiring) hr = DXGI_ERROR_DEVICE_REMOVED;
+        if (SUCCEEDED(hr) && !args.hContext) hr = E_FAIL;
+        if (SUCCEEDED(hr)) hr = native_queue_hop_fence(ctx, &queue->hop_in);
+        if (SUCCEEDED(hr)) hr = native_queue_hop_fence(ctx, &queue->hop_out);
+        native_trace("queue_open: proxy fences hr=%08x in=%x out=%x", (unsigned)hr, queue->hop_in, queue->hop_out);
+        queue->pending = false;
+        if (SUCCEEDED(hr)) { *out = queue; return hr; }
+        native_runtime_queue_close(ctx, queue);
+        native_queue_hop_destroy(ctx, queue);
+        native_runtime_queue_release_record(ctx, queue);
+        return hr;
+    }
     NativeContextCreateShared data{};
     data.base.header = native_header(sizeof(data));
     data.base.generation = ctx->native_adapter->generation;

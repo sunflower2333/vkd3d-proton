@@ -18,6 +18,8 @@ HRESULT vkd3d_create_native_image_wddm(ID3D12Device *device, const D3D12_RESOURC
         void *owner, void *token, uint32_t stride, int preserve_contents, ID3D12Resource **resource);
 HRESULT vkd3d_wddm_queue_bind(ID3D12CommandQueue *queue, void *owner, void *token);
 HRESULT vkd3d_wddm_queue_drain_enqueue(ID3D12CommandQueue *queue);
+/* Submissions the fence worker has not yet retired for this allocator. */
+uint32_t vkd3d_wddm_allocator_pending(ID3D12CommandAllocator *allocator);
 /* Retained by the actual submission allocator through GPU completion/reset. */
 HRESULT vkd3d_wddm_command_retain_query(ID3D12GraphicsCommandList *command,
         ID3D12QueryHeap *heap, ID3D12Resource *destination);

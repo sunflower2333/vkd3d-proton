@@ -38,6 +38,25 @@ HRESULT native_surface_share(Context *ctx, NativeHeap *heap, uint32_t opcode, bo
     return returned_context == ctx->native_context_id && !std::memcmp(&expected, &info, sizeof(info)) ? S_OK : E_FAIL;
 }
 
+HRESULT native_lease_escape(Context *ctx, NativeSurfaceLeaseInfo &info) {
+    if (!ctx->kernel_callbacks.pfnEscapeCb || !ctx->native_adapter) return DXGI_ERROR_DEVICE_REMOVED;
+    // Adapter-scoped: the KMD rejects a device or context on opcodes 8/9.
+    D3DDDICB_ESCAPE args{};
+    args.pPrivateDriverData = &info; args.PrivateDriverDataSize = sizeof(info);
+    return ctx->kernel_callbacks.pfnEscapeCb(ctx->native_adapter->runtime.handle, &args);
+}
+HRESULT native_lease_free(Context *ctx, const NativeSurfaceLeaseInfo &lease) {
+    NativeSurfaceLeaseInfo request = lease;
+    request.header = native_header(sizeof(request)); request.flags = 0;
+    request.reserved2[0] = request.reserved2[1] = request.reserved2[2] = 0;
+    request.opcode = 9; request.expected = request.generation;
+    const auto expected = request;
+    HRESULT hr = native_lease_escape(ctx, request);
+    native_trace("native lease free key=%llu hr=%08x", (unsigned long long)lease.key, (unsigned)hr);
+    if (hr != S_OK) return FAILED(hr) ? hr : E_FAIL;
+    return !std::memcmp(&request, &expected, sizeof(request)) ? S_OK : E_FAIL;
+}
+
 HRESULT native_surface_cleanup(Context *ctx, NativeHeap *heap, bool retirement) {
     if (heap->pending || native_heap_residency_busy(heap)) return DXGI_ERROR_WAS_STILL_DRAWING;
     heap->pending = true;
@@ -71,6 +90,9 @@ HRESULT native_surface_cleanup(Context *ctx, NativeHeap *heap, bool retirement) 
             heap->runtime_resource = nullptr;
         }
     }
+    if (SUCCEEDED(hr) && heap->lease_owned && !heap->resource_created && !heap->allocation &&
+            native_lease_free(ctx, heap->lease) == S_OK)
+        heap->lease_owned = false; // A failed free leaves the KMD to collect it at process exit.
     if (!ctx->runtime_device.handle) hr = DXGI_ERROR_DEVICE_REMOVED;
     if (mapping) --mapping->closing;
     if (SUCCEEDED(hr)) { heap->native_key = 0; heap->native_mapping.reset(); }
@@ -89,7 +111,7 @@ HRESULT native_surface_import(Context *ctx, D3DKMT_HANDLE allocation, D3DKMT_HAN
             !size || size % 4096 || size > (UINT32_MAX & ~uint64_t(4095))) return E_INVALIDARG;
     HRESULT hr = native_heap_generation(ctx);
     if (SUCCEEDED(hr)) hr = native_heap_open_context(ctx);
-    if (FAILED(hr)) return hr;
+    if (FAILED(hr)) { native_trace("surface import: context hr=%08x", (unsigned)hr); return hr; }
     NativeHeap *existing = nullptr;
     for (auto *entry = ctx->native_heaps; entry; entry = entry->next) {
         if (entry->runtime_resource == runtime_resource ||
@@ -125,6 +147,7 @@ HRESULT native_surface_import(Context *ctx, D3DKMT_HANDLE allocation, D3DKMT_HAN
     escape.hDevice = ctx->runtime_device.handle;
     escape.pPrivateDriverData = &resolve; escape.PrivateDriverDataSize = sizeof(resolve);
     hr = ctx->kernel_callbacks.pfnEscapeCb(ctx->native_adapter->runtime.handle, &escape);
+    native_trace("surface import: resolve hr=%08x res=%x expected=%x", (unsigned)hr, resolve.resource, kernel_resource);
     if (!op.live()) hr = DXGI_ERROR_DEVICE_REMOVED;
     if (hr == S_OK) {
         const uint32_t returned_resource = resolve.resource;
@@ -136,6 +159,7 @@ HRESULT native_surface_import(Context *ctx, D3DKMT_HANDLE allocation, D3DKMT_HAN
         // until release or runtime context teardown resolves that uncertainty.
         heap->native_key = key; heap->native_uncertain = true;
         hr = native_surface_share(ctx, heap, 6);
+        native_trace("surface import: share(6) hr=%08x va=%llx", (unsigned)hr, (unsigned long long)heap->address);
         if (hr == S_OK) heap->native_uncertain = false;
     }
     if (SUCCEEDED(hr)) hr = native_heap_generation(ctx);
