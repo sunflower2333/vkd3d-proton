@@ -19,17 +19,21 @@ bool native_env_flag(const char *name) {
     const DWORD n = GetEnvironmentVariableA(name, value, sizeof(value));
     return n && n < sizeof(value) && value[0] == '1';
 }
+bool native_env_is(const char *name, char expected) {
+    char value[8]{};
+    const DWORD n = GetEnvironmentVariableA(name, value, sizeof(value));
+    return n && n < sizeof(value) && value[0] == expected;
+}
+// Public D3D12 admission is on by default for the packaged UMD;
+// VIOGPU_D3D12_EXPERIMENTAL=0 closes the version/table gate again.
 bool native_experimental() {
-    static const bool enabled = native_env_flag("VIOGPU_D3D12_EXPERIMENTAL");
+    static const bool enabled = !native_env_is("VIOGPU_D3D12_EXPERIMENTAL", '0');
     return enabled;
 }
 bool native_tracing() {
     // Experimental bring-up traces; VIOGPU_D3D12_TRACE=0 silences them for timing runs.
-    static const bool enabled = [] {
-        char value[8]{};
-        const DWORD n = GetEnvironmentVariableA("VIOGPU_D3D12_TRACE", value, sizeof(value));
-        return native_experimental() && !(n && n < sizeof(value) && value[0] == '0');
-    }();
+    // OutputDebugString bring-up traces only on request (VIOGPU_D3D12_TRACE=1).
+    static const bool enabled = native_env_is("VIOGPU_D3D12_TRACE", '1');
     return enabled;
 }
 /* Opt-in CPU timing (VIOGPU_D3D12_TIMING=1): accumulated QPC per phase,
@@ -517,8 +521,40 @@ void APIENTRY native_report(void *opaque, HRESULT hr) {
         ctx->runtime_callbacks.pfnSetErrorCb(ctx->runtime_device, hr);
 }
 
+// The packaged UMD ships its paired Turnip ICD (runtime ABI) beside itself.
+// Use it directly: no loader, no process environment, works elevated.
+HRESULT native_load_paired_icd(HMODULE *module, PFN_vkGetInstanceProcAddr *loader) {
+    HMODULE self = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(&native_load_paired_icd), &self)) return HRESULT_FROM_WIN32(GetLastError());
+    wchar_t path[MAX_PATH];
+    const DWORD n = GetModuleFileNameW(self, path, MAX_PATH);
+    if (!n || n >= MAX_PATH) return E_FAIL;
+    wchar_t *slash = wcsrchr(path, L'\\');
+    if (!slash || (slash - path) + 32 >= MAX_PATH) return E_FAIL;
+    wcscpy(slash + 1, L"viogpu_gl_vk_arm64.dll");
+    if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+    HMODULE icd = LoadLibraryExW(path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (!icd) return HRESULT_FROM_WIN32(GetLastError());
+    using Negotiate = VkResult (VKAPI_PTR *)(uint32_t *);
+    if (auto negotiate = reinterpret_cast<Negotiate>(GetProcAddress(icd, "vk_icdNegotiateLoaderICDInterfaceVersion"))) {
+        uint32_t version = 5;
+        if (negotiate(&version) != VK_SUCCESS) { FreeLibrary(icd); return DXGI_ERROR_UNSUPPORTED; }
+    }
+    auto entry = reinterpret_cast<PFN_vkGetInstanceProcAddr>(GetProcAddress(icd, "vk_icdGetInstanceProcAddr"));
+    if (!entry) { FreeLibrary(icd); return HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND); }
+    *module = icd; *loader = entry;
+    native_trace("Vulkan: paired ICD %ls", path);
+    return S_OK;
+}
+
 HRESULT native_load_vulkan(HMODULE *module, PFN_vkGetInstanceProcAddr *loader) {
     *module = nullptr; *loader = nullptr;
+    // An explicit loader configuration (development: VK_DRIVER_FILES) keeps
+    // the system loader; otherwise prefer the paired ICD shipped alongside.
+    char driver_files[4]{};
+    if (!GetEnvironmentVariableA("VK_DRIVER_FILES", driver_files, sizeof(driver_files)) &&
+            SUCCEEDED(native_load_paired_icd(module, loader))) return S_OK;
     // Match the active process ABI through the normal system Vulkan loader.
     // Do not search the application's working directory or mutate its DLL path.
     HMODULE loaded = LoadLibraryExW(L"vulkan-1.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);

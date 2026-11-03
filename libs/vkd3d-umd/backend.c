@@ -119,10 +119,8 @@ static void vkdu_trace(const char *format, ...)
     char value[8] = {0}, line[512];
     va_list args;
     int n;
-    DWORD len = GetEnvironmentVariableA("VIOGPU_D3D12_EXPERIMENTAL", value, sizeof(value));
+    DWORD len = GetEnvironmentVariableA("VIOGPU_D3D12_TRACE", value, sizeof(value));
     if (!len || len >= sizeof(value) || value[0] != '1') return;
-    len = GetEnvironmentVariableA("VIOGPU_D3D12_TRACE", value, sizeof(value));
-    if (len && len < sizeof(value) && value[0] == '0') return;
     va_start(args, format);
     n = vsnprintf(line, sizeof(line) - 2, format, args);
     va_end(args);
