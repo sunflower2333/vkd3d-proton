@@ -396,7 +396,7 @@ VOID APIENTRY d0108_pool_reset(D3D12DDI_HDEVICE h, D3D12DDI_HCOMMANDPOOL_0040 sl
     auto *pool = d0108_pool(slot.pDrvPrivate);
     if (!pool) { error(context(h), E_INVALIDARG); return; }
     for (auto *allocator : pool->allocators)
-        if (allocator) r0_device.pfnResetCommandAllocator({allocator});
+        if (allocator) { NativeTimed timed(NT_ALLOC_RESET); r0_device.pfnResetCommandAllocator({allocator}); }
 }
 SIZE_T APIENTRY d0108_recorder_size(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATE_COMMAND_RECORDER_0040 *) { return sizeof(D0108Recorder); }
 HRESULT APIENTRY d0108_recorder_create(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATE_COMMAND_RECORDER_0040 *args,

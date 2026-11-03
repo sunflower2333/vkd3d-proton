@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 /* Included by ddi.cpp: one Context and one set of production DDI functions. */
 #include <array>
+#include <atomic>
 #include <mutex>
 #include <unordered_map>
 #include <type_traits>
@@ -22,8 +23,63 @@ bool native_experimental() {
     static const bool enabled = native_env_flag("VIOGPU_D3D12_EXPERIMENTAL");
     return enabled;
 }
+bool native_tracing() {
+    // Experimental bring-up traces; VIOGPU_D3D12_TRACE=0 silences them for timing runs.
+    static const bool enabled = [] {
+        char value[8]{};
+        const DWORD n = GetEnvironmentVariableA("VIOGPU_D3D12_TRACE", value, sizeof(value));
+        return native_experimental() && !(n && n < sizeof(value) && value[0] == '0');
+    }();
+    return enabled;
+}
+/* Opt-in CPU timing (VIOGPU_D3D12_TIMING=1): accumulated QPC per phase,
+ * appended to C:\Users\Public\cc\d3d12-timing.txt every 600 frames. */
+enum NativeTimer { NT_EXECUTE, NT_SUBMIT, NT_RENDER, NT_HOP_BEFORE, NT_HOP_AFTER, NT_REAP, NT_FACTS, NT_PRESENT,
+    NT_ALLOC_RESET, NT_COUNT };
+struct NativeTiming {
+    std::atomic<uint64_t> ticks[NT_COUNT]{}, calls[NT_COUNT]{};
+    std::atomic<uint64_t> frames{0};
+    int64_t freq = 0;
+};
+NativeTiming &native_timing() { static NativeTiming t; return t; }
+bool native_timing_on() {
+    static const bool enabled = native_env_flag("VIOGPU_D3D12_TIMING");
+    return enabled;
+}
+struct NativeTimed {
+    NativeTimer which; int64_t start = 0;
+    explicit NativeTimed(NativeTimer w) : which(w) {
+        if (native_timing_on()) { LARGE_INTEGER v; QueryPerformanceCounter(&v); start = v.QuadPart; }
+    }
+    ~NativeTimed() {
+        if (!start) return;
+        LARGE_INTEGER v; QueryPerformanceCounter(&v);
+        auto &t = native_timing();
+        t.ticks[which] += uint64_t(v.QuadPart - start); ++t.calls[which];
+    }
+};
+void native_timing_frame() {
+    if (!native_timing_on()) return;
+    auto &t = native_timing();
+    const uint64_t frame = ++t.frames;
+    if (frame % 600) return;
+    if (!t.freq) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); t.freq = f.QuadPart; }
+    static const char *names[NT_COUNT] = {"execute", "submit", "render", "hop_before", "hop_after", "reap", "facts",
+        "present", "alloc_reset"};
+    char line[1024]; int n = std::snprintf(line, sizeof(line), "pid=%lu frames=%llu", GetCurrentProcessId(),
+        (unsigned long long)frame);
+    for (int i = 0; i < NT_COUNT; ++i) {
+        const uint64_t ticks = t.ticks[i].exchange(0), calls = t.calls[i].exchange(0);
+        n += std::snprintf(line + n, sizeof(line) - n, " %s=%llu/%.3fms", names[i], (unsigned long long)calls,
+            calls ? 1000.0 * double(ticks) / double(t.freq) / double(calls) : 0.0);
+    }
+    std::snprintf(line + n, sizeof(line) - n, "\r\n");
+    HANDLE f = CreateFileA("C:\\Users\\Public\\cc\\d3d12-timing.txt", FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f != INVALID_HANDLE_VALUE) { DWORD w = 0; WriteFile(f, line, (DWORD)std::strlen(line), &w, nullptr); CloseHandle(f); }
+}
 void native_trace(const char *format, ...) {
-    if (!native_experimental()) return;
+    if (!native_tracing()) return;
     char line[512];
     va_list args;
     va_start(args, format);
@@ -59,6 +115,7 @@ HRESULT native_query_adapter_facts(const NativeAdapter &adapter, NativeAdapterFa
     // trailer. Old KMDs write only160 bytes and leave its zeroed tail absent.
     // Never infer shared-domain support from a package or driver version.
     // Output-only callback: never encode a request in its output buffer.
+    NativeTimed timed(NT_FACTS);
     std::array<uint8_t, 192> reply{};
     const UINT expected_size = require_queue_protocol ? 192u : 160u;
     D3DDDICB_QUERYADAPTERINFO args{};
@@ -616,7 +673,7 @@ void native_queue_execute(Object *queue, UINT count, const D3D12DDI_HCOMMANDLIST
         // Copies and independent backend references outlive every runtime slot.
         // A backend callback may destroy queue/list/device and poison all slots.
         NativeBackendCall call(ctx);
-        if (SUCCEEDED(hr)) hr = vkdu_queue_execute(queue_backend, count, native);
+        if (SUCCEEDED(hr)) { NativeTimed timed(NT_EXECUTE); hr = vkdu_queue_execute(queue_backend, count, native); }
         for (UINT index = 0; index < retained; ++index) vkdu_object_destroy(native[index]);
         vkdu_object_destroy(queue_backend);
     }
