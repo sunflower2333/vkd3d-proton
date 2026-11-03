@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <cstdio>
+#include <cstdarg>
 #include <limits>
 #include "mesa_wddm_runtime.h"
 
@@ -493,11 +494,24 @@ void APIENTRY queue_destroy(D3D12DDI_HDEVICE h, D3D12DDI_HCOMMANDQUEUE q) {
     else error(ctx, E_INVALIDARG);
 }
 SIZE_T APIENTRY allocator_size(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATECOMMANDALLOCATOR *) { return sizeof(Object); }
+static void ddi_trace(const char *format, ...) {
+    char flag[4]{};
+    if (GetEnvironmentVariableA("VIOGPU_D3D12_EXPERIMENTAL", flag, 4) != 1 || flag[0] != '1') return;
+    char line[300] = "[viogpud3d12] ";
+    va_list args; va_start(args, format);
+    std::vsnprintf(line + 14, sizeof(line) - 16, format, args);
+    va_end(args);
+    std::strcat(line, "\n");
+    OutputDebugStringA(line);
+}
 HRESULT APIENTRY allocator_create(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATECOMMANDALLOCATOR *args) {
     auto *ctx = context(h); vkdu_object *value = nullptr;
+    if (args) ddi_trace("CreateCommandAllocator type=%u flags=%x", (unsigned)args->Type, (unsigned)args->QueueFlags);
     if (!ctx || !args || command_list_type(args->Type, args->QueueFlags) == UINT32_MAX) return E_INVALIDARG;
     HRESULT hr = vkdu_allocator_create(ctx->backend, command_list_type(args->Type, args->QueueFlags), &value);
-    return finish(ctx, args->hDrvCommandAllocator.pDrvPrivate, value, VKDU_ALLOCATOR, hr);
+    hr = finish(ctx, args->hDrvCommandAllocator.pDrvPrivate, value, VKDU_ALLOCATOR, hr);
+    ddi_trace("CreateCommandAllocator hr=%08x", (unsigned)hr);
+    return hr;
 }
 void APIENTRY allocator_destroy(D3D12DDI_HDEVICE h, D3D12DDI_HCOMMANDALLOCATOR a) {
     if (belongs(context(h), a.pDrvPrivate)) VioGpuD3D12BridgeUnbindObject(a.pDrvPrivate);
@@ -509,9 +523,12 @@ void APIENTRY allocator_reset(D3D12DDI_HCOMMANDALLOCATOR a) {
 SIZE_T APIENTRY command_size(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATE_COMMAND_LIST_0001 *) { return sizeof(Object); }
 HRESULT APIENTRY command_create(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATE_COMMAND_LIST_0001 *args) {
     auto *ctx = context(h); vkdu_object *value = nullptr;
+    if (args) ddi_trace("CreateCommandList type=%u flags=%x node=%x clflags=%x alloc_belongs=%d", (unsigned)args->Type,
+        (unsigned)args->QueueFlags, args->NodeMask, (unsigned)args->CommandListFlags,
+        ctx ? (int)belongs(ctx, args->hDrvCommandAllocator.pDrvPrivate) : -1);
     if (!ctx || !args || command_list_type(args->Type, args->QueueFlags) == UINT32_MAX || args->NodeMask > 1 || args->CommandListFlags ||
         !belongs(ctx, args->hDrvCommandAllocator.pDrvPrivate)) return E_INVALIDARG;
-    if (ctx->native_adapter) return native_command_create(ctx, args);
+    if (ctx->native_adapter) { HRESULT hr = native_command_create(ctx, args); ddi_trace("CreateCommandList hr=%08x", (unsigned)hr); return hr; }
     HRESULT hr = vkdu_command_create(ctx->backend, backend(args->hDrvCommandAllocator.pDrvPrivate, VKDU_ALLOCATOR), command_list_type(args->Type, args->QueueFlags), &value);
     return finish(ctx, args->hDrvCommandList.pDrvPrivate, value, VKDU_COMMAND_LIST, hr);
 }

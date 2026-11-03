@@ -3,6 +3,8 @@
 #include <array>
 #include <mutex>
 #include <unordered_map>
+#include <type_traits>
+#include <vector>
 
 #include <cstdarg>
 #include <cstdio>
@@ -37,6 +39,9 @@ void native_trace(const char *format, ...) {
 struct NativeAdapter : NativeAdapterFacts {
     D3D12DDI_HRTADAPTER runtime{};
     D3DDDI_ADAPTERCALLBACKS callbacks{};
+    // Runtime handles of the filled command-list table copies; a driver
+    // selects one per command list with pfnSetCommandListDDITableCb.
+    std::array<D3D12DDI_HRTTABLE, 4> command_list_tables{};
 };
 std::mutex native_adapters_lock;
 std::unordered_map<void *, std::shared_ptr<NativeAdapter>> native_adapters;
@@ -101,11 +106,13 @@ bool native_owned_facts_valid(const NativeAdapterFacts &facts) {
         facts.owned_allocations_only.known && facts.owned_allocations_only.value;
 }
 
+bool native_experimental();
 bool native_version(UINT interface_version, UINT runtime_version, D3D12DDI_CREATE_DEVICE_FLAGS flags) {
     // The only actual implemented table layouts. Never reinterpret newer tables.
-    return interface_version == D3D12DDI_INTERFACE_VERSION_R0 &&
-        (runtime_version >> 16) >= D3D12DDI_BUILD_VERSION &&
-        !(static_cast<UINT>(flags) & ~static_cast<UINT>(D3D12DDI_CREATE_DEVICE_FLAG_DISABLE_IMPLICIT_MGPU));
+    if (static_cast<UINT>(flags) & ~static_cast<UINT>(D3D12DDI_CREATE_DEVICE_FLAG_DISABLE_IMPLICIT_MGPU)) return false;
+    if (native_experimental())
+        return interface_version == D3D12DDI_INTERFACE_VERSION_R8 && (runtime_version >> 16) >= D3D12DDI_BUILD_VERSION_0110;
+    return interface_version == D3D12DDI_INTERFACE_VERSION_R0 && (runtime_version >> 16) >= D3D12DDI_BUILD_VERSION;
 }
 
 bool native_contract_complete() {
@@ -132,7 +139,7 @@ HRESULT APIENTRY native_versions(D3D12DDI_HADAPTER handle, UINT32 *count, UINT64
     native_trace("GetSupportedVersions capacity=%u count=%u versions=%p", capacity, *count, (void *)versions);
     if (!versions || !*count) return S_OK;
     if (capacity < *count) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
-    versions[0] = D3D12DDI_SUPPORTED_0003;
+    versions[0] = native_experimental() ? D3D12DDI_SUPPORTED_0110 : D3D12DDI_SUPPORTED_0003;
     return S_OK;
 }
 
@@ -168,8 +175,15 @@ HRESULT native_experimental_caps(const D3D12DDIARG_GETCAPS &request) {
         return put(&data, sizeof(data));
     }
     case D3D12DDICAPS_TYPE_SHADER: {
-        const D3D12DDI_SHADER_CAPS_0003 caps{};
-        return put(&caps, sizeof(caps));
+        // Revisions 0003/0012/0015/0042/0082/0084 append to the same prefix.
+        if (request.DataSize != 20 && request.DataSize != 36 && request.DataSize != 40 && request.DataSize != 44 &&
+                request.DataSize != 60 && request.DataSize != 64) return E_INVALIDARG;
+        D3D12DDI_SHADER_CAPS_0084 caps{};
+        // No optional shader features; wave intrinsics stay disabled, but the
+        // lane geometry is reported truthfully for the Adreno 830 (wave64).
+        caps.WaveLaneCountMin = 64; caps.WaveLaneCountMax = 64; caps.TotalLaneCount = 2048;
+        std::memcpy(request.pData, &caps, request.DataSize);
+        return S_OK;
     }
     case D3D12DDICAPS_TYPE_ARCHITECTURE_INFO: {
         D3D12DDI_ARCHITECTURE_INFO_DATA info{};
@@ -177,13 +191,22 @@ HRESULT native_experimental_caps(const D3D12DDIARG_GETCAPS &request) {
         return put(&info, sizeof(info));
     }
     case D3D12DDICAPS_TYPE_D3D12_OPTIONS: {
+        // Every revision (0003 ... 0089) appends to the 0003 prefix. Zero is
+        // "not supported" for every later tier/boolean (render passes,
+        // raytracing, mesh shaders, VRS, enhanced barriers, ...).
+        static const UINT sizes[] = {28, 32, 36, 40, 44, 52, 60, 64, 68, 72, 92, 100, 104, 108, 116, 120, 124};
+        bool known = false;
+        for (UINT size : sizes) known = known || request.DataSize == size;
+        if (!known) return E_INVALIDARG;
         D3D12DDI_D3D12_OPTIONS_DATA_0003 options{};
         options.ResourceBindingTier = D3D12DDI_RESOURCE_BINDING_TIER_1;
         options.ConservativeRasterizationTier = D3D12DDI_CONSERVATIVE_RASTERIZATION_TIER_NOT_SUPPORTED;
         options.TiledResourcesTier = D3D12DDI_TILED_RESOURCES_TIER_NOT_SUPPORTED;
         options.CrossNodeSharingTier = D3D12DDI_CROSS_NODE_SHARING_TIER_NOT_SUPPORTED;
         options.ResourceHeapTier = D3D12DDI_RESOURCE_HEAP_TIER_1;
-        return put(&options, sizeof(options));
+        std::memset(request.pData, 0, request.DataSize);
+        std::memcpy(request.pData, &options, sizeof(options));
+        return S_OK;
     }
     case D3D12DDICAPS_TYPE_TEXTURE_LAYOUT: {
         // Only the opaque UNDEFINED layout: no device-dependent or standard
@@ -212,6 +235,64 @@ HRESULT native_experimental_caps(const D3D12DDIARG_GETCAPS &request) {
         }
         caps.Flags = D3D12DDI_ROW_MAJOR_LAYOUT_FLAG_NONE;
         return put(&caps, sizeof(caps));
+    }
+    case D3D12DDICAPS_TYPE_0011_SHADER_MODELS: {
+        // Native DDI shaders reach the backend as SM4/SM5 token streams; DXIL
+        // (SM6) is not admitted through this path yet.
+        if (request.DataSize != sizeof(D3D12DDI_D3D12_SHADER_MODELS_DATA_0011)) return E_INVALIDARG;
+        D3D12DDI_D3D12_SHADER_MODELS_DATA_0011 data;
+        std::memcpy(&data, request.pData, sizeof(data));
+        if (!data.pNumShaderModelsSupported) return E_INVALIDARG;
+        if (data.pShaderModelsSupported) {
+            if (*data.pNumShaderModelsSupported < 1) return E_INVALIDARG;
+            data.pShaderModelsSupported[0] = D3D12DDI_SHADER_MODEL_5_1_RELEASE_0011;
+        }
+        *data.pNumShaderModelsSupported = 1;
+        return S_OK;
+    }
+    case D3D12DDICAPS_TYPE_0022_TEXTURE_LAYOUT: {
+        // Same answer as the R0 query: only the opaque layout, no device
+        // dependent or standard swizzles, no row-major textures.
+        if (request.DataSize != sizeof(D3D12DDI_TEXTURE_LAYOUT_CAPS_0026) &&
+                request.DataSize != sizeof(D3D12DDI_TEXTURE_LAYOUT_CAPS_0001)) return E_INVALIDARG;
+        std::memset(request.pData, 0, request.DataSize);
+        return S_OK;
+    }
+    case D3D12DDICAPS_TYPE_OPTIONS_0090:   // no relaxed format casting
+    case D3D12DDICAPS_TYPE_OPTIONS_0091:   // no unrestricted pitch/alignment, no inverted viewports
+    case D3D12DDICAPS_TYPE_OPTIONS_0093:   // no advanced texture ops / writable MSAA textures
+    case D3D12DDICAPS_TYPE_OPTIONS_0098:   // L1 not CPU accessible (UMA L0 only)
+    case D3D12DDICAPS_TYPE_OPTIONS_0101:   // no compute-only custom heaps
+    case D3D12DDICAPS_TYPE_OPTIONS_0109:   // no recreate-at
+    case D3D12DDICAPS_TYPE_OPTIONS_0110:   // execute indirect tier 1.0 (value 0)
+        if (request.DataSize > 64) return E_INVALIDARG;
+        std::memset(request.pData, 0, request.DataSize);
+        return S_OK;
+    case D3D12DDICAPS_TYPE_OPTIONS_0102: {
+        if (request.DataSize != sizeof(D3D12DDI_OPTIONS_DATA_0102)) return E_INVALIDARG;
+        D3D12DDI_OPTIONS_DATA_0102 limits{};
+        limits.SupportedSampleCountsWithNoOutputs = 1;
+        // The runtime requires >= 4000 at FL11+ (API shader-visible heaps stay <= 2048).
+        limits.MaxSamplerDescriptorHeapSize = 4000;
+        limits.MaxSamplerDescriptorHeapSizeWithStaticSamplers = 2048;
+        limits.MaxViewDescriptorHeapSize = 1000000;
+        return put(&limits, sizeof(limits));
+    }
+    case D3D12DDICAPS_TYPE_0022_CPU_PAGE_TABLE_FALSE_POSITIVES:  // queue flags: none
+    case D3D12DDICAPS_TYPE_0023_UMD_BASED_COMMAND_QUEUE_PRIORITY: // no global realtime queues
+    case D3D12DDICAPS_TYPE_0033_ADAPTER_COMPUTE_ONLY:             // full 3D adapter
+    case D3D12DDICAPS_TYPE_0050_HARDWARE_SCHEDULING_CAPS:         // no scheduling groups
+    case D3D12DDICAPS_TYPE_EXECUTECOMMANDLISTS_PARALLELISM:       // serialized execution
+    case D3D12DDICAPS_TYPE_0073_SUPPORT_BATCHED_MARKERS: {        // no batched markers
+        if (request.DataSize != 4) return E_INVALIDARG;
+        const UINT zero = 0;
+        return put(&zero, sizeof(zero));
+    }
+    case D3D12DDICAPS_TYPE_0074_PROTECTED_RESOURCE_SESSION_TYPE_COUNT: {
+        if (request.DataSize != sizeof(D3D12DDI_PROTECTED_RESOURCE_SESSION_TYPE_COUNT_DATA_0074)) return E_INVALIDARG;
+        auto *data = static_cast<D3D12DDI_PROTECTED_RESOURCE_SESSION_TYPE_COUNT_DATA_0074 *>(request.pData);
+        data->Count = 0;
+        return S_OK;
     }
     case D3D12DDICAPS_TYPE_GPUVA_CAPS: {
         D3D12DDI_GPUVA_CAPS_0004 caps{};
@@ -247,7 +328,10 @@ HRESULT native_caps_impl(D3D12DDI_HADAPTER handle, const D3D12DDIARG_GETCAPS *ar
     }
     if (request.Type != D3D12DDICAPS_TYPE_MEMORY_ARCHITECTURE) return DXGI_ERROR_UNSUPPORTED;
     static_assert(sizeof(D3D12DDI_MEMORY_ARCHITECTURE_CAPS) == 12, "original R0 memory caps");
-    if (!request.pInfo || request.DataSize != sizeof(D3D12DDI_MEMORY_ARCHITECTURE_CAPS)) return E_INVALIDARG;
+    const bool serialization_tiers = native_experimental() &&
+        request.DataSize == sizeof(D3D12DDI_MEMORY_ARCHITECTURE_CAPS_0041);
+    if (!request.pInfo || (request.DataSize != sizeof(D3D12DDI_MEMORY_ARCHITECTURE_CAPS) && !serialization_tiers))
+        return E_INVALIDARG;
     UINT node;
     std::memcpy(&node, request.pInfo, sizeof(node));
     if (node) return E_INVALIDARG;
@@ -261,14 +345,21 @@ HRESULT native_caps_impl(D3D12DDI_HADAPTER handle, const D3D12DDIARG_GETCAPS *ar
         facts.uma.value ? TRUE : FALSE,
         facts.io_coherent.value ? TRUE : FALSE,
         facts.cache_coherent.value ? TRUE : FALSE};
+    if (serialization_tiers) std::memset(request.pData, 0, request.DataSize); // heap/resource serialization tier 0
     std::memcpy(request.pData, &caps, sizeof(caps));
     // This metadata answer does not certify a complete native feature level.
     // Supported versions and public table publication remain closed.
     return S_OK;
 }
 
+void d0108_tables(D3D12DDI_DEVICE_FUNCS_CORE_0108 *, D3D12DDI_COMMAND_LIST_FUNCS_3D_0108 *);
+void d0108_extended_features(D3D12DDI_EXTENDED_FEATURES_FUNCS_0096 *);
+void d0110_device(D3D12DDI_DEVICE_FUNCS_CORE_0109 *);
 HRESULT APIENTRY native_fill_table(D3D12DDI_HADAPTER handle, D3D12DDI_TABLE_TYPE type,
-        void *table, SIZE_T bytes, UINT index, D3D12DDI_HRTTABLE) {
+        void *table, SIZE_T bytes, UINT index, D3D12DDI_HRTTABLE runtime_table) {
+    if (type == D3D12DDI_TABLE_TYPE_COMMAND_LIST_3D && index < 4) {
+        if (auto adapter = native_adapter(handle)) adapter->command_list_tables[index] = runtime_table;
+    }
     if (!native_adapter(handle) || !table) return E_INVALIDARG;
     // The runtime fills multi-instance tables (command lists) once per index;
     // every instance receives the same entry points.
@@ -277,11 +368,25 @@ HRESULT APIENTRY native_fill_table(D3D12DDI_HADAPTER handle, D3D12DDI_TABLE_TYPE
         return E_INVALIDARG;
     }
     SIZE_T expected = 0;
+    const bool r8 = native_experimental();
     switch (type) {
-        case D3D12DDI_TABLE_TYPE_DEVICE_CORE: expected = sizeof(D3D12DDI_DEVICE_FUNCS_CORE_0003); break;
-        case D3D12DDI_TABLE_TYPE_COMMAND_LIST_3D: expected = sizeof(D3D12DDI_COMMAND_LIST_FUNCS_3D_0003); break;
+        case D3D12DDI_TABLE_TYPE_DEVICE_CORE:
+            expected = r8 ? sizeof(D3D12DDI_DEVICE_FUNCS_CORE_0108) : sizeof(D3D12DDI_DEVICE_FUNCS_CORE_0003); break;
+        case D3D12DDI_TABLE_TYPE_COMMAND_LIST_3D:
+            expected = r8 ? sizeof(D3D12DDI_COMMAND_LIST_FUNCS_3D_0108) : sizeof(D3D12DDI_COMMAND_LIST_FUNCS_3D_0003); break;
         case D3D12DDI_TABLE_TYPE_COMMAND_QUEUE_3D: expected = sizeof(D3D12DDI_COMMAND_QUEUE_FUNCS_CORE_0001); break;
-        default: return DXGI_ERROR_UNSUPPORTED;
+        case D3D12DDI_TABLE_TYPE_0096_EXTENDED_FEATURES:
+            if (!r8 || bytes != sizeof(D3D12DDI_EXTENDED_FEATURES_FUNCS_0096)) return DXGI_ERROR_UNSUPPORTED;
+            {
+                D3D12DDI_EXTENDED_FEATURES_FUNCS_0096 features{};
+                d0108_extended_features(&features);
+                std::memcpy(table, &features, sizeof(features));
+            }
+            native_trace("FillDDITable type=27 extended features (none)");
+            return S_OK;
+        default:
+            native_trace("FillDDITable type=%u bytes=%zu unsupported", (unsigned)type, (size_t)bytes);
+            return DXGI_ERROR_UNSUPPORTED;
     }
     native_trace("FillDDITable type=%u index=%u bytes=%zu expected=%zu", (unsigned)type, index, (size_t)bytes, (size_t)expected);
     if (bytes != expected) return E_INVALIDARG;
@@ -292,6 +397,24 @@ HRESULT APIENTRY native_fill_table(D3D12DDI_HADAPTER handle, D3D12DDI_TABLE_TYPE
     D3D12DDI_COMMAND_LIST_FUNCS_3D_0003 commands{};
     D3D12DDI_COMMAND_QUEUE_FUNCS_CORE_0001 queue{};
     VioGpuD3D12BridgeGetTables(&device, &commands, &queue);
+    if (r8) {
+        D3D12DDI_DEVICE_FUNCS_CORE_0108 device8{};
+        D3D12DDI_COMMAND_LIST_FUNCS_3D_0108 commands8{};
+        d0108_tables(&device8, &commands8);
+        D3D12DDI_DEVICE_FUNCS_CORE_0109 device9{};
+        d0110_device(&device9);
+        std::memcpy(&device8, &device9, sizeof(device8));
+        const void *source = type == D3D12DDI_TABLE_TYPE_DEVICE_CORE ? static_cast<const void *>(&device8) :
+            type == D3D12DDI_TABLE_TYPE_COMMAND_LIST_3D ? static_cast<const void *>(&commands8) : &queue;
+        const auto *slots = static_cast<void *const *>(source);
+        char nulls[400] = {};
+        size_t used = 0;
+        for (size_t i = 0; i < bytes / sizeof(void *) && used + 6 < sizeof(nulls); ++i)
+            if (!slots[i]) used += std::snprintf(nulls + used, sizeof(nulls) - used, " %zu", i);
+        native_trace("FillDDITable 0108 type=%u null slots:%s", (unsigned)type, nulls);
+        std::memcpy(table, source, bytes);
+        return S_OK;
+    }
     if (native_experimental()) {
         const void *source = type == D3D12DDI_TABLE_TYPE_DEVICE_CORE ? static_cast<const void *>(&device) :
             type == D3D12DDI_TABLE_TYPE_COMMAND_LIST_3D ? static_cast<const void *>(&commands) : &queue;
@@ -504,6 +627,11 @@ void native_queue_execute(Object *queue, UINT count, const D3D12DDI_HCOMMANDLIST
 HRESULT native_command_create(Context *ctx, const D3D12DDIARG_CREATE_COMMAND_LIST_0001 *args) {
     NativeHeapOperation op(ctx);
     if (!op.live()) return DXGI_ERROR_DEVICE_REMOVED;
+    // The runtime binds a new list to its device-removed table until the
+    // driver selects one of the command-list tables it filled.
+    if (ctx->runtime_callbacks.pfnSetCommandListDDITableCb && ctx->native_adapter &&
+            ctx->native_adapter->command_list_tables[0].handle && args->hRTCommandList.handle)
+        ctx->runtime_callbacks.pfnSetCommandListDDITableCb(args->hRTCommandList, ctx->native_adapter->command_list_tables[0]);
     if (!args->hDrvCommandList.pDrvPrivate || !args->hRTCommandList.handle ||
             !ctx->runtime_callbacks.pfnSetCommandListErrorCb) return E_INVALIDARG;
     // Copy all runtime-owned input before a backend callback can retire it.
@@ -547,6 +675,96 @@ void native_command_destroy(Context *ctx, Object *cmd) {
     release(ctx); // Drop the command-list owner; op still retains Context.
 }
 
+// Interface R8 runtimes route allocation through the D3D12 core-layer
+// callbacks (0022) and leave the legacy kernel-thunk Allocate/Deallocate
+// slots NULL. Shim them so the native heap code keeps one allocation path.
+struct NativeUmAllocation {
+    PFND3D12DDI_ALLOCATE_CB_0022 allocate; PFND3D12DDI_DEALLOCATE_CB_0022 deallocate;
+    // Allocations made through the core-layer callback start non-resident;
+    // the native submission path references them directly, so make each one
+    // resident on a driver-owned paging queue before first use.
+    PFND3DDDI_CREATEPAGINGQUEUECB create_paging_queue;
+    PFND3DDDI_MAKERESIDENTCB make_resident;
+    PFND3DDDI_WAITFORSYNCHRONIZATIONOBJECTFROMCPUCB wait_cpu;
+    D3DKMT_HANDLE paging_queue, paging_fence;
+};
+std::mutex native_um_alloc_lock;
+std::unordered_map<HANDLE, NativeUmAllocation> native_um_alloc;
+bool native_um_lookup(HANDLE device, NativeUmAllocation &out) {
+    std::lock_guard<std::mutex> lock(native_um_alloc_lock);
+    auto found = native_um_alloc.find(device);
+    if (found == native_um_alloc.end()) return false;
+    out = found->second;
+    return true;
+}
+HRESULT APIENTRY native_shim_allocate(HANDLE device, D3DDDICB_ALLOCATE *args) {
+    NativeUmAllocation um{};
+    if (!args || !native_um_lookup(device, um) || !um.allocate) return E_INVALIDARG;
+    std::vector<D3D12DDI_ALLOCATION_INFO_0022> infos;
+    try { infos.resize(args->NumAllocations); } catch (...) { return E_OUTOFMEMORY; }
+    for (UINT i = 0; i < args->NumAllocations; ++i) {
+        const auto &a = args->pAllocationInfo[i];
+        infos[i].pSystemMem = a.pSystemMem;
+        infos[i].pPrivateDriverData = a.pPrivateDriverData;
+        infos[i].PrivateDriverDataSize = a.PrivateDriverDataSize;
+        infos[i].VidPnSourceId = a.VidPnSourceId;
+    }
+    D3D12DDICB_ALLOCATE_0022 request{};
+    request.pPrivateDriverData = args->pPrivateDriverData; request.PrivateDriverDataSize = args->PrivateDriverDataSize;
+    request.hResource = args->hResource; request.NumAllocations = args->NumAllocations;
+    request.pAllocationInfo = infos.data();
+    HRESULT hr = um.allocate(D3D12DDI_HRTDEVICE{device}, &request);
+    args->hKMResource = request.hKMResource;
+    for (UINT i = 0; i < args->NumAllocations; ++i) args->pAllocationInfo[i].hAllocation = infos[i].hAllocation;
+    if (FAILED(hr) || !args->NumAllocations || !um.make_resident) return hr;
+    if (!um.paging_queue && um.create_paging_queue) {
+        D3DDDICB_CREATEPAGINGQUEUE queue{};
+        queue.Priority = D3DDDI_PAGINGQUEUE_PRIORITY_NORMAL;
+        HRESULT queue_hr = um.create_paging_queue(device, &queue);
+        if (FAILED(queue_hr)) { native_trace("residency: CreatePagingQueue hr=%08x", (unsigned)queue_hr); return hr; }
+        std::lock_guard<std::mutex> lock(native_um_alloc_lock);
+        auto found = native_um_alloc.find(device);
+        if (found != native_um_alloc.end() && !found->second.paging_queue) {
+            found->second.paging_queue = queue.hPagingQueue; found->second.paging_fence = queue.hSyncObject;
+        }
+        um.paging_queue = found != native_um_alloc.end() ? found->second.paging_queue : queue.hPagingQueue;
+        um.paging_fence = found != native_um_alloc.end() ? found->second.paging_fence : queue.hSyncObject;
+    }
+    if (!um.paging_queue) return hr;
+    std::vector<D3DKMT_HANDLE> handles;
+    try { handles.resize(args->NumAllocations); } catch (...) { return E_OUTOFMEMORY; }
+    for (UINT i = 0; i < args->NumAllocations; ++i) handles[i] = infos[i].hAllocation;
+    D3DDDI_MAKERESIDENT resident{};
+    resident.hPagingQueue = um.paging_queue; resident.NumAllocations = args->NumAllocations;
+    resident.AllocationList = handles.data();
+    HRESULT resident_hr = um.make_resident(device, &resident);
+    if (resident_hr == E_PENDING && um.wait_cpu) {
+        D3DDDICB_WAITFORSYNCHRONIZATIONOBJECTFROMCPU wait{};
+        wait.ObjectCount = 1; wait.ObjectHandleArray = &um.paging_fence; wait.FenceValueArray = &resident.PagingFenceValue;
+        resident_hr = um.wait_cpu(device, &wait);
+    }
+    if (FAILED(resident_hr)) native_trace("residency: MakeResident hr=%08x", (unsigned)resident_hr);
+    return hr;
+}
+HRESULT APIENTRY native_shim_deallocate(HANDLE device, const D3DDDICB_DEALLOCATE *args) {
+    NativeUmAllocation um{};
+    if (!args || !native_um_lookup(device, um) || !um.deallocate) return E_INVALIDARG;
+    D3D12DDICB_DEALLOCATE_0022 request{};
+    request.hResource = args->hResource; request.NumAllocations = args->NumAllocations; request.HandleList = args->HandleList;
+    return um.deallocate(D3D12DDI_HRTDEVICE{device}, &request);
+}
+HRESULT APIENTRY native_shim_deallocate2(HANDLE device, const D3DDDICB_DEALLOCATE2 *args) {
+    NativeUmAllocation um{};
+    if (!args || !native_um_lookup(device, um) || !um.deallocate) return E_INVALIDARG;
+    D3D12DDICB_DEALLOCATE_0022 request{};
+    request.hResource = args->hResource; request.NumAllocations = args->NumAllocations; request.HandleList = args->HandleList;
+    UINT flags = 0;
+    if (args->Flags.AssumeNotInUse) flags |= D3D12DDI_DEALLOCATE_FLAGS_0022_ASSUME_NOT_IN_USE;
+    if (args->Flags.SynchronousDestroy) flags |= D3D12DDI_DEALLOCATE_FLAGS_0022_SYNCHRONOUS_DESTROY;
+    request.Flags = static_cast<D3D12DDI_DEALLOCATE_FLAGS_0022>(flags);
+    return um.deallocate(D3D12DDI_HRTDEVICE{device}, &request);
+}
+
 HRESULT native_create_device_impl(D3D12DDI_HADAPTER handle, const D3D12DDIARG_CREATEDEVICE_0003 *args);
 HRESULT APIENTRY native_create_device(D3D12DDI_HADAPTER handle, const D3D12DDIARG_CREATEDEVICE_0003 *args) {
     if (args) native_trace("CreateDevice interface=%u version=%08x flags=%x", (unsigned)args->Interface,
@@ -563,7 +781,32 @@ HRESULT native_create_device_impl(D3D12DDI_HADAPTER handle, const D3D12DDIARG_CR
     if (!native_version(args->Interface, args->Version, args->Flags)) { native_trace("CreateDevice: version rejected"); return DXGI_ERROR_UNSUPPORTED; }
     // The callback may close the adapter and invalidate the original inputs.
     const auto request = *args;
-    const auto kernel_callbacks = *args->pKTCallbacks;
+    auto kernel_callbacks = *args->pKTCallbacks;
+    if (args->Interface == D3D12DDI_INTERFACE_VERSION_R8 && args->p12UMCallbacks_0022 &&
+            (!kernel_callbacks.pfnAllocateCb || !kernel_callbacks.pfnDeallocateCb || !kernel_callbacks.pfnDeallocate2Cb)) {
+        try {
+            std::lock_guard<std::mutex> lock(native_um_alloc_lock);
+            native_um_alloc[args->hRTDevice.handle] = {args->p12UMCallbacks_0022->pfnAllocateCb,
+                args->p12UMCallbacks_0022->pfnDeallocateCb, kernel_callbacks.pfnCreatePagingQueueCb,
+                kernel_callbacks.pfnMakeResidentCb, kernel_callbacks.pfnWaitForSynchronizationObjectFromCpuCb, 0, 0};
+        } catch (...) { return E_OUTOFMEMORY; }
+        if (!kernel_callbacks.pfnAllocateCb) kernel_callbacks.pfnAllocateCb = native_shim_allocate;
+        if (!kernel_callbacks.pfnDeallocateCb) kernel_callbacks.pfnDeallocateCb = native_shim_deallocate;
+        if (!kernel_callbacks.pfnDeallocate2Cb) kernel_callbacks.pfnDeallocate2Cb = native_shim_deallocate2;
+    }
+    if (native_experimental()) {
+        const auto *slots = reinterpret_cast<void *const *>(args->pKTCallbacks);
+        char nulls[600] = {};
+        size_t used = 0;
+        for (size_t i = 0; i < sizeof(D3DDDI_DEVICECALLBACKS) / sizeof(void *) && used + 6 < sizeof(nulls); ++i)
+            if (!slots[i]) used += std::snprintf(nulls + used, sizeof(nulls) - used, " %zu", i);
+        native_trace("CreateDevice KT callbacks null slots:%s", nulls);
+        const auto *um = reinterpret_cast<void *const *>(args->p12UMCallbacks);
+        used = 0; nulls[0] = 0;
+        for (size_t i = 0; i < sizeof(D3D12DDI_CORELAYER_DEVICECALLBACKS_0062) / sizeof(void *) && used + 6 < sizeof(nulls); ++i)
+            if (!um[i]) used += std::snprintf(nulls + used, sizeof(nulls) - used, " %zu", i);
+        native_trace("CreateDevice UM callbacks null slots:%s", nulls);
+    }
     const auto runtime_callbacks = *args->p12UMCallbacks;
     // Never inspect uninitialized runtime-owned storage before constructing it.
     NativeAdapterFacts current_facts{};
@@ -670,6 +913,7 @@ HRESULT APIENTRY native_close_adapter(D3D12DDI_HADAPTER handle) {
     std::lock_guard<std::mutex> lock(native_adapters_lock);
     return native_adapters.erase(handle.pDrvPrivate) ? S_OK : E_INVALIDARG;
 }
+#include "ddi_0108.inc"
 }
 
 extern "C" HRESULT APIENTRY OpenAdapter12(D3D12DDIARG_OPENADAPTER *args) {

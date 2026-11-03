@@ -319,6 +319,8 @@ int32_t native_runtime_submit_on_queue(void *owner, void *queue_token, uint32_t 
     ctx->native_last_submitted = fence;
     ctx->native_submitting = true;
     hr = ctx->kernel_callbacks.pfnRenderCb(ctx->runtime_device.handle, &args);
+    native_trace("submit: RenderCb hr=%08x bytes=%u allocations=%u patches=%u", (unsigned)hr, (unsigned)bytes,
+        allocation_count, owned_count);
     ctx->native_submitting = false;
     submitted->pending = false;
     if (!op.live()) return DXGI_ERROR_DEVICE_REMOVED;
@@ -336,12 +338,16 @@ int32_t native_runtime_submit_on_queue(void *owner, void *queue_token, uint32_t 
 }
 int32_t MWD_CALL native_runtime_submit(void *owner, uint32_t fence, const void *stream, uint32_t size,
         const mwd_reference *refs, uint32_t count) {
-    return native_runtime_submit_on_queue(owner, nullptr, fence, stream, size, refs, count);
+    const int32_t hr = native_runtime_submit_on_queue(owner, nullptr, fence, stream, size, refs, count);
+    if (hr < 0) native_trace("submit fence=%u size=%u refs=%u hr=%08x", fence, size, count, (unsigned)hr);
+    return hr;
 }
 int32_t MWD_CALL native_runtime_submit_queue(void *owner, void *queue, uint32_t fence, const void *stream, uint32_t size,
         const mwd_reference *refs, uint32_t count) {
     if (!queue) return E_INVALIDARG;
-    return native_runtime_submit_on_queue(owner, queue, fence, stream, size, refs, count);
+    const int32_t hr = native_runtime_submit_on_queue(owner, queue, fence, stream, size, refs, count);
+    if (hr < 0) native_trace("submit_queue fence=%u size=%u refs=%u hr=%08x", fence, size, count, (unsigned)hr);
+    return hr;
 }
 static const mwd_callbacks native_runtime_callbacks = {
     MWD_RUNTIME_MAGIC, MWD_RUNTIME_ABI_VERSION, sizeof(mwd_callbacks), 0,
