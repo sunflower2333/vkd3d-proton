@@ -26725,6 +26725,13 @@ HRESULT vkd3d_wddm_queue_bind(ID3D12CommandQueue *iface, void *owner, void *toke
     return hr;
 }
 
+uint32_t vkd3d_wddm_allocator_pending(ID3D12CommandAllocator *iface)
+{
+    struct d3d12_command_allocator *allocator = impl_from_ID3D12CommandAllocator(iface);
+    const uint32_t refs = vkd3d_atomic_uint32_load_explicit(&allocator->internal_refcount, vkd3d_memory_order_acquire);
+    return refs > 1 ? refs - 1 : 0;
+}
+
 HRESULT vkd3d_wddm_queue_drain_enqueue(ID3D12CommandQueue *iface)
 {
     struct d3d12_command_queue *queue = impl_from_ID3D12CommandQueue(iface);

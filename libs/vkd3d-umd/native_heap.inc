@@ -29,6 +29,20 @@ struct NativeAllocationInfo {
 static_assert(sizeof(NativeContextCreate) == 32 && sizeof(NativeContextInfo) == 64, "v0 context ABI");
 static_assert(sizeof(NativeContextCreateShared) == 40, "shared domain context ABI");
 static_assert(sizeof(NativeAllocationInfo) == 80 && offsetof(NativeAllocationInfo, context_id) == 76, "v0 allocation ABI");
+#pragma pack(push, 4)
+/* Host surface lease (KMD escape opcodes 8/9), the creator half of the
+ * VIOGPU/DXVK native surface protocol. Same 128-byte wire as DXVK's
+ * NativeSurfaceInfo. */
+struct NativeSurfaceLeaseInfo {
+    NativeAbiHeader header;
+    uint32_t opcode, flags;
+    uint64_t expected, key, size, generation, modifier, offset;
+    uint32_t resource, context, width, height, fourcc;
+    uint32_t stride, planes, layout_flags;
+    uint64_t reserved2[3];
+};
+#pragma pack(pop)
+static_assert(sizeof(NativeSurfaceLeaseInfo) == 128, "native surface lease v0");
 constexpr uint64_t native_heap_alignment = 65536;
 static_assert((D3D12DDI_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER | D3D12DDI_RESOURCE_STATE_INDEX_BUFFER |
         D3D12DDI_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12DDI_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
@@ -62,6 +76,10 @@ struct NativeHeap {
     uint64_t native_key = 0;
     bool native_uncertain = false;
     std::shared_ptr<NativeSurfaceMapping> native_mapping;
+    // Creator-owned host surface lease (swapchain buffers). Freed only after
+    // the wrapper allocation is gone; the KMD retires the AHB after that.
+    NativeSurfaceLeaseInfo lease{};
+    bool lease_owned = false;
 };
 HRESULT native_surface_cleanup(Context *, NativeHeap *, bool);
 
@@ -343,6 +361,7 @@ void APIENTRY native_allocation_info(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREAT
     const bool texture = request.ResourceType == D3D12DDI_RT_TEXTURE2D;
     const UINT allowed = D3D12DDI_RESOURCE_OPTIMIZATION_FLAG_SHADER_RESOURCE |
         D3D12DDI_RESOURCE_OPTIMIZATION_FLAG_DETERMINISTIC |
+        (texture && op.ctx->native_surfaces ? static_cast<UINT>(D3D12DDI_RESOURCE_OPTIMIZATION_FLAG_PRIMARY) : 0u) |
         (texture ? 0u : static_cast<UINT>(D3D12DDI_RESOURCE_OPTIMIZATION_FLAG_UNORDERED_ACCESS));
     if (static_cast<UINT>(flags) & ~allowed) { error(op.ctx, DXGI_ERROR_UNSUPPORTED); return; }
     // Validate the same resource subset as creation, independently of its
@@ -416,6 +435,9 @@ HRESULT native_heap_create_impl(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATEHEAP
         D3D12DDI_HHEAP slot, D3D12DDI_HRTRESOURCE runtime_resource,
         const D3D12DDIARG_CREATERESOURCE_0003 *resource, const D3D12DDI_CLEAR_VALUES *clear,
         D3D12DDI_HRESOURCE resource_slot);
+HRESULT native_primary_create(D3D12DDI_HDEVICE device, const D3D12DDIARG_CREATEHEAP_0001 *args,
+        D3D12DDI_HHEAP heap_slot, D3D12DDI_HRTRESOURCE runtime, const D3D12DDIARG_CREATERESOURCE_0003 *resource,
+        D3D12DDI_HRESOURCE resource_slot);
 HRESULT APIENTRY native_heap_create(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATEHEAP_0001 *args,
         D3D12DDI_HHEAP slot, D3D12DDI_HRTRESOURCE runtime_resource,
         const D3D12DDIARG_CREATERESOURCE_0003 *resource, const D3D12DDI_CLEAR_VALUES *clear,
@@ -439,6 +461,8 @@ HRESULT native_heap_create_impl(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATEHEAP
     // Capture Resource GPU VA creates only a logical resource. It does not
     // create an allocation or acquire another runtime hResource association.
     if (!args) return native_child_create(h, slot, resource, clear, resource_slot);
+    if ((args->Flags & D3D12DDI_HEAP_FLAG_PRIMARY) && resource)
+        return native_primary_create(h, args, slot, runtime_resource, resource, resource_slot);
     NativeHeapOperation op(context(h));
     if (!op.live()) return DXGI_ERROR_DEVICE_REMOVED;
     D3D12DDIARG_CREATEHEAP_0001 implicit_heap;

@@ -500,6 +500,7 @@ HRESULT native_adapter_memory_facts(D3D12DDI_HADAPTER handle, vkdu_memory_facts 
 
 #include "native_heap.inc"
 #include "native_open.inc"
+#include "native_primary.inc"
 #include "native_buffer_child.inc"
 #include "native_samplers.inc"
 #include "native_textures.inc"
@@ -838,9 +839,12 @@ HRESULT native_create_device_impl(D3D12DDI_HADAPTER handle, const D3D12DDIARG_CR
         // Cross-context imported native surfaces require a separate lifetime
         // and ordering contract. ICD image support alone cannot grant that
         // KMD capability: keep native Open/Present/provider opt-in disabled.
-        ctx->native_surfaces = false;
+        ctx->native_surfaces = native_experimental();
         const auto expected = native_memory_expectation(current_facts);
-        hr = vkdu_device_create_shared(loader, &expected, &native_runtime_callbacks, ctx,
+        hr = ctx->native_surfaces ?
+            vkdu_device_create_shared_native_facts(loader, &expected, &native_runtime_callbacks, ctx,
+                &ctx->native_memory_facts, &ctx->backend) :
+            vkdu_device_create_shared(loader, &expected, &native_runtime_callbacks, ctx,
                 &ctx->native_memory_facts, &ctx->backend);
         native_trace("CreateDevice: vkdu_device_create_shared hr=%08x", (unsigned)hr);
         if (hr != S_OK && SUCCEEDED(hr)) hr = E_FAIL;

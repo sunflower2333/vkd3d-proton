@@ -9,10 +9,19 @@ void APIENTRY native_present(D3D12DDI_HCOMMANDLIST list, D3D12DDI_HCOMMANDQUEUE 
     if (out) *out = {};
     if (!command.value || !out || !args) { command.report(E_INVALIDARG); return; }
     const auto request = *args;
+    native_trace("Present surfaces=%u src=%p sub=%u dst=%p dstsub=%u dirty=%u priv=%u vidpn=%u flags=%x interval=%u comp=%u",
+        request.SurfacesToPresent, request.phSurfacesToPresent ? request.phSurfacesToPresent->hSurface.pDrvPrivate : nullptr,
+        request.phSurfacesToPresent ? request.phSurfacesToPresent->SubResourceIndex : 0u,
+        request.hDstResource.pDrvPrivate, request.DstSubResourceIndex, request.DirtyRects, request.PrivateDriverDataSize,
+        (unsigned)request.VidPnSourceID, (unsigned)request.Flags.Value, (unsigned)request.FlipInterval,
+        (unsigned)request.OptimizeForComposition);
     if (request.SurfacesToPresent != 1 || !request.phSurfacesToPresent ||
             request.DstSubResourceIndex || request.DirtyRects || request.pDirtyRects ||
-            request.PrivateDriverDataSize || request.pPrivateDriverData || request.VidPnSourceID ||
-            (request.Flags.Value & ~0x53u) || (request.Flags.Blt && request.Flags.Flip) ||
+            request.PrivateDriverDataSize || request.pPrivateDriverData ||
+            // Windowed flip-model presents to DWM carry no source (UNINITIALIZED).
+            (request.VidPnSourceID && request.VidPnSourceID != D3DDDI_ID_UNINITIALIZED) ||
+            // Blt, Flip, AllowTearing, AllowFlexibleRefresh, NoScanoutTransform.
+            (request.Flags.Value & ~0x73u) || (request.Flags.Blt && request.Flags.Flip) ||
             static_cast<UINT>(request.FlipInterval) > 4 ||
             (request.OptimizeForComposition != FALSE && request.OptimizeForComposition != TRUE)) {
         command.report(DXGI_ERROR_UNSUPPORTED); return;
@@ -24,7 +33,7 @@ void APIENTRY native_present(D3D12DDI_HCOMMANDLIST list, D3D12DDI_HCOMMANDQUEUE 
         command.report(E_INVALIDARG); return;
     }
     auto *ctx = command.op.ctx;
-    if (!ctx->native_surfaces) { command.report(DXGI_ERROR_UNSUPPORTED); return; }
+    if (!ctx->native_surfaces) { native_trace("Present: native surfaces off"); command.report(DXGI_ERROR_UNSUPPORTED); return; }
     auto *queue = native_submission_find(ctx->native_queue_objects, queue_handle.pDrvPrivate);
     auto *route = queue ? queue->runtime_route : nullptr;
     if (!queue || queue->kind != VKDU_QUEUE || !route || route->pending || route->closing ||
@@ -66,7 +75,8 @@ void APIENTRY native_present(D3D12DDI_HCOMMANDLIST list, D3D12DDI_HCOMMANDQUEUE 
     if (SUCCEEDED(hr)) {
         result.hSrcAllocation = heaps[0]->allocation;
         result.hDstAllocation = count == 2 ? heaps[1]->allocation : 0;
-        result.hContext = route->native_heap_context;
+        // Proxy queues present on the owner context that wrote the surface.
+        result.hContext = route->proxy ? ctx->native_heap_context : route->native_heap_context;
         result.BackBufferMultiplicity = 1;
         // Everything below may call back into the runtime. No caller-owned
         // request, image slot or queue slot is read without registry validation.
