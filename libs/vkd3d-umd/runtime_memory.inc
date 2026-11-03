@@ -175,6 +175,7 @@ int32_t MWD_CALL native_runtime_completed(void *owner, uint32_t *out) {
 }
 int32_t native_runtime_submit_on_queue(void *owner, void *queue_token, uint32_t fence, const void *stream, uint32_t size,
         const mwd_reference *refs, uint32_t count) {
+    NativeTimed timed_submit(NT_SUBMIT);
     NativeHeapOperation op(static_cast<Context *>(owner));
     if (!op.live()) return DXGI_ERROR_DEVICE_REMOVED;
     auto *ctx = op.ctx;
@@ -319,9 +320,10 @@ int32_t native_runtime_submit_on_queue(void *owner, void *queue_token, uint32_t 
     ctx->native_last_submitted = fence;
     ctx->native_submitting = true;
     const bool hops = queue && queue->proxy;
-    HRESULT hop_hr = hops ? native_queue_hop(ctx, queue, true) : S_OK;
-    hr = ctx->kernel_callbacks.pfnRenderCb(ctx->runtime_device.handle, &args);
-    if (hops && SUCCEEDED(hr)) hop_hr = native_queue_hop(ctx, queue, false);
+    HRESULT hop_hr = S_OK;
+    if (hops) { NativeTimed timed(NT_HOP_BEFORE); hop_hr = native_queue_hop(ctx, queue, true); }
+    { NativeTimed timed(NT_RENDER); hr = ctx->kernel_callbacks.pfnRenderCb(ctx->runtime_device.handle, &args); }
+    if (hops && SUCCEEDED(hr)) { NativeTimed timed(NT_HOP_AFTER); hop_hr = native_queue_hop(ctx, queue, false); }
     if (SUCCEEDED(hr) && FAILED(hop_hr)) hr = hop_hr;
     native_trace("submit: RenderCb hr=%08x bytes=%u allocations=%u patches=%u", (unsigned)hr, (unsigned)bytes,
         allocation_count, owned_count);
@@ -336,7 +338,8 @@ int32_t native_runtime_submit_on_queue(void *owner, void *queue_token, uint32_t 
             buffers->native_command_capacity < sizeof(NativeRenderInfo) || buffers->native_command_capacity > 65536 ||
             !buffers->native_allocation_capacity || buffers->native_allocation_capacity > 1024 ||
             !buffers->native_patch_capacity || buffers->native_patch_capacity > 1024) hr = E_FAIL;
-    const HRESULT completion_hr = native_submission_reap(ctx);
+    HRESULT completion_hr;
+    { NativeTimed timed(NT_REAP); completion_hr = native_submission_reap(ctx); }
     if (FAILED(hr)) return hr;
     return FAILED(completion_hr) ? completion_hr : native_heap_generation(ctx);
 }

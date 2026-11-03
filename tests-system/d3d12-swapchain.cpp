@@ -30,6 +30,7 @@ int main(int argc, char **argv) {
     const int frames = argc > 2 ? std::atoi(argv[2]) : 300;
     const UINT interval = argc > 3 ? std::atoi(argv[3]) : 1;
     const UINT W = argc > 4 ? std::atoi(argv[4]) : 640, H = argc > 5 ? std::atoi(argv[5]) : 480;
+    const bool fixed = argc > 6 && std::atoi(argv[6]) == 1; // pure red background for channel-order checks
 
     WNDCLASSW wc{}; wc.lpfnWndProc = wndproc; wc.hInstance = GetModuleHandleW(nullptr);
     wc.lpszClassName = L"d3d12swapchain"; wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
@@ -82,14 +83,17 @@ int main(int argc, char **argv) {
     UINT64 values[kBuffers]{}, next = 1;
 
     LARGE_INTEGER freq, t0, t1; QueryPerformanceFrequency(&freq); QueryPerformanceCounter(&t0);
-    double worst = 0; LARGE_INTEGER prev = t0;
+    double worst = 0, wait_ms = 0, record_ms = 0, present_ms = 0; LARGE_INTEGER prev = t0;
+    auto now_ms = [&]() { LARGE_INTEGER v; QueryPerformanceCounter(&v); return 1000.0 * v.QuadPart / freq.QuadPart; };
     for (int f = 0; f < frames; ++f) {
         pump();
         const UINT i = swap->GetCurrentBackBufferIndex();
+        const double a = now_ms();
         if (fence->GetCompletedValue() < values[i]) {
             CHECK(fence->SetEventOnCompletion(values[i], event), "SetEventOnCompletion");
             if (WaitForSingleObject(event, 5000) != WAIT_OBJECT_0) return fail("fence wait timeout", E_FAIL);
         }
+        const double tb = now_ms(); wait_ms += tb - a;
         CHECK(allocators[i]->Reset(), "allocator Reset");
         CHECK(list->Reset(allocators[i].Get(), nullptr), "list Reset");
         D3D12_RESOURCE_BARRIER b{}; b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -98,7 +102,7 @@ int main(int argc, char **argv) {
         list->ResourceBarrier(1, &b);
         D3D12_CPU_DESCRIPTOR_HANDLE h = rtvs->GetCPUDescriptorHandleForHeapStart(); h.ptr += i * inc;
         const float phase = (f % 120) / 119.0f;
-        const float color[4] = {phase, 0.3f, 1.0f - phase, 1.0f};
+        const float color[4] = {fixed ? 1.0f : phase, fixed ? 0.0f : 0.3f, fixed ? 0.0f : 1.0f - phase, 1.0f};
         list->ClearRenderTargetView(h, color, 0, nullptr);
         // A white square that moves so tearing/stale frames are visible on the panel.
         D3D12_RECT r{(LONG)((f * 4) % (W - 64)), (LONG)(H / 2 - 32), 0, (LONG)(H / 2 + 32)}; r.right = r.left + 64;
@@ -109,7 +113,9 @@ int main(int argc, char **argv) {
         CHECK(list->Close(), "list Close");
         ID3D12CommandList *lists[] = {list.Get()};
         queue->ExecuteCommandLists(1, lists);
+        const double c = now_ms(); record_ms += c - tb;
         const HRESULT phr = swap->Present(interval, 0);
+        present_ms += now_ms() - c;
         if (FAILED(phr)) {
             std::printf("frame %d ", f);
             if (phr == DXGI_ERROR_DEVICE_REMOVED) std::printf("removed reason=%08lx ", (unsigned long)device->GetDeviceRemovedReason());
@@ -129,6 +135,8 @@ int main(int argc, char **argv) {
     const double secs = double(t1.QuadPart - t0.QuadPart) / freq.QuadPart;
     DXGI_FRAME_STATISTICS stats{};
     const HRESULT shr = swap->GetFrameStatistics(&stats);
+    std::printf("TIMING per frame: fence-wait=%.2fms record+reset+execute=%.2fms present=%.2fms\n",
+        wait_ms / frames, record_ms / frames, present_ms / frames);
     std::printf("PASS D3D12 SWAPCHAIN frames=%d secs=%.3f fps=%.1f worst=%.2fms stats_hr=%08lx PresentCount=%u PresentRefreshCount=%u SyncRefreshCount=%u\n",
         frames, secs, frames / secs, worst, (unsigned long)shr, stats.PresentCount, stats.PresentRefreshCount, stats.SyncRefreshCount);
     DestroyWindow(hwnd);

@@ -74,6 +74,10 @@ struct vkdu_object {
     struct vkdu_uav_record *uav_records;
     struct vkdu_attachment_lifetime *attachment_lifetime;
     struct vkdu_attachment_record *attachment_records;
+    /* Allocators: retired embedded allocators whose submissions the fence
+     * worker has not yet observed. Reset rotates instead of blocking. */
+    ID3D12CommandAllocator *spare_allocators[4];
+    uint32_t spare_count;
 #ifdef VKDU_ENABLE_TEST_DEVICE
     void (*test_retire_hook)(void *);
     void *test_retire_context;
@@ -117,6 +121,8 @@ static void vkdu_trace(const char *format, ...)
     int n;
     DWORD len = GetEnvironmentVariableA("VIOGPU_D3D12_EXPERIMENTAL", value, sizeof(value));
     if (!len || len >= sizeof(value) || value[0] != '1') return;
+    len = GetEnvironmentVariableA("VIOGPU_D3D12_TRACE", value, sizeof(value));
+    if (len && len < sizeof(value) && value[0] == '0') return;
     va_start(args, format);
     n = vsnprintf(line, sizeof(line) - 2, format, args);
     va_end(args);
@@ -351,6 +357,7 @@ void vkdu_object_destroy(vkdu_object *object)
 #endif
         vkdu_attachment_retire(object);
         IUnknown_Release(object->object);
+        while (object->spare_count) ID3D12CommandAllocator_Release(object->spare_allocators[--object->spare_count]);
         if (object->kind == VKDU_COMMAND_LIST) {
             if (object->command_type == 1 && !object->closed && object->command_allocator)
                 --object->command_allocator->bundle_recordings;
@@ -860,23 +867,42 @@ int32_t vkdu_allocator_reset(vkdu_object *allocator)
         return E_INVALIDARG;
     /* The runtime signals application fences on its own queue context, so an
      * application can legally reset after its fence completes but before the
-     * embedded fence worker has observed the same GPU completion. Give that
-     * worker a bounded chance to retire, or the reset is skipped and the
-     * allocator keeps every command buffer and upload chunk. */
+     * embedded fence worker has observed the same GPU completion (Turnip polls
+     * completion). A reset then would be skipped and the allocator would keep
+     * every command buffer and upload chunk. Rotate to an idle spare instead of
+     * waiting; the busy one is recycled once its submissions retire. */
     {
         ID3D12CommandAllocator *native = OBJ(ID3D12CommandAllocator, allocator);
         if (vkd3d_wddm_allocator_pending(native))
         {
-            LARGE_INTEGER freq, start, now;
-            unsigned int spins = 0;
-            QueryPerformanceFrequency(&freq); QueryPerformanceCounter(&start);
-            do {
-                Sleep(spins++ < 16 ? 0 : 1);
-                QueryPerformanceCounter(&now);
-            } while (vkd3d_wddm_allocator_pending(native) && now.QuadPart - start.QuadPart < freq.QuadPart / 4);
-            vkdu_trace("allocator reset waited %.3f ms pending=%u",
-                1000.0 * (double)(now.QuadPart - start.QuadPart) / (double)freq.QuadPart,
-                vkd3d_wddm_allocator_pending(native));
+            ID3D12CommandAllocator *idle = NULL;
+            uint32_t i;
+            for (i = 0; i < allocator->spare_count; ++i)
+                if (!vkd3d_wddm_allocator_pending(allocator->spare_allocators[i])) {
+                    idle = allocator->spare_allocators[i];
+                    allocator->spare_allocators[i] = native;
+                    break;
+                }
+            if (!idle && allocator->spare_count < ARRAY_SIZE(allocator->spare_allocators) &&
+                    SUCCEEDED(ID3D12Device_CreateCommandAllocator(allocator->owner, allocator->command_type,
+                        &IID_ID3D12CommandAllocator, (void **)&idle)))
+                allocator->spare_allocators[allocator->spare_count++] = native;
+            if (idle) {
+                allocator->object = (IUnknown *)idle;
+                hr = ID3D12CommandAllocator_Reset(idle);
+                if (SUCCEEDED(hr)) ++allocator->allocator_generation;
+                return hr;
+            }
+            /* All spares busy: bounded wait for the fence worker. */
+            {
+                LARGE_INTEGER freq, start, now;
+                unsigned int spins = 0;
+                QueryPerformanceFrequency(&freq); QueryPerformanceCounter(&start);
+                do {
+                    Sleep(spins++ < 16 ? 0 : 1);
+                    QueryPerformanceCounter(&now);
+                } while (vkd3d_wddm_allocator_pending(native) && now.QuadPart - start.QuadPart < freq.QuadPart / 4);
+            }
         }
     }
     hr = ID3D12CommandAllocator_Reset(OBJ(ID3D12CommandAllocator, allocator));

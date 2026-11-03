@@ -5,6 +5,8 @@
  * execution/presentation remains an admission requirement, not fixture proof. */
 void APIENTRY native_present(D3D12DDI_HCOMMANDLIST list, D3D12DDI_HCOMMANDQUEUE queue_handle,
         const D3D12DDIARG_PRESENT_0001 *args, D3D12DDI_PRESENT_0003 *out) {
+    NativeTimed timed(NT_PRESENT);
+    native_timing_frame();
     NativeGraphicsCommand command(list);
     if (out) *out = {};
     if (!command.value || !out || !args) { command.report(E_INVALIDARG); return; }
