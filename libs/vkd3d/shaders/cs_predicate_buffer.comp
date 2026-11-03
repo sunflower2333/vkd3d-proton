@@ -1,0 +1,21 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+layout(local_size_x = 128) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer source_t { uint data[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer destination_t { uint data[]; };
+layout(push_constant) uniform arguments_t
+{
+    source_t predicate;
+    source_t source;
+    destination_t destination;
+    uint count;
+    uint fill;
+    uint is_fill;
+} args;
+void main()
+{
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= args.count || args.predicate.data[0] == 0)
+        return;
+    args.destination.data[index] = args.is_fill != 0 ? args.fill : args.source.data[index];
+}

@@ -1,0 +1,205 @@
+name: Native VIOGPU D3D12 bridge
+on:
+  push:
+    branches: [viogpu-native-d3d12-umd, viogpu-native-d3d12-descriptors, viogpu-native-runtime-entry-20260911]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  backend:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - run: git submodule update --init --recursive --depth 1
+      - name: Execute production logical queue routing and software enqueue ordering
+        run: |
+          python3 libs/vkd3d-umd/queue_worker_test.py
+          for control in drop-route shared-token skip-drain skip-execute-drain; do
+            python3 libs/vkd3d-umd/queue_worker_test.py --negative-control "$control"
+          done
+      - name: Execute production descriptor and query pageable enumeration
+        run: |
+          python3 libs/vkd3d-umd/pageable_backing_test.py --sanitize
+          for control in drop-descriptor-pool drop-query-pool keep-duplicate; do
+            python3 libs/vkd3d-umd/pageable_backing_test.py --negative-control "$control"
+          done
+      - run: sudo apt-get update && sudo apt-get install -y meson ninja-build wine64-tools libwine-dev glslang-tools mesa-vulkan-drivers
+      - run: meson setup build-umd --buildtype debugoptimized -Denable_umd_bridge=true -Denable_umd_bridge_tests=true
+      - run: meson compile -C build-umd -j 3 vkd3d-umd-backend-test vkd3d-umd-fence-test vkd3d-umd-fence-negative vkd3d-umd-sampler-negative vkd3d-umd-texture-negative vkd3d-umd-graphics-negative vkd3d-umd-query-resolve-negative vkd3d-umd-query-owner-negative vkd3d-umd-vertex-offset-negative vkd3d-umd-vertex-owner-negative
+      - name: Execute real backend on CPU Vulkan, never report GPU acceptance
+        shell: bash
+        run: |
+          export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+          if [ ! -f "$VK_DRIVER_FILES" ]; then export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json; fi
+          timeout 90 build-umd/libs/vkd3d-umd/vkd3d-umd-backend-test
+      - name: Validate real backend fence events, cancellation and device loss on CPU Vulkan
+        shell: bash
+        run: |
+          export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+          if [ ! -f "$VK_DRIVER_FILES" ]; then export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json; fi
+          timeout 60 build-umd/libs/vkd3d-umd/vkd3d-umd-fence-test
+      - name: Reject omitted query GPU resolve and premature query ownership release
+        shell: bash
+        run: |
+          export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+          if [ ! -f "$VK_DRIVER_FILES" ]; then export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json; fi
+          for control in resolve owner; do
+            set +e
+            timeout 90 build-umd/libs/vkd3d-umd/vkd3d-umd-query-${control}-negative > query-${control}.txt 2>&1
+            result=$?
+            set -e
+            cat query-${control}.txt
+            test "$result" -eq 1
+            if [ "$control" = resolve ]; then
+              grep -F 'FAIL query GPU results round0' query-${control}.txt
+            else
+              grep -F 'FAIL query owners released before recording retirement' query-${control}.txt
+            fi
+          done
+      - name: Reject a dropped real backend queue wait
+        shell: bash
+        run: |
+          export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+          if [ ! -f "$VK_DRIVER_FILES" ]; then export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json; fi
+          set +e
+          timeout 60 build-umd/libs/vkd3d-umd/vkd3d-umd-fence-negative > fence-negative.txt 2>&1
+          result=$?
+          set -e
+          cat fence-negative.txt
+          test "$result" -eq 1
+          grep -F 'FAIL real fence event: future queue wait must block completion' fence-negative.txt
+      - name: Require actual sampler readback to reject dropped address translation
+        shell: bash
+        run: |
+          export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+          if [ ! -f "$VK_DRIVER_FILES" ]; then export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json; fi
+          set +e
+          timeout 90 build-umd/libs/vkd3d-umd/vkd3d-umd-sampler-negative > sampler-negative.txt 2>&1
+          result=$?
+          set -e
+          cat sampler-negative.txt
+          test "$result" -eq 1
+          grep -F 'sampler round2 word0=3f800000 expected00000000' sampler-negative.txt
+      - name: Require texture readback to reject dropped footprint offset
+        shell: bash
+        run: |
+          export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+          if [ ! -f "$VK_DRIVER_FILES" ]; then export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json; fi
+          set +e
+          timeout 90 build-umd/libs/vkd3d-umd/vkd3d-umd-texture-negative > texture-negative.txt 2>&1
+          result=$?
+          set -e
+          cat texture-negative.txt
+          test "$result" -eq 1
+          grep -F 'texture copy format41 word128=' texture-negative.txt
+      - name: Require actual draw pixels to reject dropped scissor state
+        shell: bash
+        run: |
+          export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+          if [ ! -f "$VK_DRIVER_FILES" ]; then export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json; fi
+          set +e
+          timeout 90 build-umd/libs/vkd3d-umd/vkd3d-umd-graphics-negative > graphics-negative.txt 2>&1
+          result=$?
+          set -e
+          cat graphics-negative.txt
+          test "$result" -eq 1
+          grep -F 'graphics round0 word128=' graphics-negative.txt
+      - name: Reject dropped actual vertex offset and recording owner
+        shell: bash
+        run: |
+          export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+          if [ ! -f "$VK_DRIVER_FILES" ]; then export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json; fi
+          for control in offset owner; do
+            set +e
+            timeout 90 build-umd/libs/vkd3d-umd/vkd3d-umd-vertex-$control-negative > vertex-$control-negative.txt 2>&1
+            result=$?
+            set -e
+            cat vertex-$control-negative.txt
+            test "$result" -eq 1
+            if [ "$control" = offset ]; then
+              grep -F 'FAIL vertex fetch round0' vertex-$control-negative.txt
+            else
+              grep -F 'FAIL vertex/index owners released before recording retirement' vertex-$control-negative.txt
+            fi
+          done
+  windows:
+    runs-on: windows-2025-vs2026
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            msvc: x64_arm64
+          - arch: x64
+            msvc: x64
+          - arch: x86
+            msvc: x64_x86
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - run: git submodule update --init --recursive --depth 1
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.msvc }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Prepare upstream build tools
+        shell: pwsh
+        run: |
+          choco install strawberryperl -y --no-progress
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Invoke-WebRequest 'https://raw.githubusercontent.com/HansKristian-Work/vkd3d-proton-ci/9e54d0ea518003b6da3f1600c010840a5921e0aa/glslangValidator.exe' -OutFile C:\Strawberry\c\bin\glslangValidator.exe
+          'C:\Strawberry\c\bin' | Out-File $env:GITHUB_PATH -Append
+          pip install meson ninja
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Build WDK bridge and check ABI
+        shell: pwsh
+        run: ./tools/build-windows-umd.ps1 -Architecture '${{ matrix.arch }}'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vkd3d-native-ddi-${{ matrix.arch }}
+          path: |
+            build-umd-${{ matrix.arch }}/package/
+            build-umd-${{ matrix.arch }}/meson-logs/
+            build-umd-${{ matrix.arch }}/libs/vkd3d-umd/runtime-*.txt
+            build-umd-${{ matrix.arch }}/libs/vkd3d-umd/descriptor-*.txt
+            build-umd-${{ matrix.arch }}/libs/vkd3d-umd/system-d3d12-*.txt
+  arm64-runtime:
+    needs: windows
+    if: ${{ !cancelled() }}
+    runs-on: windows-11-arm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: actions/download-artifact@v4
+        with:
+          name: vkd3d-native-ddi-arm64
+          path: candidate
+      - name: Execute actual ARM64 lifecycle and semantic negative controls
+        shell: pwsh
+        run: ./tools/test-windows-umd-runtime.ps1 -Executable candidate/package/vkd3d-umd-runtime-test.exe
+      - name: Execute native ARM64 sampler and descriptor DDI ownership
+        shell: pwsh
+        run: ./tools/test-windows-umd-descriptors.ps1 -Executable candidate/package/vkd3d-umd-ddi-descriptor-test.exe
+      - name: Validate ordinary D3D12 app harness on explicit CPU WARP only
+        shell: pwsh
+        run: ./tools/test-system-d3d12-probe.ps1 -Executable candidate/package/vkd3d-system-d3d12-probe.exe
+      - name: Validate OS fence request configuration on ARM64 without device access
+        shell: pwsh
+        run: |
+          & candidate/package/vkd3d-umd-shared-gpu-probe.exe --validate-os-fence-controls
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vkd3d-runtime-arm64-validation
+          path: |
+            candidate/package/runtime-*.txt
+            candidate/package/descriptor-*.txt
+            candidate/package/system-d3d12-*.txt

@@ -1,0 +1,122 @@
+/* SPDX-License-Identifier: MIT */
+#ifndef MESA_WDDM_RUNTIME_INTEROP_H
+#define MESA_WDDM_RUNTIME_INTEROP_H
+#include <stddef.h>
+#include <stdint.h>
+
+/* Private, matched UMD/ICD in-process protocol. Not a public Vulkan extension
+ * or KMD ABI. No runtime opaque HANDLE is represented as a KMT handle here.
+ * These private pNext tags are intentionally outside registered Vulkan ranges. */
+#define MWD_RUNTIME_ABI_VERSION 2u
+#define MWD_RUNTIME_MAGIC 0x3152574du
+#define MWD_STYPE_SUPPORT 0x7fff2330
+/* Version-specific query preserves the deployed DXVK ABI1 reply. */
+#define MWD_STYPE_SUPPORT_V2 0x7fff2335
+#define MWD_STYPE_NATIVE_SURFACE_SUPPORT_V2 0x7fff2336
+#define MWD_STYPE_NATIVE_SURFACE_DEVICE_V2 0x7fff2337
+#define MWD_STYPE_NATIVE_PRESENT_SUPPORT_V2 0x7fff2338
+#define MWD_SUPPORT_NATIVE_SURFACE 0x2u
+#define MWD_SUPPORT_NATIVE_PRESENT 0x4u
+#define MWD_ALLOCATION_NATIVE_SURFACE 0x10u
+#define MWD_NATIVE_SURFACE_REFERENCE UINT32_MAX
+#define MWD_STYPE_DEVICE  0x7fff2331
+#define MWD_STYPE_IMPORT  0x7fff2332
+#define MWD_STYPE_SUBMIT  0x7fff2333
+#ifdef _WIN32
+#define MWD_CALL __stdcall
+#else
+#define MWD_CALL
+#endif
+
+struct mwd_context_info {
+   uint8_t luid[8];
+   uint64_t generation, va_start, va_size;
+   uint32_t context_id, queue_id;
+};
+struct mwd_allocation {
+   void *token;
+   uint64_t address, size, generation;
+   uint32_t handle, flags;
+};
+struct mwd_reference {
+   void *token;
+   uint64_t offset, length;
+   uint32_t flags, patch_offset;
+};
+struct mwd_callbacks {
+   uint32_t magic, version, size, reserved;
+   int32_t (MWD_CALL *context)(void *owner, struct mwd_context_info *info);
+   int32_t (MWD_CALL *allocate)(void *owner, uint64_t size, uint64_t alignment,
+                               uint64_t requested_address, uint32_t flags,
+                               struct mwd_allocation *allocation);
+   int32_t (MWD_CALL *retain)(void *owner, void *token, struct mwd_allocation *allocation);
+   int32_t (MWD_CALL *release)(void *owner, void *token);
+   int32_t (MWD_CALL *map)(void *owner, void *token, void **mapping, uint32_t *handle);
+   int32_t (MWD_CALL *unmap)(void *owner, void *token);
+   int32_t (MWD_CALL *submit)(void *owner, uint32_t fence, const void *stream, uint32_t stream_size,
+                             const struct mwd_reference *references, uint32_t count);
+   int32_t (MWD_CALL *completed)(void *owner, uint32_t *fence);
+   int32_t (MWD_CALL *status)(void *owner);
+   int32_t (MWD_CALL *queue_retain)(void *owner, void *queue);
+   int32_t (MWD_CALL *queue_release)(void *owner, void *queue);
+   int32_t (MWD_CALL *submit_queue)(void *owner, void *queue, uint32_t fence,
+                                   const void *stream, uint32_t stream_size,
+                                   const struct mwd_reference *references, uint32_t count);
+};
+/* VkPhysicalDeviceProperties2 query. A zero reply means unsupported. */
+struct mwd_support {
+   int32_t sType;
+   void *pNext;
+   uint32_t magic, version, size, flags;
+};
+/* VkDeviceCreateInfo input. ICD copies callbacks before returning; owner is
+ * borrowed until VkDevice destruction, including failure cleanup. */
+struct mwd_device_create_info {
+   int32_t sType;
+   const void *pNext;
+   const struct mwd_callbacks *callbacks;
+   void *owner;
+};
+/* Separately negotiated ABI2 opt-in. An absent input retains the original
+ * heap-only protocol. Native tokens must already have a live provider owner. */
+struct mwd_native_surface_device_info {
+   int32_t sType;
+   const void *pNext;
+   void *owner;
+   uint32_t flags, reserved;
+};
+static inline int mwd_native_surface_device_valid(const struct mwd_native_surface_device_info *info,
+        const void *owner)
+{
+   return !info || (info->sType == MWD_STYPE_NATIVE_SURFACE_DEVICE_V2 && !info->pNext &&
+      info->owner && info->owner == owner && !info->reserved &&
+      (info->flags == MWD_SUPPORT_NATIVE_SURFACE || info->flags == (MWD_SUPPORT_NATIVE_SURFACE | MWD_SUPPORT_NATIVE_PRESENT)));
+}
+/* VkMemoryAllocateInfo input. A successful import retains the exact existing
+ * allocation; failed imports transfer no ownership. */
+struct mwd_import_memory_info {
+   int32_t sType;
+   const void *pNext;
+   void *owner;
+   void *token;
+};
+
+/* VkSubmitInfo2 input. The ICD retains this queue token before copying the
+ * submission and releases it after actual kernel enqueue or cancellation.
+ * Completion remains a separate OS-ordered domain timeline. */
+struct mwd_submit_info {
+   int32_t sType;
+   const void *pNext;
+   void *owner;
+   void *queue;
+};
+
+static inline int mwd_callbacks_valid(const struct mwd_callbacks *cb)
+{
+   return cb && cb->magic == MWD_RUNTIME_MAGIC &&
+      cb->version == MWD_RUNTIME_ABI_VERSION && cb->size == sizeof(*cb) &&
+      !cb->reserved && cb->context && cb->allocate && cb->retain &&
+      cb->release && cb->map && cb->unmap && cb->submit &&
+      cb->completed && cb->status && cb->queue_retain && cb->queue_release && cb->submit_queue;
+}
+#endif
