@@ -1801,9 +1801,12 @@ static void vkd3d_predicate_ops_cleanup(struct vkd3d_predicate_ops *meta_predica
     for (i = 0; i < VKD3D_PREDICATE_COMMAND_COUNT; i++)
         VK_CALL(vkDestroyPipeline(device->vk_device, meta_predicate_ops->vk_command_pipelines[i], NULL));
     VK_CALL(vkDestroyPipeline(device->vk_device, meta_predicate_ops->vk_resolve_pipeline, NULL));
+    VK_CALL(vkDestroyPipeline(device->vk_device, meta_predicate_ops->vk_buffer_pipeline, NULL));
+    VK_CALL(vkDestroyPipeline(device->vk_device, meta_predicate_ops->vk_buffer_bytes_pipeline, NULL));
 
     VK_CALL(vkDestroyPipelineLayout(device->vk_device, meta_predicate_ops->vk_command_pipeline_layout, NULL));
     VK_CALL(vkDestroyPipelineLayout(device->vk_device, meta_predicate_ops->vk_resolve_pipeline_layout, NULL));
+    VK_CALL(vkDestroyPipelineLayout(device->vk_device, meta_predicate_ops->vk_buffer_pipeline_layout, NULL));
 }
 
 static HRESULT vkd3d_predicate_ops_init(struct vkd3d_predicate_ops *meta_predicate_ops,
@@ -1868,6 +1871,22 @@ static HRESULT vkd3d_predicate_ops_init(struct vkd3d_predicate_ops *meta_predica
     if ((vr = vkd3d_meta_create_compute_pipeline(device, sizeof(cs_resolve_predicate), cs_resolve_predicate,
             meta_predicate_ops->vk_resolve_pipeline_layout, NULL, true, NULL,
             &meta_predicate_ops->vk_resolve_pipeline)) < 0)
+        goto fail;
+
+    push_constant_range.size = sizeof(struct vkd3d_predicate_buffer_args);
+    if ((vr = vkd3d_meta_create_pipeline_layout(device, 0, NULL,
+            &push_constant_range, &meta_predicate_ops->vk_buffer_pipeline_layout)) < 0)
+        goto fail;
+    if ((vr = vkd3d_meta_create_compute_pipeline(device, sizeof(cs_predicate_buffer), cs_predicate_buffer,
+            meta_predicate_ops->vk_buffer_pipeline_layout, NULL, true, NULL,
+            &meta_predicate_ops->vk_buffer_pipeline)) < 0)
+        goto fail;
+    /* Byte copies need this optional feature. Aligned copies and fills never
+     * require it, and unsupported byte copies invalidate recording explicitly. */
+    if (device->device_info.vulkan_1_2_features.storageBuffer8BitAccess &&
+            (vr = vkd3d_meta_create_compute_pipeline(device, sizeof(cs_predicate_buffer_bytes), cs_predicate_buffer_bytes,
+            meta_predicate_ops->vk_buffer_pipeline_layout, NULL, true, NULL,
+            &meta_predicate_ops->vk_buffer_bytes_pipeline)) < 0)
         goto fail;
 
     return S_OK;

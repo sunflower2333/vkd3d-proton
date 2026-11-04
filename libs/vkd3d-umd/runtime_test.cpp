@@ -4,6 +4,7 @@
 #include "ddi.h"
 #include "mesa_wddm_runtime.h"
 #include <array>
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cwchar>
@@ -21,9 +22,16 @@
 }
 
 static HRESULT backend_result = S_OK, query_result = S_OK;
+static HRESULT native_backend_result = DXGI_ERROR_UNSUPPORTED;
+static unsigned native_backend_attempts;
 static unsigned loads, unloads, creates, destroys, query_calls, error_calls;
 static bool bad_loader = false, old_reply = false;
+static bool missing_queue_protocol = false;
+static uint32_t cached_coherent_wire = 1;
+static unsigned queue_protocol_queries;
+static std::function<void(uint8_t *, const D3DDDICB_QUERYADAPTERINFO *)> queue_protocol_query_callback;
 static bool reset_during_create = false;
+static std::function<void()> identity_query_callback;
 static PFND3D12DDI_DESTROYDEVICE retire_in_error = nullptr;
 static D3D12DDI_HDEVICE error_device{};
 static std::function<void()> nested_error_callback;
@@ -49,9 +57,13 @@ static std::function<void()> backend_signature_create_callback, backend_indirect
 static unsigned barrier_calls;
 static HRESULT barrier_result = S_OK;
 static std::vector<vkdu_resource_barrier> recorded_barriers;
+static std::function<void()> backend_barriers_callback;
 static std::vector<std::pair<HANDLE, HRESULT>> command_errors;
 static std::function<void()> nested_command_error, backend_command_create_callback, backend_command_destroy_callback;
 static unsigned command_creates, command_destroys;
+static unsigned bundle_executes;
+static HRESULT bundle_result = S_OK;
+static std::function<void()> bundle_callback;
 static HRESULT command_create_result = S_OK, command_close_result = S_OK;
 static unsigned queue_creates, queue_destroys, queue_executes;
 static HRESULT queue_create_result = S_OK, queue_execute_result = S_OK;
@@ -61,7 +73,10 @@ static std::vector<vkdu_object *> submitted_commands;
 static bool force_queue_unowned, queue_negative_active;
 static bool force_early_completion, completion_negative_active;
 static bool native_fence_ignore_owner, native_fence_drop_mask;
+static bool native_surface_skip_close, native_surface_late_pin, native_surface_negative_active;
 static uint64_t generation = 7;
+static bool msaa_heap_fixture;
+static uint64_t seen_rt_import_alignment;
 static D3D12DDI_HRTDEVICE last_runtime{};
 static const HANDLE expected_adapter = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(0x13570));
 static const std::array<uint8_t, 8> expected_luid{1,2,3,4,5,6,7,8};
@@ -97,11 +112,17 @@ static FARPROC WINAPI test_symbol(HMODULE, LPCSTR name) {
     return reinterpret_cast<FARPROC>(static_cast<uintptr_t>(0x35790));
 }
 static BOOL WINAPI test_unload(HMODULE) { ++unloads; return TRUE; }
-static int32_t test_create(PFN_vkGetInstanceProcAddr loader, const uint8_t luid[8],
-        const mwd_callbacks *callbacks, void *owner, vkdu_device **out) {
-    if (!loader || std::memcmp(luid, expected_luid.data(), 8) || !owner || !mwd_callbacks_valid(callbacks)) fixture_abort(__LINE__);
+#include "runtime_memory_peers_test.inc"
+static int32_t test_create(PFN_vkGetInstanceProcAddr loader, const vkdu_memory_expectation *expected,
+        const mwd_callbacks *callbacks, void *owner, vkdu_memory_facts *facts, vkdu_device **out) {
+    if (!loader || !expected || std::memcmp(expected->luid, expected_luid.data(), 8) || !owner || !mwd_callbacks_valid(callbacks)) fixture_abort(__LINE__);
+    *out = nullptr;
+    const auto memory_hr = test_memory_query(loader, expected, facts);
+    if (FAILED(memory_hr)) return memory_hr;
+    if (!vkdu_memory_facts_qualified(facts)) return DXGI_ERROR_UNSUPPORTED;
     ++creates; *out = nullptr;
     if (SUCCEEDED(backend_result)) *out = reinterpret_cast<vkdu_device *>(new TestDevice{callbacks, owner});
+    if (memory_create_callback) { auto callback = memory_create_callback; callback(); }
     if (reset_during_create) ++generation;
     return backend_result;
 }
@@ -113,23 +134,50 @@ static void test_destroy(vkdu_device *device) {
         ++destroys; delete peer;
     }
 }
+static int32_t test_create_native(PFN_vkGetInstanceProcAddr loader, const uint8_t luid[8],
+        const mwd_callbacks *callbacks, void *owner, vkdu_device **out) {
+    ++native_backend_attempts;
+    *out = nullptr;
+    vkdu_memory_expectation expected{}; std::memcpy(expected.luid, luid, 8); expected.generation = generation;
+    expected.cached_coherent = {1, 1}; expected.owned_allocations_only = {1, 1};
+    vkdu_memory_facts facts{};
+    return native_backend_result == S_OK ? test_create(loader, &expected, callbacks, owner, &facts, out) : native_backend_result;
+}
 static unsigned backend_device_removals;
 static int32_t backend_removal_reason;
 static int32_t test_device_remove(vkdu_device *, int32_t reason) {
     ++backend_device_removals; backend_removal_reason = reason; return reason;
 }
 static HRESULT APIENTRY test_query(HANDLE runtime, const D3DDDICB_QUERYADAPTERINFO *args) {
-    if (runtime != expected_adapter || args->PrivateDriverDataSize != 160) fixture_abort(__LINE__);
+    if (runtime != expected_adapter || (args->PrivateDriverDataSize != 160 &&
+            args->PrivateDriverDataSize != 192)) fixture_abort(__LINE__);
     auto *bytes = static_cast<uint8_t *>(args->pPrivateDriverData);
-    for (unsigned i = 0; i < 160; ++i) if (bytes[i]) fixture_abort(__LINE__);
+    for (unsigned i = 0; i < args->PrivateDriverDataSize; ++i) if (bytes[i]) fixture_abort(__LINE__);
     ++query_calls;
     if (FAILED(query_result)) return query_result;
     auto put = [&](size_t offset, uint32_t value) { std::memcpy(bytes + offset, &value, 4); };
     put(0, 0x504d5644); put(8, 128);
+    put(76, cached_coherent_wire);
     std::memcpy(bytes + 24, &generation, 8);
     if (!old_reply) {
         put(128, 0x44494c56); put(132, 1); put(136, 32); put(140, 1); put(152, 1);
         std::memcpy(bytes + 144, expected_luid.data(), 8);
+    }
+    if (args->PrivateDriverDataSize == 192 && !missing_queue_protocol) {
+        put(160, 0x43445156); put(164, 1); put(168, 32); put(172, 1);
+        put(176, 32); put(180, 40); put(184, 64);
+    }
+    if (args->PrivateDriverDataSize == 192) {
+        ++queue_protocol_queries;
+        if (queue_protocol_query_callback) {
+            auto callback = queue_protocol_query_callback;
+            callback(bytes, args);
+        }
+    }
+    if (identity_query_callback) {
+        auto callback = std::move(identity_query_callback);
+        identity_query_callback = {};
+        callback();
     }
     return S_OK;
 }
@@ -146,14 +194,20 @@ static void APIENTRY test_command_error(D3D12DDI_HRTCOMMANDLIST runtime, HRESULT
 }
 
 static int32_t test_import_heap(vkdu_device *, void *, void *, uint64_t, int, vkdu_object **);
+static int32_t test_native_image_import(vkdu_device *, void *, void *, uint32_t, uint32_t, uint32_t, uint32_t, int, int, vkdu_object **);
 static int32_t test_place_buffer(vkdu_device *, vkdu_object *, uint64_t, uint64_t, uint32_t, vkdu_object **);
 static int32_t test_texture_allocation(vkdu_device *, uint32_t, uint32_t, uint32_t, uint64_t *, uint64_t *);
 static int32_t test_buffer_allocation(vkdu_device *, uint64_t, uint64_t *, uint64_t *);
 static int32_t test_texture_import(vkdu_device *, void *, void *, uint64_t, vkdu_object **);
 static int32_t test_texture_place(vkdu_device *, vkdu_object *, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, vkdu_object **);
-static int32_t test_rt_allocation(vkdu_device *, uint32_t, uint32_t, uint64_t *, uint64_t *);
+static int32_t test_texture_shape_allocation(vkdu_device *, const vkdu_texture2d_shape *, uint64_t *, uint64_t *);
+static int32_t test_texture_shape_place(vkdu_device *, vkdu_object *, uint64_t, const vkdu_texture2d_shape *, uint32_t, vkdu_object **);
+static int32_t test_rt_allocation(vkdu_device *, uint32_t, uint32_t, uint32_t, uint64_t *, uint64_t *);
 static int32_t test_rt_import(vkdu_device *, void *, void *, uint64_t, vkdu_object **);
-static int32_t test_rt_place(vkdu_device *, vkdu_object *, uint32_t, uint32_t, uint32_t, vkdu_object **);
+static int32_t test_rt_import_aligned(vkdu_device *, void *, void *, uint64_t, uint64_t, vkdu_object **);
+static int32_t test_rt_place(vkdu_device *, vkdu_object *, uint32_t, uint32_t, uint32_t, uint32_t, vkdu_object **);
+static int32_t test_depth_allocation(vkdu_device *, uint32_t, uint32_t, uint32_t, uint64_t *, uint64_t *);
+static int32_t test_depth_place(vkdu_device *, vkdu_object *, uint32_t, uint32_t, uint32_t, uint32_t, vkdu_object **);
 static void test_object_destroy(vkdu_object *);
 static int test_object_retain(vkdu_object *);
 static int test_object_is(vkdu_object *, vkdu_kind);
@@ -163,6 +217,13 @@ static uint64_t test_buffer_size(vkdu_object *);
 static int32_t test_allocator_create(vkdu_device *, uint32_t, vkdu_object **);
 static int32_t test_command_create(vkdu_device *, vkdu_object *, uint32_t, vkdu_object **);
 static int32_t test_command_close(vkdu_object *);
+static int32_t test_execute_bundle(vkdu_object *, vkdu_object *);
+static int32_t test_clear_root_arguments(vkdu_object *);
+static int32_t test_predication(vkdu_object *, vkdu_object *, uint64_t, uint32_t);
+static int test_uav_heap_resolve(vkdu_object *, uint64_t, int, uint32_t *);
+static int32_t test_clear_uav(vkdu_object *, vkdu_object *, uint32_t, vkdu_object *, uint32_t,
+        vkdu_object *, int, const void *, uint32_t, const vkdu_rect *);
+static int32_t test_native_present(vkdu_object *, vkdu_object *, vkdu_object *, vkdu_object *);
 static int32_t test_command_barriers(vkdu_object *, uint32_t, const vkdu_resource_barrier *);
 static int32_t test_queue_create(vkdu_device *, uint32_t, vkdu_object **);
 static int32_t test_queue_bind(vkdu_object *, void *, void *);
@@ -183,17 +244,25 @@ static DWORD WINAPI test_event_wait(HANDLE event, DWORD timeout) {
 #define GetProcAddress test_symbol
 #define FreeLibrary test_unload
 #define vkdu_device_create_shared test_create
+#define vkdu_query_adapter_memory_facts test_memory_query
+#define vkdu_device_create_shared_native test_create_native
 #define vkdu_device_destroy test_destroy
 #define vkdu_device_remove test_device_remove
 #define vkdu_memory_heap_import test_import_heap
+#define vkdu_native_image_import test_native_image_import
 #define vkdu_buffer_place test_place_buffer
 #define vkdu_texture2d_allocation test_texture_allocation
 #define vkdu_buffer_allocation test_buffer_allocation
 #define vkdu_texture_heap_import test_texture_import
 #define vkdu_texture2d_place test_texture_place
-#define vkdu_render_target_allocation test_rt_allocation
+#define vkdu_texture2d_shape_allocation test_texture_shape_allocation
+#define vkdu_texture2d_shape_place test_texture_shape_place
+#define vkdu_render_target_allocation_format test_rt_allocation
 #define vkdu_render_target_heap_import test_rt_import
-#define vkdu_render_target_place test_rt_place
+#define vkdu_render_target_heap_import_aligned test_rt_import_aligned
+#define vkdu_render_target_place_format test_rt_place
+#define vkdu_depth_allocation test_depth_allocation
+#define vkdu_depth_place test_depth_place
 #define vkdu_object_destroy test_object_destroy
 #define vkdu_object_retain test_object_retain
 #define vkdu_object_is test_object_is
@@ -203,6 +272,12 @@ static DWORD WINAPI test_event_wait(HANDLE event, DWORD timeout) {
 #define vkdu_allocator_create test_allocator_create
 #define vkdu_command_create test_command_create
 #define vkdu_command_close test_command_close
+#define vkdu_command_execute_bundle test_execute_bundle
+#define vkdu_command_clear_root_arguments test_clear_root_arguments
+#define vkdu_command_predication test_predication
+#define vkdu_heap_resolve test_uav_heap_resolve
+#define vkdu_command_clear_uav test_clear_uav
+#define vkdu_command_native_present test_native_present
 #define vkdu_command_barriers test_command_barriers
 #define vkdu_queue_create test_queue_create
 #define vkdu_queue_bind_runtime test_queue_bind
@@ -217,6 +292,7 @@ static DWORD WINAPI test_event_wait(HANDLE event, DWORD timeout) {
 #define WaitForSingleObject test_event_wait
 #define VKDU_TEST_NATIVE_FENCE_CONTROLS
 #define VKDU_TEST_NATIVE_RESIDENCY_CONTROLS
+#define VKDU_TEST_NATIVE_SURFACE_CONTROLS
 #include "ddi.cpp"
 #undef WaitForSingleObject
 
@@ -235,6 +311,7 @@ struct ImportPeer {
     unsigned references = 1;
     uint32_t width = 0, height = 0, format = 0;
     void *runtime_route = nullptr;
+    std::vector<std::shared_ptr<ImportOwner>> present_owners;
 };
 static std::function<void()> texture_allocation_callback;
 static unsigned allocation_queries;
@@ -251,7 +328,9 @@ static int32_t test_texture_allocation(vkdu_device *device, uint32_t width, uint
         uint32_t format, uint64_t *bytes, uint64_t *alignment) {
     auto *peer = reinterpret_cast<TestDevice *>(device);
     ++allocation_queries; wait_backend_worker(peer->callbacks, peer->owner);
-    if (!width || !height || (format != 28 && format != 41)) fixture_abort(__LINE__);
+    if (!width || !height || (!vkdu_color_resource_format(format) && format != DXGI_FORMAT_R32_FLOAT &&
+            format != DXGI_FORMAT_D32_FLOAT && format != DXGI_FORMAT_D16_UNORM &&
+            format != DXGI_FORMAT_D24_UNORM_S8_UINT && format != DXGI_FORMAT_D32_FLOAT_S8X24_UINT)) fixture_abort(__LINE__);
     *bytes = texture_required_bytes; *alignment = 65536;
     if (texture_allocation_callback) texture_allocation_callback();
     return allocation_query_result;
@@ -269,19 +348,44 @@ static int32_t test_texture_place(vkdu_device *device, vkdu_object *memory, uint
     return hr;
 }
 static bool import_failure, placement_failure, retire_during_import;
+static vkdu_texture2d_shape seen_texture_shape_query{}, seen_texture_shape_place{};
+static int32_t test_texture_shape_allocation(vkdu_device *device, const vkdu_texture2d_shape *shape, uint64_t *bytes, uint64_t *alignment) {
+    seen_texture_shape_query = *shape;
+    const HRESULT hr = test_texture_allocation(device, shape->width, shape->height, shape->format, bytes, alignment);
+    if (SUCCEEDED(hr)) *alignment = shape->sample_count > 1 ? 4194304 : 65536;
+    return hr;
+}
+static int32_t test_texture_shape_place(vkdu_device *device, vkdu_object *memory, uint64_t offset,
+        const vkdu_texture2d_shape *shape, uint32_t state, vkdu_object **out) {
+    seen_texture_shape_place = *shape;
+    return test_texture_place(device, memory, offset, shape->width, shape->height, shape->format, state, out);
+}
 static unsigned rt_queries, rt_imports, rt_placements;
-static int32_t test_rt_allocation(vkdu_device *device, uint32_t width, uint32_t height, uint64_t *bytes, uint64_t *alignment) {
-    ++rt_queries; return test_texture_allocation(device, width, height, 28, bytes, alignment);
+static int32_t test_rt_allocation(vkdu_device *device, uint32_t width, uint32_t height, uint32_t format, uint64_t *bytes, uint64_t *alignment) {
+    ++rt_queries; return test_texture_allocation(device, width, height, format, bytes, alignment);
 }
 static int32_t test_rt_import(vkdu_device *device, void *owner, void *token, uint64_t bytes, vkdu_object **out) {
     ++rt_imports; return test_texture_import(device, owner, token, bytes, out);
 }
-static int32_t test_rt_place(vkdu_device *device, vkdu_object *memory, uint32_t width, uint32_t height, uint32_t state, vkdu_object **out) {
-    ++rt_placements; return test_texture_place(device, memory, 0, width, height, 28, state, out);
+static int32_t test_rt_import_aligned(vkdu_device *device, void *owner, void *token, uint64_t bytes, uint64_t alignment, vkdu_object **out) {
+    seen_rt_import_alignment = alignment;
+    if (alignment != 4194304 || bytes % alignment) fixture_abort(__LINE__);
+    return test_rt_import(device, owner, token, bytes, out);
+}
+static int32_t test_rt_place(vkdu_device *device, vkdu_object *memory, uint32_t width, uint32_t height, uint32_t format, uint32_t state, vkdu_object **out) {
+    ++rt_placements; return test_texture_place(device, memory, 0, width, height, format, state, out);
+}
+static unsigned depth_queries, depth_placements;
+static int32_t test_depth_allocation(vkdu_device *device, uint32_t width, uint32_t height, uint32_t format, uint64_t *bytes, uint64_t *alignment) {
+    ++depth_queries; return test_texture_allocation(device, width, height, format, bytes, alignment);
+}
+static int32_t test_depth_place(vkdu_device *device, vkdu_object *memory, uint32_t width, uint32_t height, uint32_t format, uint32_t state, vkdu_object **out) {
+    ++depth_placements; return test_texture_place(device, memory, 0, width, height, format, state, out);
 }
 static unsigned imports, placements;
 static bool last_import_cpu_visible;
 static uint32_t last_placement_state;
+static std::function<void()> buffer_import_callback, buffer_placement_callback;
 static void retire_import_with_map(Context *, const mwd_allocation &);
 static int32_t test_import_heap(vkdu_device *device, void *owner, void *token, uint64_t size, int cpu_visible, vkdu_object **out) {
     last_import_cpu_visible = cpu_visible != 0;
@@ -295,6 +399,7 @@ static int32_t test_import_heap(vkdu_device *device, void *owner, void *token, u
     auto backing = std::make_shared<ImportOwner>();
     backing->context = static_cast<Context *>(owner); backing->allocation = allocation;
     *out = reinterpret_cast<vkdu_object *>(new ImportPeer{backing, device, VKDU_MEMORY_HEAP, allocation.address, size});
+    if (buffer_import_callback) { auto callback = std::move(buffer_import_callback); callback(); }
     if (retire_during_import) retire_import_with_map(backing->context, allocation);
     return S_OK;
 }
@@ -304,8 +409,10 @@ static int32_t test_place_buffer(vkdu_device *device, vkdu_object *memory, uint6
     if (placement_failure) return E_INVALIDARG;
     auto *peer = reinterpret_cast<ImportPeer *>(memory);
     if (FAILED(native_runtime_status(peer->owner->context))) return DXGI_ERROR_DEVICE_REMOVED;
-    if (peer->device != device || peer->kind != VKDU_MEMORY_HEAP || offset || size > peer->bytes) fixture_abort(__LINE__);
-    *out = reinterpret_cast<vkdu_object *>(new ImportPeer{peer->owner, device, VKDU_BUFFER, peer->address, size});
+    if (peer->device != device || peer->kind != VKDU_MEMORY_HEAP || offset % 65536 ||
+            offset > peer->bytes || size > peer->bytes - offset) fixture_abort(__LINE__);
+    *out = reinterpret_cast<vkdu_object *>(new ImportPeer{peer->owner, device, VKDU_BUFFER, peer->address + offset, size});
+    if (buffer_placement_callback) { auto callback = std::move(buffer_placement_callback); callback(); }
     return S_OK;
 }
 static void test_object_destroy(vkdu_object *object) {
@@ -447,22 +554,86 @@ static int32_t test_pageable_backing(vkdu_object *object, uint32_t *count, mwd_a
     return S_OK;
 }
 static int32_t test_allocator_create(vkdu_device *device, uint32_t type, vkdu_object **out) {
-    if (!device || type != 0 || !out) return E_INVALIDARG;
-    *out = reinterpret_cast<vkdu_object *>(new ImportPeer{{}, device, VKDU_ALLOCATOR, 0, 0});
+    if (!device || type > 1 || !out) return E_INVALIDARG;
+    *out = reinterpret_cast<vkdu_object *>(new ImportPeer{{}, device, VKDU_ALLOCATOR, type, 0});
     return S_OK;
 }
 static int32_t test_command_create(vkdu_device *device, vkdu_object *allocator, uint32_t type, vkdu_object **out) {
     *out = nullptr; ++command_creates;
-    if (!test_object_is(allocator, VKDU_ALLOCATOR) || !test_object_belongs(device, allocator) || type != 0) return E_INVALIDARG;
+    if (!test_object_is(allocator, VKDU_ALLOCATOR) || !test_object_belongs(device, allocator) || type > 1 || reinterpret_cast<ImportPeer *>(allocator)->address != type) return E_INVALIDARG;
     auto *peer = reinterpret_cast<TestDevice *>(device);
     wait_backend_worker(peer->callbacks, peer->owner);
     if (FAILED(command_create_result)) return command_create_result;
-    *out = reinterpret_cast<vkdu_object *>(new ImportPeer{{}, device, VKDU_COMMAND_LIST, 0, 0});
+    *out = reinterpret_cast<vkdu_object *>(new ImportPeer{{}, device, VKDU_COMMAND_LIST, type, 0});
     if (backend_command_create_callback) backend_command_create_callback();
     return S_OK;
 }
 static int32_t test_command_close(vkdu_object *object) {
-    return test_object_is(object, VKDU_COMMAND_LIST) ? command_close_result : E_INVALIDARG;
+    if (!test_object_is(object, VKDU_COMMAND_LIST)) return E_INVALIDARG;
+    if (SUCCEEDED(command_close_result)) reinterpret_cast<ImportPeer *>(object)->bytes = 1;
+    return command_close_result;
+}
+static int32_t test_execute_bundle(vkdu_object *parent, vkdu_object *bundle) {
+    ++bundle_executes;
+    if (!test_object_is(parent, VKDU_COMMAND_LIST) || !test_object_is(bundle, VKDU_COMMAND_LIST)) return E_INVALIDARG;
+    auto *a = reinterpret_cast<ImportPeer *>(parent), *b = reinterpret_cast<ImportPeer *>(bundle);
+    if (a->references < 2 || b->references < 2) fixture_abort(__LINE__);
+    if (a->device != b->device || a->address || b->address != 1 || a->bytes || !b->bytes) return E_INVALIDARG;
+    if (bundle_callback) { auto callback = std::move(bundle_callback); callback(); }
+    if (a->references == 0 || b->references == 0) fixture_abort(__LINE__);
+    return bundle_result;
+}
+static unsigned root_clear_calls;
+static uint32_t root_clear_command_type;
+static HRESULT root_clear_result = S_OK;
+static std::function<void()> root_clear_callback;
+static int32_t test_clear_root_arguments(vkdu_object *object) {
+    if (!test_object_is(object, VKDU_COMMAND_LIST) ||
+            reinterpret_cast<ImportPeer *>(object)->references < 2) fixture_abort(__LINE__);
+    ++root_clear_calls;
+    root_clear_command_type=static_cast<uint32_t>(reinterpret_cast<ImportPeer *>(object)->address);
+    if (reinterpret_cast<ImportPeer *>(object)->bytes) return E_INVALIDARG;
+    if (root_clear_callback) { auto callback = std::move(root_clear_callback); callback(); }
+    if (!reinterpret_cast<ImportPeer *>(object)->references) fixture_abort(__LINE__);
+    return root_clear_result;
+}
+static unsigned uav_clear_calls;
+static unsigned predication_calls;
+static HRESULT predication_result = S_OK;
+static std::function<void()> predication_callback;
+static int32_t test_predication(vkdu_object *command, vkdu_object *resource, uint64_t offset, uint32_t operation) {
+    for (auto *object : {command, resource})
+        if (!object || reinterpret_cast<ImportPeer *>(object)->references < 2) fixture_abort(__LINE__);
+    ++predication_calls;
+    if (predication_callback) { auto callback = std::move(predication_callback); callback(); }
+    if (offset != 0x123456780ull || operation != 1 ||
+            !reinterpret_cast<ImportPeer *>(command)->references || !reinterpret_cast<ImportPeer *>(resource)->references)
+        fixture_abort(__LINE__);
+    return predication_result;
+}
+static HRESULT uav_clear_result = S_OK;
+static std::function<void()> uav_clear_callback;
+static int test_uav_heap_resolve(vkdu_object *object, uint64_t address, int gpu, uint32_t *index) {
+    if (!test_object_is(object, VKDU_DESCRIPTOR_HEAP)) return 0;
+    auto *p = reinterpret_cast<ImportPeer *>(object);
+    if (gpu && !(p->format & 2)) return 0;
+    const uint64_t base = p->address + (gpu ? 0x10000000 : 0);
+    if (address < base || (address - base) % 32 || (address - base) / 32 >= p->bytes) return 0;
+    *index = uint32_t((address - base) / 32); return 1;
+}
+static int32_t test_clear_uav(vkdu_object *command, vkdu_object *gpu, uint32_t gi,
+        vkdu_object *cpu, uint32_t ci, vkdu_object *resource, int floating,
+        const void *values, uint32_t count, const vkdu_rect *rects) {
+    for (auto *object : {command, gpu, cpu, resource})
+        if (!object || reinterpret_cast<ImportPeer *>(object)->references < 2) fixture_abort(__LINE__);
+    ++uav_clear_calls;
+    if (uav_clear_callback) { auto callback = std::move(uav_clear_callback); callback(); }
+    const auto *bits = static_cast<const uint32_t *>(values);
+    if (gi != 4 || ci != 2 || floating != 1 || count != 19 || bits[0] != 0x7fc12345 ||
+            bits[3] != 0xff800000 || rects[18].left != 18 || rects[18].right != 22) fixture_abort(__LINE__);
+    for (auto *object : {command, gpu, cpu, resource})
+        if (!reinterpret_cast<ImportPeer *>(object)->references) fixture_abort(__LINE__);
+    return uav_clear_result;
 }
 static int32_t test_command_barriers(vkdu_object *object, uint32_t count, const vkdu_resource_barrier *barriers) {
     if (!test_object_is(object, VKDU_COMMAND_LIST) || (count && !barriers)) fixture_abort(__LINE__);
@@ -470,6 +641,18 @@ static int32_t test_command_barriers(vkdu_object *object, uint32_t count, const 
     for (uint32_t i = 0; i < count; ++i) {
         if (force_drop_global_barrier && barriers[i].type == VKDU_BARRIER_UAV && !barriers[i].resource) continue;
         recorded_barriers.push_back(barriers[i]);
+    }
+    if (backend_barriers_callback) {
+        if (reinterpret_cast<ImportPeer *>(object)->references < 2) fixture_abort(__LINE__);
+        for (const auto &barrier : recorded_barriers) {
+            for (auto *resource : {barrier.resource, barrier.alias_after})
+                if (resource && reinterpret_cast<ImportPeer *>(resource)->references < 2) fixture_abort(__LINE__);
+        }
+        auto callback = std::move(backend_barriers_callback); callback();
+        for (const auto &barrier : recorded_barriers) {
+            for (auto *resource : {barrier.resource, barrier.alias_after})
+                if (resource && !reinterpret_cast<ImportPeer *>(resource)->references) fixture_abort(__LINE__);
+        }
     }
     return barrier_result;
 }
@@ -603,7 +786,7 @@ static HRESULT APIENTRY heap_escape(HANDLE adapter, const D3DDDICB_ESCAPE *args)
             !native_header_valid(info->header, sizeof(*info)) || info->opcode != 1 || info->flags ||
             info->expected_generation != generation || info->va_start || info->va_size || info->generation ||
             info->context_id || info->queue_id) fixture_abort(__LINE__);
-    info->va_start = 0x10001000; info->va_size = 0x80000; info->generation = generation;
+    info->va_start = 0x10001000; info->va_size = msaa_heap_fixture ? 0x2000000 : 0x80000; info->generation = generation;
     info->context_id = 83; info->queue_id = 1;
     if (invalid_context_info) info->va_size = UINT64_MAX;
     return S_OK;
@@ -617,7 +800,8 @@ static HRESULT APIENTRY heap_allocate(HANDLE runtime, D3DDDICB_ALLOCATE *args) {
             data->alignment != 4096 || data->context_id != 83 || data->generation != generation ||
             (data->flags != 4 && data->flags != 6 && data->flags != 14) || data->format || data->width || data->height || data->pitch ||
             data->refresh_numerator || data->refresh_denominator || data->iova < 0x10001000 ||
-            data->iova % 4096 || data->size % 4096 || data->iova + data->size > 0x10081000)
+            data->iova % 4096 || data->size % 4096 || data->iova + data->size > (msaa_heap_fixture ? 0x12001000 : 0x10081000) ||
+            (msaa_heap_fixture && data->iova % 4194304))
         fixture_abort(__LINE__);
     for (const auto &item : kernel_heaps) {
         const auto &heap = item.second;
@@ -643,7 +827,9 @@ static HRESULT APIENTRY heap_allocate(HANDLE runtime, D3DDDICB_ALLOCATE *args) {
     }
     return fail_allocate ? E_OUTOFMEMORY : S_OK;
 }
-static HRESULT APIENTRY heap_deallocate(HANDLE runtime, const D3DDDICB_DEALLOCATE *args) {
+static unsigned legacy_deallocation_calls, pageable_deallocation_calls;
+static HRESULT pageable_deallocation_result = S_OK;
+static HRESULT heap_deallocate_impl(HANDLE runtime, const D3DDDICB_DEALLOCATE *args) {
     valid_kernel_callback(runtime);
     ++deallocations;
     if (fail_deallocate) { --fail_deallocate; return DXGI_ERROR_WAS_STILL_DRAWING; }
@@ -663,6 +849,20 @@ static HRESULT APIENTRY heap_deallocate(HANDLE runtime, const D3DDDICB_DEALLOCAT
     }
     if (nested_deallocate) nested_deallocate();
     return S_OK;
+}
+static HRESULT APIENTRY heap_deallocate(HANDLE runtime, const D3DDDICB_DEALLOCATE *args) {
+    ++legacy_deallocation_calls;
+    return heap_deallocate_impl(runtime, args);
+}
+static HRESULT APIENTRY heap_deallocate2(HANDLE runtime, const D3DDDICB_DEALLOCATE2 *args) {
+    valid_kernel_callback(runtime);
+    if (args->Flags.Value != 3) fixture_abort(__LINE__);
+    ++pageable_deallocation_calls;
+    if (pageable_deallocation_result != S_OK) return pageable_deallocation_result;
+    D3DDDICB_DEALLOCATE compatible{};
+    compatible.hResource = args->hResource; compatible.NumAllocations = args->NumAllocations;
+    compatible.HandleList = args->HandleList;
+    return heap_deallocate_impl(runtime, &compatible);
 }
 static HRESULT APIENTRY heap_lock(HANDLE runtime, D3DDDICB_LOCK *args) {
     valid_kernel_callback(runtime);
@@ -755,7 +955,14 @@ static void retire_import_with_map(Context *ctx, const mwd_allocation &allocatio
         fixture_abort(__LINE__);
 }
 
+#include "runtime_resource_queries_test.inc"
 #include "runtime_textures_test.inc"
+#include "runtime_buffers_test.inc"
+#include "runtime_alias_test.inc"
+#include "runtime_root_clear_test.inc"
+#include "runtime_bundle_root_data_test.inc"
+#include "runtime_uav_clear_test.inc"
+#include "runtime_predication_test.inc"
 
 static int test_native_heaps() {
     D3DDDI_ADAPTERCALLBACKS adapter_callbacks{};
@@ -767,6 +974,7 @@ static int test_native_heaps() {
     D3DDDI_DEVICECALLBACKS kt{};
     kt.pfnCreateContextCb = heap_context_create; kt.pfnDestroyContextCb = heap_context_destroy;
     kt.pfnEscapeCb = heap_escape; kt.pfnAllocateCb = heap_allocate; kt.pfnDeallocateCb = heap_deallocate;
+    kt.pfnDeallocate2Cb = heap_deallocate2;
     kt.pfnLockCb = heap_lock; kt.pfnUnlockCb = heap_unlock; kt.pfnRenderCb = heap_render;
     kt.pfnSignalSynchronizationObject2Cb = heap_signal;
     D3D12DDI_CORELAYER_DEVICECALLBACKS_0003 um{}; um.pfnSetErrorCb = test_error;
@@ -917,17 +1125,36 @@ static int test_native_heaps() {
     auto sizes = table.pfnCalcPrivateHeapAndResourceSizes(create.hDrvDevice, &desc, &resource);
     REQUIRE(sizes.Heap == sizeof(NativeHeapSlot) && sizes.Resource == sizeof(Object));
     unsigned before_pair = allocations;
+    desc.ByteSize = 131072; // Resource requirement remains 64 KiB inside a larger heap.
     REQUIRE(paired() == S_OK && allocations == before_pair + 1 && imports == 1 && placements == 1);
     auto *paired_heap = native_heap_find(ctx, ha.pDrvPrivate);
     REQUIRE(paired_heap && object(resource_handle.pDrvPrivate)->address == paired_heap->address && paired_heap->users == 2);
+    REQUIRE(test_native_resource_queries(ctx, create.hDrvDevice, table, resource_handle,
+            paired_heap, D3D12DDI_TL_ROW_MAJOR, paired_heap->address) == 0);
     for (size_t i = sizeof(Object); i < resource_storage.size(); ++i) REQUIRE(resource_storage[i] == 0xa5);
     // Destroying the heap slot cannot destroy the resource's imported backing.
     destroy(ha);
     REQUIRE(native_token(ctx, paired_heap) && paired_heap->users == 1 && kernel_heaps.size() == 1);
-    table.pfnDestroyHeapAndResource(create.hDrvDevice, {}, resource_handle);
+    REQUIRE(test_native_resource_queries(ctx, create.hDrvDevice, table, resource_handle,
+            paired_heap, D3D12DDI_TL_ROW_MAJOR, paired_heap->address) == 0);
+    // Actual resource retirement and slot poisoning from the identity callback
+    // must precede lookup; no old allocation handle may escape afterward.
+    identity_query_callback = [&]() {
+        table.pfnDestroyHeapAndResource(create.hDrvDevice, {}, resource_handle);
+        resource_storage.fill(0xcc);
+    };
+    D3D12DDI_RESOURCE_ALLOCATION_INFO retired_info;
+    std::memset(&retired_info, 0xa5, sizeof(retired_info));
+    const auto retired_original = retired_info;
+    D3DKMT_HANDLE retired_handle = 0xa5a5a5a5;
+    table.pfnCheckExistingResourceAllocationInfo(create.hDrvDevice, resource_handle, &retired_info, &retired_handle);
+    REQUIRE(!identity_query_callback && retired_handle == 0xa5a5a5a5 &&
+            !std::memcmp(&retired_info, &retired_original, sizeof(retired_info)));
     REQUIRE(kernel_heaps.empty() && !ctx->native_heaps);
+    desc.ByteSize = 65536;
+    puts("PASS native resource queries: exact allocation handle/requirements/GPUVA, larger heap, retained resource and reentrant retirement");
     // R0 has no explicit UAV resource flag. Native default buffers retain
-    // UAV-capable backend usage; READBACK still permits COPY_DEST only.
+    // UAV-capable backend usage; cached native buffer UAVs are not implemented.
     resource.InitialResourceState = D3D12DDI_RESOURCE_STATE_UNORDERED_ACCESS;
     before_pair = allocations;
     REQUIRE(table.pfnCalcPrivateHeapAndResourceSizes(create.hDrvDevice, &desc, &resource).Heap == 0);
@@ -945,6 +1172,8 @@ static int test_native_heaps() {
     before_pair = allocations;
     REQUIRE(paired() == DXGI_ERROR_UNSUPPORTED && allocations == before_pair);
     resource.Flags = D3D12DDI_RESOURCE_FLAG_0003_NONE;
+    REQUIRE(test_native_buffer_read_states(ctx, create.hDrvDevice, table) == 0);
+    REQUIRE(test_native_buffer_children(ctx, create.hDrvDevice, table) == 0);
     REQUIRE(test_native_textures(ctx, create.hDrvDevice, table) == 0);
     desc.CPUPageProperty = D3D12DDI_CPU_PAGE_PROPERTY_WRITE_BACK;
     resource.InitialResourceState = D3D12DDI_RESOURCE_STATE_COPY_DEST;
@@ -1096,6 +1325,18 @@ static int test_native_heaps() {
     kernel_heaps.clear(); kernel_resources.clear(); heap_callbacks_retired = false;
     REQUIRE(adapter.pfnCloseAdapter(open.hAdapter) == S_OK);
     std::puts("PASS ordinary backend completion/unmap/release before runtime retirement; recursive poisoned-slot retirement remains closed");
+    for (unsigned phase = 0; phase < 4; ++phase) {
+        REQUIRE(OpenAdapter12(&open) == S_OK);
+        REQUIRE(adapter.pfnCreateDevice(open.hAdapter, &create) == S_OK);
+        ctx = context(create.hDrvDevice); REQUIRE(retain_live(ctx));
+        std::weak_ptr<NativeAdapter> owner = ctx->native_adapter;
+        REQUIRE(test_native_buffer_child_cancel(ctx, create.hDrvDevice, table, phase, [&]() {
+            adapter.pfnDestroyDevice(create.hDrvDevice); heap_callbacks_retired = true; memory.fill(0xa5);
+        }) == 0);
+        REQUIRE(adapter.pfnCloseAdapter(open.hAdapter) == S_OK);
+        release(ctx); REQUIRE(owner.expired());
+        kernel_heaps.clear(); kernel_resources.clear(); heap_callbacks_retired = false;
+    }
     std::printf("PASS native buffer heaps/shared runtime allocation tokens/RenderCb replacements/reset/reentrant teardown (%zu-bit); DDI versions remain unsupported\n", sizeof(void *) * 8);
     return 0;
 }
@@ -1201,15 +1442,20 @@ static int test_native_command_errors() {
     REQUIRE(barrier_calls == prior_invalid && command_errors.back().second == E_NOTIMPL);
     batch[2].Flags = D3D12DDI_RESOURCE_BARRIER_FLAG_NONE;
     batch[2].Type = D3D12DDI_RESOURCE_BARRIER_TYPE_ALIASING;
+    batch[2].Aliasing = {{&buffer}, {&buffer}};
     commands.pfnResourceBarrier(second_handle, 3, batch);
-    REQUIRE(barrier_calls == prior_invalid && command_errors.back().second == E_NOTIMPL);
+    REQUIRE(barrier_calls == prior_invalid + 1 && recorded_barriers.size() == 3);
+    batch[2].Type = D3D12DDI_RESOURCE_BARRIER_TYPE_0022_RANGED;
+    commands.pfnResourceBarrier(second_handle, 3, batch);
+    REQUIRE(barrier_calls == prior_invalid + 1 && command_errors.back().second == E_NOTIMPL);
+    batch[2] = {};
     batch[2].Type = D3D12DDI_RESOURCE_BARRIER_TYPE_UAV;
     commands.pfnResourceBarrier(first_handle, 1, nullptr);
-    REQUIRE(barrier_calls == prior_invalid && command_errors.back().second == E_INVALIDARG);
+    REQUIRE(barrier_calls == prior_invalid + 1 && command_errors.back().second == E_INVALIDARG);
     commands.pfnResourceBarrier(first_handle, 65537, batch);
-    REQUIRE(barrier_calls == prior_invalid && command_errors.back().second == E_INVALIDARG);
+    REQUIRE(barrier_calls == prior_invalid + 1 && command_errors.back().second == E_INVALIDARG);
     commands.pfnResourceBarrier(first_handle, 0, nullptr);
-    REQUIRE(barrier_calls == prior_invalid + 1 && recorded_barriers.empty());
+    REQUIRE(barrier_calls == prior_invalid + 2 && recorded_barriers.empty());
     std::array<D3D12DDIARG_RESOURCE_BARRIER_0003, 17> large_batch{};
     for (auto &barrier : large_batch) barrier.Type = D3D12DDI_RESOURCE_BARRIER_TYPE_UAV;
     commands.pfnResourceBarrier(first_handle, UINT(large_batch.size()), large_batch.data());
@@ -1334,6 +1580,7 @@ static int test_native_queue_lifetime() {
     D3DDDI_DEVICECALLBACKS kt{};
     kt.pfnCreateContextCb = heap_context_create; kt.pfnDestroyContextCb = heap_context_destroy;
     kt.pfnEscapeCb = heap_escape; kt.pfnAllocateCb = heap_allocate; kt.pfnDeallocateCb = heap_deallocate;
+    kt.pfnDeallocate2Cb = heap_deallocate2;
     kt.pfnLockCb = heap_lock; kt.pfnUnlockCb = heap_unlock;
     D3D12DDI_CORELAYER_DEVICECALLBACKS_0003 um{};
     um.pfnCreateContextCb = queue_context_create; um.pfnDestroyContextCb = queue_context_destroy;
@@ -1486,6 +1733,7 @@ static int test_native_completion() {
     D3DDDI_DEVICECALLBACKS kt{};
     kt.pfnCreateContextCb = heap_context_create; kt.pfnDestroyContextCb = heap_context_destroy;
     kt.pfnEscapeCb = heap_escape; kt.pfnAllocateCb = heap_allocate; kt.pfnDeallocateCb = heap_deallocate;
+    kt.pfnDeallocate2Cb = heap_deallocate2;
     kt.pfnLockCb = heap_lock; kt.pfnUnlockCb = heap_unlock; kt.pfnRenderCb = heap_render;
     kt.pfnSignalSynchronizationObject2Cb = heap_signal;
     D3D12DDI_CORELAYER_DEVICECALLBACKS_0003 um{}; um.pfnSetErrorCb = test_error;
@@ -1648,11 +1896,38 @@ static int test_native_completion() {
 
 #include "runtime_indirect_test.inc"
 #include "runtime_fences_test.inc"
+#include "runtime_node_metadata_test.inc"
 #include "runtime_residency_test.inc"
 #include "runtime_queries_test.inc"
+#include "runtime_native_surface_test.inc"
+#include "runtime_pageable_destroy_test.inc"
+
+#include "runtime_queue_protocol_test.inc"
+#include "runtime_adapter_facts_test.inc"
+#include "runtime_memory_facts_test.inc"
+#include "runtime_memory_caps_test.inc"
+#include "runtime_bundles_test.inc"
+#include "runtime_msaa_test.inc"
 
 int main(int argc, char **argv) {
+    if (argc == 2 && !std::strcmp(argv[1], "--native-alias-residency-only")) {
+        const int result = test_native_surface_provider();
+        if (!result) std::puts("PASS NATIVE_ALIAS_RESIDENCY actual_UMD=1 injected_surface_fixture=1 GPU=0 SYSTEM=0");
+        return result;
+    }
+    if (argc == 2 && !std::strcmp(argv[1], "--native-residency-only")) {
+        const int result = test_native_residency();
+        if (!result) std::puts("PASS NATIVE_RESIDENCY actual_UMD=1 controlled_callbacks=1 GPU=0 SYSTEM=0");
+        return result;
+    }
+    if (argc == 2 && !std::strcmp(argv[1], "--node-metadata-only")) return test_native_node_metadata();
+    if (argc == 2 && !std::strcmp(argv[1], "--bundle-root-data-only")) return test_native_bundle_root_data();
+    if (argc == 2 && !std::strcmp(argv[1], "--bundles-only")) return test_native_bundles();
+    if (argc == 2 && !std::strcmp(argv[1], "--memory-caps-only")) return test_native_memory_caps();
+    if (argc == 2 && !std::strcmp(argv[1], "--memory-facts-only")) return test_native_memory_facts();
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    if (argc == 2 && !std::strcmp(argv[1], "--adapter-facts-only")) return test_native_adapter_facts();
+    if (argc == 2 && !std::strcmp(argv[1], "--msaa-only")) return test_native_msaa_admission();
     if (argc == 2 && !std::strcmp(argv[1], "--negative-control-deferred-backend")) force_deferred_cleanup = true;
     else if (argc == 2 && !std::strcmp(argv[1], "--negative-control-command-error-owner")) force_device_command_error = true;
     else if (argc == 2 && !std::strcmp(argv[1], "--negative-control-global-uav-barrier")) force_drop_global_barrier = true;
@@ -1663,7 +1938,11 @@ int main(int argc, char **argv) {
     else if (argc == 2 && !std::strcmp(argv[1], "--negative-control-native-fence-mask")) native_fence_drop_mask = true;
     else if (argc == 2 && !std::strcmp(argv[1], "--negative-control-native-residency-pending")) native_residency_drop_pending = true;
     else if (argc == 2 && !std::strcmp(argv[1], "--negative-control-native-residency-evict")) native_residency_skip_evict = true;
+    else if (argc == 2 && !std::strcmp(argv[1], "--negative-control-native-alias-paging-hold")) native_residency_skip_alias_holds = true;
+    else if (argc == 2 && !std::strcmp(argv[1], "--negative-control-native-present-alias-hold")) force_present_alias_unpinned = true;
     else if (argc == 2 && !std::strcmp(argv[1], "--negative-control-query-field-order")) force_query_swap_fields = true;
+    else if (argc == 2 && !std::strcmp(argv[1], "--negative-control-native-open-close")) native_surface_skip_close = true;
+    else if (argc == 2 && !std::strcmp(argv[1], "--negative-control-native-retain-pin")) native_surface_late_pin = true;
     else if (argc != 1) return 2;
     REQUIRE(test_finalization_borrow() == 0);
     REQUIRE(OpenAdapter12(nullptr) == E_INVALIDARG);
@@ -1711,6 +1990,16 @@ int main(int argc, char **argv) {
     create.Interface = size.Interface; create.Version = size.Version;
     create.pKTCallbacks = &kt; create.p12UMCallbacks = &um;
     create.hDrvDevice.pDrvPrivate = storage.data();
+    // The real 58642 query writes only the first160 bytes. Admission must
+    // reject this before LoadLibrary/backend creation, never probe a40-byte
+    // context after publishing resources on a legacy allocation domain.
+    missing_queue_protocol = true;
+    const HRESULT missing_protocol_hr = funcs.pfnCreateDevice(open.hAdapter, &create);
+    std::printf("PROTOCOL legacy160 hr=%08x loads=%u backend_creates=%u\n",
+        static_cast<unsigned>(missing_protocol_hr), loads, creates);
+    REQUIRE(missing_protocol_hr == DXGI_ERROR_UNSUPPORTED && !loads && !creates);
+    for (auto byte : storage) REQUIRE(byte == 0xa5);
+    missing_queue_protocol = false;
     ++generation;
     REQUIRE(funcs.pfnCreateDevice(open.hAdapter, &create) == DXGI_ERROR_DEVICE_REMOVED && !loads);
     --generation; bad_loader = true;
@@ -1767,6 +2056,10 @@ int main(int argc, char **argv) {
     retire_in_error = nullptr;
     REQUIRE(test_native_heaps() == 0);
     REQUIRE(test_native_command_errors() == 0);
+    REQUIRE(test_native_alias_barriers() == 0);
+    REQUIRE(test_native_root_clear() == 0);
+    REQUIRE(test_native_uav_clear() == 0);
+    REQUIRE(test_native_predication() == 0);
     REQUIRE(test_native_queue_lifetime() == 0);
     REQUIRE(test_native_completion() == 0);
     REQUIRE(test_native_indirect() == 0);
@@ -1774,6 +2067,12 @@ int main(int argc, char **argv) {
     REQUIRE(test_native_residency() == 0);
     REQUIRE(test_native_queries() == 0);
     REQUIRE(test_native_queries(true) == 0);
+    REQUIRE(test_native_surface_provider() == 0);
+    REQUIRE(test_native_pageable_destroy() == 0);
+    REQUIRE(test_native_queue_protocol() == 0);
+    REQUIRE(test_native_adapter_facts() == 0);
+    REQUIRE(test_native_memory_facts() == 0);
+    REQUIRE(test_native_memory_caps() == 0);
     std::printf("PASS native OpenAdapter12 WDK identity/negotiation/private memory/callback/lifetime/error cleanup (%zu-bit); no system-runtime or GPU acceptance\n", sizeof(void *) * 8);
     return 0;
 }

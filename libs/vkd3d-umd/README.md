@@ -171,6 +171,16 @@ contracts, and FillDDITable refuses partial tables. This is real adapter/device
 lifecycle code with a WDK fixture, not successful Microsoft D3D12CreateDevice
 activation. The fixture does not enable an alternate production admission path.
 
+The R0 memory-architecture query now answers only node0 with the original
+12-byte UMA/IOCoherent/CacheCoherent structure. It requires the paired
+owned-memory profile, matching current KMD identity/cache facts and an actual
+coherent/cached memory-type witness. Valid raw false/unknown facts remain
+unsupported, and all rejected queries preserve caller output. The request and
+node are copied before callbacks; CloseAdapter during the query prevents output
+publication. This conditional owned-backing contract is not a physical coherence
+measurement. Other caps, supported versions and public table publication stay
+closed; no SYSTEM D3D12 device or feature-level support follows from this query.
+
 The next native slice implements R0 buffer-only heaps through the runtime's real
 CreateContext/Escape/Allocate/Lock/Unlock/Deallocate callbacks. It preserves the
 original adapter/device/resource handles, validates the v0 KMD context's reset

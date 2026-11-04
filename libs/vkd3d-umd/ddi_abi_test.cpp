@@ -39,16 +39,34 @@ int main(int argc, char **argv) {
     REQUIRE(commands.value.pfnSetDescriptorHeaps && commands.value.pfnSetComputeRootDescriptorTable);
     REQUIRE(commands.value.pfnCopyTextureRegion && device.value.pfnCreateSampler);
     REQUIRE(device.value.pfnCheckResourceAllocationInfo);
+    REQUIRE(device.value.pfnCheckExistingResourceAllocationInfo && device.value.pfnCheckResourceAllocationHandle &&
+            device.value.pfnCheckResourceVirtualAddress && device.value.pfnCheckSubresourceInfo);
     REQUIRE(device.value.pfnCalcPrivateHeapAndResourceSizes && device.value.pfnCreateHeapAndResource &&
             device.value.pfnDestroyHeapAndResource && device.value.pfnMapHeap && device.value.pfnUnmapHeap);
     REQUIRE(device.value.pfnCalcPrivateFenceSize && device.value.pfnCreateFence && device.value.pfnDestroyFence);
     REQUIRE(device.value.pfnMakeResident && device.value.pfnEvict);
     REQUIRE(queue.value.pfnSignalFence && queue.value.pfnWaitForFence);
     REQUIRE(device.value.pfnCreateVertexShader && device.value.pfnCreatePixelShader && device.value.pfnCreateRenderTargetView);
+    REQUIRE(device.value.pfnCreateGeometryShader && device.value.pfnCalcPrivateGeometryShaderWithStreamOutput &&
+            device.value.pfnCreateGeometryShaderWithStreamOutput && commands.value.pfnSOSetTargets);
+    REQUIRE(device.value.pfnCalcPrivateGeometryShaderWithStreamOutput({}, nullptr, nullptr) == size());
+    REQUIRE(device.value.pfnCalcPrivateTessellationShaderSize && device.value.pfnCreateHullShader && device.value.pfnCreateDomainShader);
+    REQUIRE(device.value.pfnCalcPrivateTessellationShaderSize({}, nullptr, {}, nullptr) == size());
+    device.value.pfnCreateHullShader({}, nullptr, {}, {}, nullptr, {});
+    device.value.pfnCreateDomainShader({}, nullptr, {}, {}, nullptr, {});
+    device.value.pfnCreateGeometryShader({}, nullptr, {}, {}, nullptr, {});
+    device.value.pfnCreateGeometryShaderWithStreamOutput({}, nullptr, {}, nullptr, {});
+    commands.value.pfnSOSetTargets({}, 0, 0, nullptr);
     REQUIRE(device.value.pfnCreateBlendState && device.value.pfnCreateRasterizerState && device.value.pfnCreateDepthStencilState);
     REQUIRE(commands.value.pfnDrawInstanced && commands.value.pfnDrawIndexedInstanced && commands.value.pfnIaSetTopology &&
             commands.value.pfnRsSetViewports && commands.value.pfnRsSetScissorRects && commands.value.pfnOMSetRenderTargets &&
             commands.value.pfnClearRenderTargetView && commands.value.pfnIASetIndexBuffer && commands.value.pfnSetGraphicsRootSignature);
+    REQUIRE(commands.value.pfnSetGraphicsRootDescriptorTable && commands.value.pfnSetGraphicsRoot32BitConstant &&
+            commands.value.pfnSetGraphicsRoot32BitConstants && commands.value.pfnSetGraphicsRootConstantBufferView &&
+            commands.value.pfnSetGraphicsRootShaderResourceView && commands.value.pfnSetGraphicsRootUnorderedAccessView);
+    REQUIRE(device.value.pfnCheckFormatSupport && device.value.pfnCheckMultisampleQualityLevels);
+    REQUIRE(device.value.pfnCreateDepthStencilView && commands.value.pfnClearDepthStencilView);
+    REQUIRE(commands.value.pfnOmSetBlendFactor && commands.value.pfnResourceCopy);
     commands.value.pfnDrawInstanced({}, 3, 1, 0, 0);
     commands.value.pfnDrawIndexedInstanced({}, 3, 1, 0, -1, 0);
     commands.value.pfnRsSetViewports({}, 0, nullptr);

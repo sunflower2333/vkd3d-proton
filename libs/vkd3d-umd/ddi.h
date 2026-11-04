@@ -1,7 +1,18 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 #include <windows.h>
+/* The WDK still uses SAL1 __out in PFND3D12DDI_SERIALIZEOBJECT. MinGW omits
+ * that spelling in C++ to avoid colliding with standard-library locals. Keep
+ * the compatibility spelling confined to the WDK include. */
+#if defined(__MINGW32__) && !defined(__out)
+#define VKDU_DDI_DEFINE_OUT
+#define __out
+#endif
 #include <d3d12umddi.h>
+#ifdef VKDU_DDI_DEFINE_OUT
+#undef __out
+#undef VKDU_DDI_DEFINE_OUT
+#endif
 #include "backend.h"
 
 /* Native OpenAdapter12 plus internal bridge entrypoints. No complete DDI

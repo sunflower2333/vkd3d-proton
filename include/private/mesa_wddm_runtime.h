@@ -10,6 +10,15 @@
 #define MWD_RUNTIME_ABI_VERSION 2u
 #define MWD_RUNTIME_MAGIC 0x3152574du
 #define MWD_STYPE_SUPPORT 0x7fff2330
+/* Version-specific query preserves the deployed DXVK ABI1 reply. */
+#define MWD_STYPE_SUPPORT_V2 0x7fff2335
+#define MWD_STYPE_NATIVE_SURFACE_SUPPORT_V2 0x7fff2336
+#define MWD_STYPE_NATIVE_SURFACE_DEVICE_V2 0x7fff2337
+#define MWD_STYPE_NATIVE_PRESENT_SUPPORT_V2 0x7fff2338
+#define MWD_SUPPORT_NATIVE_SURFACE 0x2u
+#define MWD_SUPPORT_NATIVE_PRESENT 0x4u
+#define MWD_ALLOCATION_NATIVE_SURFACE 0x10u
+#define MWD_NATIVE_SURFACE_REFERENCE UINT32_MAX
 #define MWD_STYPE_DEVICE  0x7fff2331
 #define MWD_STYPE_IMPORT  0x7fff2332
 #define MWD_STYPE_SUBMIT  0x7fff2333
@@ -68,6 +77,21 @@ struct mwd_device_create_info {
    const struct mwd_callbacks *callbacks;
    void *owner;
 };
+/* Separately negotiated ABI2 opt-in. An absent input retains the original
+ * heap-only protocol. Native tokens must already have a live provider owner. */
+struct mwd_native_surface_device_info {
+   int32_t sType;
+   const void *pNext;
+   void *owner;
+   uint32_t flags, reserved;
+};
+static inline int mwd_native_surface_device_valid(const struct mwd_native_surface_device_info *info,
+        const void *owner)
+{
+   return !info || (info->sType == MWD_STYPE_NATIVE_SURFACE_DEVICE_V2 && !info->pNext &&
+      info->owner && info->owner == owner && !info->reserved &&
+      (info->flags == MWD_SUPPORT_NATIVE_SURFACE || info->flags == (MWD_SUPPORT_NATIVE_SURFACE | MWD_SUPPORT_NATIVE_PRESENT)));
+}
 /* VkMemoryAllocateInfo input. A successful import retains the exact existing
  * allocation; failed imports transfer no ownership. */
 struct mwd_import_memory_info {

@@ -8,6 +8,7 @@ static int test_native_fences() {
     D3DDDI_DEVICECALLBACKS kt{};
     kt.pfnCreateContextCb = heap_context_create; kt.pfnDestroyContextCb = heap_context_destroy;
     kt.pfnEscapeCb = heap_escape; kt.pfnAllocateCb = heap_allocate; kt.pfnDeallocateCb = heap_deallocate;
+    kt.pfnDeallocate2Cb = heap_deallocate2;
     kt.pfnLockCb = heap_lock; kt.pfnUnlockCb = heap_unlock;
     D3D12DDI_CORELAYER_DEVICECALLBACKS_0003 um{};
     um.pfnCreateContextCb = queue_context_create; um.pfnDestroyContextCb = queue_context_destroy;

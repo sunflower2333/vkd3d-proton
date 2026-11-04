@@ -1,8 +1,11 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #define COBJMACROS
+#define VKD3D_DBG_CHANNEL VKD3D_DBG_CHANNEL_API
 #include "vkd3d.h"
 #include "vkd3d_wddm.h"
 #include "vkd3d_atomic.h"
+#include "vkd3d_threads.h"
+#include "vkd3d_shader.h"
 #include "backend.h"
 #include <stdlib.h>
 #include <string.h>
@@ -14,30 +17,72 @@
 struct vkdu_device { ID3D12Device *object; };
 struct vkdu_root_slot { uint32_t type, extent, heap_type, unbounded; };
 struct vkdu_query_scope { IUnknown *heap; uint32_t type, index; };
+/* Descriptors do not own resources. A generation ID distinguishes stale views
+ * and placed aliases even when their object address or GPU address is reused. */
+struct vkdu_uav_record {
+    uint64_t resource_id, first;
+    uint32_t format, count, stride, flags;
+};
+struct vkdu_attachment_lifetime {
+    uint64_t references, generation;
+    vkdu_object *live;
+};
+struct vkdu_attachment_record {
+    struct vkdu_attachment_lifetime *lifetime;
+    uint32_t width, height, layers, format, mip, first_layer, sample_count, sample_quality;
+};
+static uint64_t vkdu_object_serial;
+struct vkdu_bundle_owner;
+struct vkdu_bundle_requirement;
 struct vkdu_object {
     uint32_t references;
     IUnknown *object;
     ID3D12Device *owner;
     enum vkdu_kind kind;
+    uint64_t identity;
     uint64_t bytes;
+    uint64_t placement_heap_id, placement_offset;
     uint32_t heap_type, command_type;
     int closed;
+    vkdu_object *command_allocator;
+    uint64_t allocator_generation, bundle_generation;
+    uint32_t bundle_recordings, bundle_users, bundle_changed;
+    uint32_t bundle_needs_root, bundle_needs_targets, bundle_inherited_indices;
+    /* Bundles use one immutable raster sample tuple for this private slice.
+     * A later raster PSO with a different tuple is rejected before any GPU
+     * command is emitted; stream-output-only PSOs do not set this tuple. */
+    uint32_t bundle_has_raster, bundle_raster_samples, bundle_raster_quality;
+    struct vkdu_bundle_owner *bundle_owners;
+    struct vkdu_bundle_requirement *bundle_requirements;
+    int predicate_enabled;
     uint32_t resource_flags, descriptor_count, descriptor_stride;
     int shader_visible;
     /* Copy root layout at bind time: never retain a borrowed private wrapper. */
     struct vkdu_root_slot slots[64];
     uint32_t slot_count;
+    struct vkdu_root_slot graphics_slots[64];
+    uint32_t graphics_slot_count;
     uint64_t bound_heaps[2];
     uint32_t width, height, format;
     int texture_heap;
     uint32_t graphics_root, graphics_pipeline, topology, viewport_count, scissor_count, render_target, index_count;
+    uint32_t pipeline_samples, pipeline_quality, attachment_samples, attachment_quality;
     uint32_t query_type, query_count, query_scope_count, query_scope_capacity;
     struct vkdu_query_scope *query_scopes;
+    struct vkdu_uav_record *uav_records;
+    struct vkdu_attachment_lifetime *attachment_lifetime;
+    struct vkdu_attachment_record *attachment_records;
+#ifdef VKDU_ENABLE_TEST_DEVICE
+    void (*test_retire_hook)(void *);
+    void *test_retire_context;
+#endif
 };
 
 #define OBJ(type, o) ((type *)(o)->object)
 #define VALID(o, k) ((o) && (o)->object && (o)->kind == (k))
 #define RECORDING(o) (VALID(o, VKDU_COMMAND_LIST) && !(o)->closed)
+#include "backend_attachment_records.inc"
+#include "backend_bundles.inc"
 
 static int32_t wrap(vkdu_device *device, enum vkdu_kind kind, HRESULT hr, IUnknown *object, vkdu_object **out)
 {
@@ -49,35 +94,43 @@ static int32_t wrap(vkdu_device *device, enum vkdu_kind kind, HRESULT hr, IUnkno
     value->owner = device->object;
     ID3D12Device_AddRef(value->owner);
     value->kind = kind;
+    value->identity = vkd3d_atomic_uint64_increment(&vkdu_object_serial, vkd3d_memory_order_relaxed);
+    if (kind == VKDU_TEXTURE2D) {
+        if (!(value->attachment_lifetime = calloc(1, sizeof(*value->attachment_lifetime)))) {
+            IUnknown_Release(object); ID3D12Device_Release(value->owner); free(value); return E_OUTOFMEMORY;
+        }
+        value->attachment_lifetime->references = 1;
+        value->attachment_lifetime->generation = value->identity;
+        value->attachment_lifetime->live = value;
+    }
     *out = value;
     return S_OK;
 }
 
-static int32_t create_device(PFN_vkGetInstanceProcAddr loader, const struct vkdu_adapter *adapter, int test_cpu,
-        int runtime_identity, const struct mwd_device_create_info *runtime, vkdu_device **out)
+#include "backend_memory_profile.inc"
+
+static int32_t select_physical_device(PFN_vkGetInstanceProcAddr loader, const struct vkdu_adapter *adapter,
+        int test_cpu, int runtime_identity, struct vkd3d_instance **out_instance, VkPhysicalDevice *out_physical)
 {
-    struct vkd3d_instance_create_info instance_info = {0};
-    struct vkd3d_device_create_info device_info = {0};
+    struct vkd3d_instance_create_info info = {0};
     PFN_vkEnumeratePhysicalDevices enumerate;
     PFN_vkGetPhysicalDeviceProperties2 properties;
     struct vkd3d_instance *instance = NULL;
     VkPhysicalDevice *devices = NULL, selected = VK_NULL_HANDLE;
     VkInstance vk_instance;
-    uint32_t count = 0, i;
-    vkdu_device *device = NULL;
+    uint32_t count = 0, capacity, i;
     HRESULT hr;
-    if (!out) return E_POINTER;
-    *out = NULL;
     if (!loader || (!test_cpu && !adapter)) return E_INVALIDARG;
-    instance_info.pfn_vkGetInstanceProcAddr = loader;
-    if (FAILED(hr = vkd3d_create_instance(&instance_info, &instance))) return hr;
+    info.pfn_vkGetInstanceProcAddr = loader;
+    if (FAILED(hr = vkd3d_create_instance(&info, &instance))) return hr;
     vk_instance = vkd3d_instance_get_vk_instance(instance);
     enumerate = (PFN_vkEnumeratePhysicalDevices)loader(vk_instance, "vkEnumeratePhysicalDevices");
     properties = (PFN_vkGetPhysicalDeviceProperties2)loader(vk_instance, "vkGetPhysicalDeviceProperties2");
     hr = DXGI_ERROR_NOT_FOUND;
     if (!enumerate || !properties || enumerate(vk_instance, &count, NULL) != VK_SUCCESS || !count) goto done;
+    capacity = count;
     if (!(devices = calloc(count, sizeof(*devices)))) { hr = E_OUTOFMEMORY; goto done; }
-    if (enumerate(vk_instance, &count, devices) != VK_SUCCESS) { hr = E_FAIL; goto done; }
+    if (enumerate(vk_instance, &count, devices) != VK_SUCCESS || count > capacity) { hr = E_FAIL; goto done; }
     for (i = 0; i < count; ++i) {
         VkPhysicalDeviceIDProperties id = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
         VkPhysicalDeviceDriverProperties driver = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
@@ -86,13 +139,56 @@ static int32_t create_device(PFN_vkGetInstanceProcAddr loader, const struct vkdu
         properties(devices[i], &props);
         if (test_cpu ? props.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU :
             (id.deviceLUIDValid && !memcmp(id.deviceLUID, adapter->luid, 8) &&
-             (runtime_identity || (props.properties.vendorID == adapter->vendor_id && props.properties.deviceID == adapter->device_id)) &&
+             (runtime_identity ? id.deviceNodeMask == 1 :
+              (props.properties.vendorID == adapter->vendor_id && props.properties.deviceID == adapter->device_id)) &&
              driver.driverID == VK_DRIVER_ID_MESA_TURNIP)) {
-            if (selected) { hr = E_INVALIDARG; goto done; } /* Never select ambiguously. */
+            if (selected) { hr = E_INVALIDARG; goto done; }
             selected = devices[i];
         }
     }
-    if (!selected) goto done;
+    if (selected) {
+        *out_instance = instance; instance = NULL; *out_physical = selected; hr = S_OK;
+    }
+done:
+    free(devices);
+    if (instance) vkd3d_instance_decref(instance);
+    return hr;
+}
+
+int32_t vkdu_query_adapter_memory_facts(PFN_vkGetInstanceProcAddr loader,
+        const struct vkdu_memory_expectation *expected, struct vkdu_memory_facts *out)
+{
+    struct vkd3d_instance *instance = NULL;
+    struct vkdu_adapter adapter = {0};
+    VkPhysicalDevice selected = VK_NULL_HANDLE;
+    HRESULT hr;
+    if (!out) return E_POINTER;
+    if (!expected) return E_INVALIDARG;
+    memcpy(adapter.luid, expected->luid, 8);
+    if (FAILED(hr = select_physical_device(loader, &adapter, 0, 1, &instance, &selected))) return hr;
+    hr = vkdu_memory_facts_for_device(loader, vkd3d_instance_get_vk_instance(instance), selected, expected, out);
+    vkd3d_instance_decref(instance);
+    return hr;
+}
+
+static int32_t create_device(PFN_vkGetInstanceProcAddr loader, const struct vkdu_adapter *adapter, int test_cpu,
+        int runtime_identity, const struct mwd_device_create_info *runtime,
+        const struct vkdu_memory_expectation *expected, struct vkdu_memory_facts *facts, vkdu_device **out)
+{
+    struct vkd3d_device_create_info device_info = {0};
+    struct vkd3d_instance *instance = NULL;
+    struct vkdu_memory_facts current = {0};
+    VkPhysicalDevice selected = VK_NULL_HANDLE;
+    vkdu_device *device = NULL;
+    HRESULT hr;
+    if (!out) return E_POINTER;
+    *out = NULL;
+    if (FAILED(hr = select_physical_device(loader, adapter, test_cpu, runtime_identity, &instance, &selected))) return hr;
+    if (expected) {
+        hr = vkdu_memory_facts_for_device(loader, vkd3d_instance_get_vk_instance(instance), selected, expected, &current);
+        if (FAILED(hr)) goto done;
+        if (!vkdu_memory_facts_qualified(&current)) { hr = DXGI_ERROR_UNSUPPORTED; goto done; }
+    }
     if (!(device = calloc(1, sizeof(*device)))) { hr = E_OUTOFMEMORY; goto done; }
     device_info.instance = instance;
     device_info.vk_physical_device = selected;
@@ -104,15 +200,18 @@ static int32_t create_device(PFN_vkGetInstanceProcAddr loader, const struct vkdu
     if (SUCCEEDED(hr) && vkd3d_get_vk_physical_device(device->object) != selected) {
         ID3D12Device_Release(device->object); device->object = NULL; hr = DXGI_ERROR_NOT_FOUND;
     }
-    if (SUCCEEDED(hr)) { *out = device; device = NULL; }
+    if (SUCCEEDED(hr)) {
+        if (facts) *facts = current;
+        *out = device; device = NULL;
+    }
 done:
-    free(device); free(devices);
+    free(device);
     vkd3d_instance_decref(instance);
     return hr;
 }
 
 int32_t vkdu_device_create(PFN_vkGetInstanceProcAddr loader, const struct vkdu_adapter *adapter, vkdu_device **out)
-{ return create_device(loader, adapter, 0, 0, NULL, out); }
+{ return create_device(loader, adapter, 0, 0, NULL, NULL, NULL, out); }
 int32_t vkdu_device_create_runtime(PFN_vkGetInstanceProcAddr loader, const uint8_t luid[8], vkdu_device **out)
 {
     struct vkdu_adapter adapter = {0};
@@ -120,22 +219,59 @@ int32_t vkdu_device_create_runtime(PFN_vkGetInstanceProcAddr loader, const uint8
     if (out) *out = NULL;
     if (!luid || !memcmp(luid, zero_luid, sizeof(zero_luid))) return E_INVALIDARG;
     memcpy(adapter.luid, luid, sizeof(adapter.luid));
-    return create_device(loader, &adapter, 0, 1, NULL, out);
+    return create_device(loader, &adapter, 0, 1, NULL, NULL, NULL, out);
 }
-int32_t vkdu_device_create_shared(PFN_vkGetInstanceProcAddr loader, const uint8_t luid[8],
-        const struct mwd_callbacks *callbacks, void *owner, vkdu_device **out)
+static int32_t create_shared(PFN_vkGetInstanceProcAddr loader, const uint8_t luid[8],
+        const struct mwd_callbacks *callbacks, void *owner, int native_surfaces,
+        const struct vkdu_memory_expectation *expected, struct vkdu_memory_facts *facts, vkdu_device **out)
 {
     struct vkdu_adapter adapter = {0};
     struct mwd_device_create_info runtime = {MWD_STYPE_DEVICE, NULL, callbacks, owner};
+    struct mwd_native_surface_device_info native = {MWD_STYPE_NATIVE_SURFACE_DEVICE_V2, NULL,
+        owner, MWD_SUPPORT_NATIVE_SURFACE | MWD_SUPPORT_NATIVE_PRESENT, 0};
     static const uint8_t zero[8] = {0};
     if (out) *out = NULL;
     if (!luid || !memcmp(luid, zero, 8) || !owner || !mwd_callbacks_valid(callbacks)) return E_INVALIDARG;
     memcpy(adapter.luid, luid, 8);
-    return create_device(loader, &adapter, 0, 1, &runtime, out);
+    if (native_surfaces) runtime.pNext = &native;
+    return create_device(loader, &adapter, 0, 1, &runtime, expected, facts, out);
+}
+int32_t vkdu_device_create_shared(PFN_vkGetInstanceProcAddr loader, const struct vkdu_memory_expectation *expected,
+        const struct mwd_callbacks *callbacks, void *owner, struct vkdu_memory_facts *facts, vkdu_device **out)
+{
+    if (!expected || !facts) { if (out) *out = NULL; return E_INVALIDARG; }
+    return create_shared(loader, expected->luid, callbacks, owner, 0, expected, facts, out);
+}
+int32_t vkdu_device_create_shared_native(PFN_vkGetInstanceProcAddr loader, const uint8_t luid[8],
+        const struct mwd_callbacks *callbacks, void *owner, vkdu_device **out)
+{ return create_shared(loader, luid, callbacks, owner, 1, NULL, NULL, out); }
+
+int32_t vkdu_native_image_import(vkdu_device *device, void *owner, void *token,
+        uint32_t width, uint32_t height, uint32_t format, uint32_t stride,
+        int render_target, int preserve_contents, vkdu_object **out)
+{
+    D3D12_RESOURCE_DESC desc = {0};
+    ID3D12Resource *resource = NULL;
+    HRESULT hr;
+    if (!out) return E_POINTER;
+    *out = NULL;
+    if (!device || (render_target != 0 && render_target != 1)) return E_INVALIDARG;
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = width; desc.Height = height; desc.DepthOrArraySize = desc.MipLevels = 1;
+    desc.Format = format; desc.SampleDesc.Count = 1;
+    desc.Flags = render_target ? D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET : D3D12_RESOURCE_FLAG_NONE;
+    hr = vkd3d_create_native_image_wddm(device->object, &desc, owner, token, stride, preserve_contents, &resource);
+    hr = wrap(device, VKDU_TEXTURE2D, hr, (IUnknown *)resource, out);
+    if (SUCCEEDED(hr))
+    {
+        (*out)->width = width; (*out)->height = height; (*out)->format = format;
+        (*out)->resource_flags = desc.Flags;
+    }
+    return hr;
 }
 #ifdef VKDU_ENABLE_TEST_DEVICE
 int32_t vkdu_test_device_create(PFN_vkGetInstanceProcAddr loader, vkdu_device **out)
-{ return create_device(loader, NULL, 1, 0, NULL, out); }
+{ return create_device(loader, NULL, 1, 0, NULL, NULL, NULL, out); }
 static void __stdcall test_destroyed(void *counter)
 { vkd3d_atomic_uint32_increment((uint32_t *)counter, vkd3d_memory_order_release); }
 int32_t vkdu_test_destroy_counter(vkdu_object *object, uint32_t *counter)
@@ -152,6 +288,8 @@ int32_t vkdu_test_destroy_counter(vkdu_object *object, uint32_t *counter)
 }
 uint32_t vkdu_test_counter_load(uint32_t *counter)
 { return vkd3d_atomic_uint32_load_explicit(counter, vkd3d_memory_order_acquire); }
+void *vkdu_test_command_iface(vkdu_object *command)
+{ return VALID(command, VKDU_COMMAND_LIST) ? command->object : NULL; }
 #endif
 void vkdu_device_destroy(vkdu_device *device)
 { if (device) { ID3D12Device_Release(device->object); free(device); } }
@@ -177,32 +315,99 @@ int vkdu_object_retain(vkdu_object *object)
 void vkdu_object_destroy(vkdu_object *object)
 {
     if (object && !vkd3d_atomic_uint32_decrement(&object->references, vkd3d_memory_order_acq_rel)) {
-        IUnknown_Release(object->object); ID3D12Device_Release(object->owner);
-        free(object->query_scopes); free(object);
+#ifdef VKDU_ENABLE_TEST_DEVICE
+        if (object->test_retire_hook) object->test_retire_hook(object->test_retire_context);
+#endif
+        vkdu_attachment_retire(object);
+        IUnknown_Release(object->object);
+        if (object->kind == VKDU_COMMAND_LIST) {
+            if (object->command_type == 1 && !object->closed && object->command_allocator)
+                --object->command_allocator->bundle_recordings;
+            vkdu_bundle_drop_owners(object);
+            vkdu_object_destroy(object->command_allocator);
+        }
+        ID3D12Device_Release(object->owner);
+        free(object->query_scopes); free(object->uav_records); free(object);
     }
 }
+#ifdef VKDU_ENABLE_TEST_DEVICE
+int32_t vkdu_test_retire_hook(vkdu_object *object, void (*hook)(void *), void *context)
+{
+    if (!VALID(object, VKDU_TEXTURE2D)) return E_INVALIDARG;
+    object->test_retire_hook = hook; object->test_retire_context = context;
+    return S_OK;
+}
+#endif
 int vkdu_object_is(vkdu_object *object, enum vkdu_kind kind) { return VALID(object, kind); }
 int vkdu_same_device(vkdu_object *a, vkdu_object *b) { return a && b && a->owner == b->owner; }
+/* Conservatively reject aliases represented by distinct placed resources.
+ * One resource's distinct subresources retain their existing legal copy path.
+ * Subtraction keeps the range test independent of integer end overflow. */
+static int vkdu_placed_overlap(vkdu_object *a, vkdu_object *b)
+{
+    if (a->object == b->object || !a->placement_heap_id || a->placement_heap_id != b->placement_heap_id) return 0;
+    return a->placement_offset <= b->placement_offset ?
+        b->placement_offset - a->placement_offset < a->bytes :
+        a->placement_offset - b->placement_offset < b->bytes;
+}
 int vkdu_object_belongs(vkdu_device *device, vkdu_object *object) { return device && object && device->object == object->owner; }
+
+static D3D12_HEAP_DESC vkdu_memory_heap_desc(uint64_t bytes, int cpu_visible)
+{
+    D3D12_HEAP_DESC desc = {0};
+    desc.SizeInBytes = bytes; desc.Alignment = 65536;
+    desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+    desc.Properties.CreationNodeMask = desc.Properties.VisibleNodeMask = 1;
+    desc.Properties.Type = cpu_visible ? D3D12_HEAP_TYPE_CUSTOM : D3D12_HEAP_TYPE_DEFAULT;
+    if (cpu_visible) {
+        /* The native KMD maps CPU-visible allocations as cached pages. The DDI
+         * supplies WRITE_BACK, not an API READBACK heap type; the same heap can
+         * back a coherent UMA upload buffer. Preserve those actual properties. */
+        desc.Properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+        desc.Properties.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+#ifdef VKDU_TEST_CACHED_HEAP_AS_READBACK
+        desc.Properties.Type = D3D12_HEAP_TYPE_READBACK;
+        desc.Properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+        desc.Properties.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+#endif
+    }
+    return desc;
+}
 
 int32_t vkdu_memory_heap_import(vkdu_device *device, void *owner, void *token, uint64_t bytes,
         int cpu_visible, vkdu_object **out)
 {
-    D3D12_HEAP_DESC desc = {0};
+    D3D12_HEAP_DESC desc;
     ID3D12Heap *heap = NULL;
     HRESULT hr;
     if (!out) return E_POINTER;
     *out = NULL;
     if (!device || !owner || !token || !bytes || bytes % 65536) return E_INVALIDARG;
-    desc.SizeInBytes = bytes; desc.Alignment = 65536;
-    desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
-    desc.Properties.CreationNodeMask = desc.Properties.VisibleNodeMask = 1;
-    desc.Properties.Type = cpu_visible ? D3D12_HEAP_TYPE_READBACK : D3D12_HEAP_TYPE_DEFAULT;
+    desc = vkdu_memory_heap_desc(bytes, cpu_visible);
     hr = vkd3d_create_heap_wddm(device->object, &desc, owner, token, &heap);
     hr = wrap(device, VKDU_MEMORY_HEAP, hr, (IUnknown *)heap, out);
     if (SUCCEEDED(hr)) { (*out)->bytes = bytes; (*out)->heap_type = desc.Properties.Type; }
     return hr;
 }
+
+#ifdef VKDU_ENABLE_TEST_DEVICE
+/* Same production heap description and placement on CPU Vulkan. This factory
+ * uses local VkDeviceMemory, so it cannot prove native KMD allocation/import. */
+int32_t vkdu_test_memory_heap_create(vkdu_device *device, uint64_t bytes, int cpu_visible, vkdu_object **out)
+{
+    D3D12_HEAP_DESC desc;
+    ID3D12Heap *heap = NULL;
+    HRESULT hr;
+    if (!out) return E_POINTER;
+    *out = NULL;
+    if (!device || !bytes || bytes % 65536) return E_INVALIDARG;
+    desc = vkdu_memory_heap_desc(bytes, cpu_visible);
+    hr = ID3D12Device_CreateHeap(device->object, &desc, &IID_ID3D12Heap, (void **)&heap);
+    hr = wrap(device, VKDU_MEMORY_HEAP, hr, (IUnknown *)heap, out);
+    if (SUCCEEDED(hr)) { (*out)->bytes = bytes; (*out)->heap_type = desc.Properties.Type; }
+    return hr;
+}
+#endif
 
 int32_t vkdu_buffer_place(vkdu_device *device, vkdu_object *heap, uint64_t offset,
         uint64_t bytes, uint32_t state, vkdu_object **out)
@@ -214,9 +419,11 @@ int32_t vkdu_buffer_place(vkdu_device *device, vkdu_object *heap, uint64_t offse
     *out = NULL;
     if (!device || !VALID(heap, VKDU_MEMORY_HEAP) || heap->owner != device->object || !bytes ||
             offset % 65536 || offset > heap->bytes || bytes > heap->bytes - offset ||
-            (state != D3D12_RESOURCE_STATE_COMMON && state != D3D12_RESOURCE_STATE_COPY_SOURCE &&
-             state != D3D12_RESOURCE_STATE_COPY_DEST && state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) ||
-            (heap->heap_type == D3D12_HEAP_TYPE_READBACK && state != D3D12_RESOURCE_STATE_COPY_DEST)) return E_INVALIDARG;
+            (!vkdu_buffer_read_state(state) &&
+             state != D3D12_RESOURCE_STATE_COPY_DEST && state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS &&
+             state != D3D12_RESOURCE_STATE_STREAM_OUT) ||
+            (heap->heap_type == D3D12_HEAP_TYPE_READBACK && state != D3D12_RESOURCE_STATE_COPY_DEST) ||
+            (heap->heap_type != D3D12_HEAP_TYPE_DEFAULT && state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) return E_INVALIDARG;
     desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; desc.Width = bytes;
     desc.Height = desc.DepthOrArraySize = desc.MipLevels = desc.SampleDesc.Count = 1;
     desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
@@ -293,6 +500,14 @@ int32_t vkdu_heap_create(vkdu_device *device, uint32_t type, uint32_t count, int
     if (SUCCEEDED(hr)) {
         (*out)->heap_type = type; (*out)->descriptor_count = count; (*out)->shader_visible = shader_visible;
         (*out)->descriptor_stride = vkdu_descriptor_size(device, type);
+        if (type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
+                !((*out)->uav_records = calloc(count, sizeof(*(*out)->uav_records)))) {
+            vkdu_object_destroy(*out); *out = NULL; return E_OUTOFMEMORY;
+        }
+        if (type >= D3D12_DESCRIPTOR_HEAP_TYPE_RTV &&
+                !((*out)->attachment_records = calloc(count, sizeof(*(*out)->attachment_records)))) {
+            vkdu_object_destroy(*out); *out = NULL; return E_OUTOFMEMORY;
+        }
     }
     return hr;
 }
@@ -336,6 +551,8 @@ int vkdu_heap_resolve(vkdu_object *heap, uint64_t handle, int gpu, uint32_t *ind
 
 #include "backend_samplers.inc"
 #include "backend_textures.inc"
+#include "backend_resource_copy.inc"
+#include "backend_resolve.inc"
 int32_t vkdu_buffer_uav(vkdu_object *heap, uint32_t index, vkdu_object *buffer,
         uint32_t format, uint64_t first, uint32_t count, uint32_t stride, uint32_t flags,
         vkdu_object *counter, uint64_t counter_offset)
@@ -371,6 +588,7 @@ int32_t vkdu_buffer_uav(vkdu_object *heap, uint32_t index, vkdu_object *buffer,
     destination.ptr = (SIZE_T)(vkdu_heap_start(heap, 0) + (uint64_t)index * heap->descriptor_stride);
     ID3D12Device_CreateUnorderedAccessView(heap->owner, OBJ(ID3D12Resource, buffer),
             counter ? OBJ(ID3D12Resource, counter) : NULL, &desc, destination);
+    heap->uav_records[index] = (struct vkdu_uav_record){buffer->identity, first, format, count, stride, flags};
     return ID3D12Device_GetDeviceRemovedReason(heap->owner);
 }
 int32_t vkdu_buffer_cbv(vkdu_object *heap, uint32_t index, vkdu_object *buffer, uint64_t offset, uint32_t bytes)
@@ -390,6 +608,7 @@ int32_t vkdu_buffer_cbv(vkdu_object *heap, uint32_t index, vkdu_object *buffer, 
     desc.SizeInBytes = bytes;
     destination.ptr = (SIZE_T)(vkdu_heap_start(heap, 0) + (uint64_t)index * heap->descriptor_stride);
     ID3D12Device_CreateConstantBufferView(heap->owner, &desc, destination);
+    memset(&heap->uav_records[index], 0, sizeof(*heap->uav_records));
     return ID3D12Device_GetDeviceRemovedReason(heap->owner);
 }
 int32_t vkdu_buffer_srv(vkdu_object *heap, uint32_t index, vkdu_object *buffer,
@@ -432,11 +651,12 @@ int32_t vkdu_buffer_srv(vkdu_object *heap, uint32_t index, vkdu_object *buffer,
     desc.Buffer.StructureByteStride = stride; desc.Buffer.Flags = flags;
     destination.ptr = (SIZE_T)(vkdu_heap_start(heap, 0) + (uint64_t)index * heap->descriptor_stride);
     ID3D12Device_CreateShaderResourceView(heap->owner, buffer ? OBJ(ID3D12Resource, buffer) : NULL, &desc, destination);
+    memset(&heap->uav_records[index], 0, sizeof(*heap->uav_records));
     return ID3D12Device_GetDeviceRemovedReason(heap->owner);
 }
 int32_t vkdu_descriptor_copy(vkdu_object *dst, uint32_t dst_index, vkdu_object *src, uint32_t src_index, uint32_t count)
 {
-    D3D12_CPU_DESCRIPTOR_HANDLE destination, source;
+    D3D12_CPU_DESCRIPTOR_HANDLE destination, source; HRESULT status;
     if (!VALID(dst, VKDU_DESCRIPTOR_HEAP) || !VALID(src, VKDU_DESCRIPTOR_HEAP) || !vkdu_same_device(dst, src) ||
         dst->heap_type != src->heap_type || src->shader_visible || dst_index > dst->descriptor_count ||
         count > dst->descriptor_count - dst_index || src_index > src->descriptor_count || count > src->descriptor_count - src_index ||
@@ -446,7 +666,11 @@ int32_t vkdu_descriptor_copy(vkdu_object *dst, uint32_t dst_index, vkdu_object *
     destination.ptr = (SIZE_T)(vkdu_heap_start(dst, 0) + (uint64_t)dst_index * dst->descriptor_stride);
     source.ptr = (SIZE_T)(vkdu_heap_start(src, 0) + (uint64_t)src_index * src->descriptor_stride);
     ID3D12Device_CopyDescriptorsSimple(dst->owner, count, destination, source, dst->heap_type);
-    return ID3D12Device_GetDeviceRemovedReason(dst->owner);
+    if (dst->uav_records) memcpy(&dst->uav_records[dst_index], &src->uav_records[src_index],
+            count * sizeof(*dst->uav_records));
+    status = ID3D12Device_GetDeviceRemovedReason(dst->owner);
+    vkdu_attachment_copy(dst, dst_index, src, src_index, count, SUCCEEDED(status));
+    return status;
 }
 
 static int valid_descriptor_span(vkdu_device *device, uint32_t type,
@@ -497,6 +721,11 @@ int32_t vkdu_descriptor_copy_ranges(vkdu_device *device, uint32_t type,
         source.ptr = (SIZE_T)(vkdu_heap_start(src[s].heap, 0) +
                 ((uint64_t)src[s].first + si) * src[s].heap->descriptor_stride);
         ID3D12Device_CopyDescriptorsSimple(device->object, count, destination, source, type);
+        if (dst[d].heap->uav_records) memcpy(&dst[d].heap->uav_records[dst[d].first + di],
+                &src[s].heap->uav_records[src[s].first + si], count * sizeof(*dst[d].heap->uav_records));
+        if (dst[d].heap->attachment_records)
+            vkdu_attachment_copy(dst[d].heap, dst[d].first + di, src[s].heap, src[s].first + si, count,
+                    SUCCEEDED(ID3D12Device_GetDeviceRemovedReason(device->object)));
         di += count; si += count;
     }
     return dst_total ? ID3D12Device_GetDeviceRemovedReason(device->object) : S_OK;
@@ -511,23 +740,50 @@ int32_t vkdu_command_heaps(vkdu_object *command, uint32_t count, vkdu_object *co
         addresses[heaps[i]->heap_type] = vkdu_heap_start(heaps[i], 1);
         native[i] = OBJ(ID3D12DescriptorHeap, heaps[i]);
     }
+    /* Every heap bind in a bundle must match the executing primary. Two
+     * different pairs can never satisfy that rule for a single execution. */
+    if (command->command_type == 1 && (command->bundle_changed & VKDU_BUNDLE_HEAPS) &&
+            memcmp(command->bound_heaps, addresses, sizeof(addresses))) return E_INVALIDARG;
+    for (i = 0; i < count; ++i)
+        if (FAILED(vkdu_bundle_hold_if_recording(command, heaps[i]))) return E_OUTOFMEMORY;
+    command->bundle_changed |= VKDU_BUNDLE_HEAPS;
     ID3D12GraphicsCommandList_SetDescriptorHeaps(OBJ(ID3D12GraphicsCommandList, command), count, native);
     memcpy(command->bound_heaps, addresses, sizeof(addresses));
     return S_OK;
 }
-int32_t vkdu_command_table(vkdu_object *command, uint32_t index, vkdu_object *heap, uint32_t first)
+static const struct vkdu_root_slot *vkdu_command_slot(vkdu_object *command, uint32_t index, int graphics)
+{
+    if (!RECORDING(command) || (graphics ? command->command_type > 1 : command->command_type == 3)) return NULL;
+    if (index >= (graphics ? command->graphics_slot_count : command->slot_count)) return NULL;
+    return graphics ? &command->graphics_slots[index] : &command->slots[index];
+}
+static int32_t vkdu_command_table_mode(vkdu_object *command, uint32_t index, vkdu_object *heap, uint32_t first, int graphics)
 {
     D3D12_GPU_DESCRIPTOR_HANDLE handle;
-    if (!RECORDING(command) || command->command_type == 3 || index >= command->slot_count ||
-        command->slots[index].type != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE ||
+    const struct vkdu_root_slot *slot = vkdu_command_slot(command, index, graphics);
+    int inherited = vkdu_bundle_inherits_root(command, graphics);
+    if (index >= 64 || (!inherited && (!slot || slot->type != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)) ||
         !VALID(heap, VKDU_DESCRIPTOR_HEAP) || !vkdu_same_device(command, heap) || !heap->shader_visible ||
-        heap->heap_type > 1 || heap->heap_type != command->slots[index].heap_type || first >= heap->descriptor_count ||
-        (!command->slots[index].unbounded && command->slots[index].extent > heap->descriptor_count - first) ||
-        command->bound_heaps[heap->heap_type] != vkdu_heap_start(heap, 1)) return E_INVALIDARG;
+        heap->heap_type > 1 || first >= heap->descriptor_count ||
+        (!inherited && (heap->heap_type != slot->heap_type ||
+         (!slot->unbounded && slot->extent > heap->descriptor_count - first))) ||
+        (command->command_type != 1 && command->bound_heaps[heap->heap_type] != vkdu_heap_start(heap, 1))) return E_INVALIDARG;
+    if (FAILED(vkdu_bundle_hold_if_recording(command, heap))) return E_OUTOFMEMORY;
+    if (command->command_type == 1 && FAILED(vkdu_bundle_require(command, graphics, index,
+            D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE, heap->descriptor_count - first, heap->heap_type,
+            vkdu_heap_start(heap, 1), inherited))) return E_OUTOFMEMORY;
+#if defined(VKDU_ENABLE_TEST_DEVICE) && defined(VKDU_TEST_BUNDLE_TABLE_DROP_OFFSET)
+    if (command->command_type == 1) first = 0;
+#endif
     handle.ptr = vkdu_heap_start(heap, 1) + (uint64_t)first * heap->descriptor_stride;
-    ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(OBJ(ID3D12GraphicsCommandList, command), index, handle);
+    if (graphics) ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(OBJ(ID3D12GraphicsCommandList, command), index, handle);
+    else ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(OBJ(ID3D12GraphicsCommandList, command), index, handle);
     return S_OK;
 }
+int32_t vkdu_command_table(vkdu_object *command, uint32_t index, vkdu_object *heap, uint32_t first)
+{ return vkdu_command_table_mode(command, index, heap, first, 0); }
+int32_t vkdu_command_graphics_table(vkdu_object *command, uint32_t index, vkdu_object *heap, uint32_t first)
+{ return vkdu_command_table_mode(command, index, heap, first, 1); }
 int32_t vkdu_queue_create(vkdu_device *device, uint32_t type, vkdu_object **out)
 {
     D3D12_COMMAND_QUEUE_DESC desc = {0}; ID3D12CommandQueue *queue = NULL; HRESULT hr;
@@ -560,14 +816,21 @@ int32_t vkdu_allocator_create(vkdu_device *device, uint32_t type, vkdu_object **
     ID3D12CommandAllocator *allocator = NULL; HRESULT hr;
     if (!out) return E_POINTER;
     *out = NULL;
-    if (!device || (type != 0 && type != 2 && type != 3)) return E_INVALIDARG;
+    if (!device || type > 3) return E_INVALIDARG;
     hr = ID3D12Device_CreateCommandAllocator(device->object, type, &IID_ID3D12CommandAllocator, (void **)&allocator);
     hr = wrap(device, VKDU_ALLOCATOR, hr, (IUnknown *)allocator, out);
     if (SUCCEEDED(hr)) (*out)->command_type = type;
     return hr;
 }
 int32_t vkdu_allocator_reset(vkdu_object *allocator)
-{ return VALID(allocator, VKDU_ALLOCATOR) ? ID3D12CommandAllocator_Reset(OBJ(ID3D12CommandAllocator, allocator)) : E_INVALIDARG; }
+{
+    HRESULT hr;
+    if (!VALID(allocator, VKDU_ALLOCATOR) || allocator->bundle_recordings || allocator->bundle_users)
+        return E_INVALIDARG;
+    hr = ID3D12CommandAllocator_Reset(OBJ(ID3D12CommandAllocator, allocator));
+    if (SUCCEEDED(hr)) ++allocator->allocator_generation;
+    return hr;
+}
 int32_t vkdu_command_create(vkdu_device *device, vkdu_object *allocator, uint32_t type, vkdu_object **out)
 {
     ID3D12GraphicsCommandList *command = NULL; HRESULT hr;
@@ -577,37 +840,74 @@ int32_t vkdu_command_create(vkdu_device *device, vkdu_object *allocator, uint32_
     hr = ID3D12Device_CreateCommandList(device->object, 0, type, OBJ(ID3D12CommandAllocator, allocator), NULL,
             &IID_ID3D12GraphicsCommandList, (void **)&command);
     hr = wrap(device, VKDU_COMMAND_LIST, hr, (IUnknown *)command, out);
-    if (SUCCEEDED(hr)) (*out)->command_type = type;
+    if (SUCCEEDED(hr)) {
+        (*out)->command_type = type;
+        vkdu_object_retain(allocator); (*out)->command_allocator = allocator;
+        (*out)->bundle_generation = allocator->allocator_generation;
+        if (type == 1) ++allocator->bundle_recordings;
+    }
     return hr;
 }
+int32_t vkdu_command_native_present(vkdu_object *command, vkdu_object *queue,
+        vkdu_object *source, vkdu_object *destination)
+{
+    if (!RECORDING(command) || command->command_type || !VALID(queue, VKDU_QUEUE) || queue->command_type ||
+            queue->owner != command->owner || !VALID(source, VKDU_TEXTURE2D) || source->owner != command->owner ||
+            (destination && (!VALID(destination, VKDU_TEXTURE2D) || destination->owner != command->owner ||
+                destination == source))) return E_INVALIDARG;
+    return vkd3d_wddm_command_prepare_present(OBJ(ID3D12GraphicsCommandList, command),
+        OBJ(ID3D12Resource, source), destination ? OBJ(ID3D12Resource, destination) : NULL);
+}
+
 int32_t vkdu_command_close(vkdu_object *command)
 {
     HRESULT hr;
     if (!RECORDING(command) || command->query_scope_count) return E_INVALIDARG;
     hr = ID3D12GraphicsCommandList_Close(OBJ(ID3D12GraphicsCommandList, command));
-    if (SUCCEEDED(hr)) command->closed = 1;
+    if (SUCCEEDED(hr)) {
+        command->closed = 1;
+        if (command->command_type == 1) --command->command_allocator->bundle_recordings;
+    }
     return hr;
 }
 int32_t vkdu_command_reset(vkdu_object *command, vkdu_object *allocator)
 {
     HRESULT hr;
-    if (!VALID(command, VKDU_COMMAND_LIST) || !command->closed || !VALID(allocator, VKDU_ALLOCATOR) ||
+    if (!VALID(command, VKDU_COMMAND_LIST) || !command->closed || command->bundle_users || !VALID(allocator, VKDU_ALLOCATOR) ||
         !vkdu_same_device(command, allocator) || command->command_type != allocator->command_type) return E_INVALIDARG;
     hr = ID3D12GraphicsCommandList_Reset(OBJ(ID3D12GraphicsCommandList, command), OBJ(ID3D12CommandAllocator, allocator), NULL);
     if (SUCCEEDED(hr)) {
-        command->closed = 0; command->slot_count = 0;
+        vkdu_bundle_drop_owners(command);
+        vkdu_object_retain(allocator); vkdu_object_destroy(command->command_allocator);
+        command->command_allocator = allocator; command->bundle_generation = allocator->allocator_generation;
+        if (command->command_type == 1) ++allocator->bundle_recordings;
+        command->closed = 0; command->slot_count = command->graphics_slot_count = 0;
         memset(command->bound_heaps, 0, sizeof(command->bound_heaps));
         command->graphics_root = command->graphics_pipeline = command->topology = 0;
+        command->pipeline_samples = command->pipeline_quality = command->attachment_samples = command->attachment_quality = 0;
         command->viewport_count = command->scissor_count = command->render_target = command->index_count = 0;
         command->query_scope_count = 0;
+        command->predicate_enabled = 0;
     }
     return hr;
 }
+int32_t vkdu_command_clear_root_arguments(vkdu_object *command)
+{
+    if (!RECORDING(command)) return E_INVALIDARG;
+    if (command->command_type == 1) return vkd3d_wddm_bundle_clear_root_arguments(OBJ(ID3D12GraphicsCommandList, command));
+#if defined(VKDU_ENABLE_TEST_DEVICE) && defined(VKDU_TEST_ROOT_CLEAR_DROP)
+    return S_OK;
+#else
+    return vkd3d_wddm_command_clear_root_arguments(OBJ(ID3D12GraphicsCommandList, command));
+#endif
+}
 #include "backend_queries.inc"
+#include "backend_uav_clear.inc"
+#include "backend_predication.inc"
 
 int32_t vkdu_command_copy(vkdu_object *command, vkdu_object *dst, uint64_t dst_offset, vkdu_object *src, uint64_t src_offset, uint64_t bytes)
 {
-    if (!RECORDING(command) || !VALID(dst, VKDU_BUFFER) || !VALID(src, VKDU_BUFFER) ||
+    if (!RECORDING(command) || command->command_type == 1 || !VALID(dst, VKDU_BUFFER) || !VALID(src, VKDU_BUFFER) ||
         !vkdu_same_device(command, dst) || !vkdu_same_device(command, src) || !bytes ||
         dst_offset > dst->bytes || bytes > dst->bytes - dst_offset ||
         src_offset > src->bytes || bytes > src->bytes - src_offset) return E_INVALIDARG;
@@ -624,7 +924,8 @@ int32_t vkdu_command_barriers(vkdu_object *command, uint32_t count, const struct
 {
     D3D12_RESOURCE_BARRIER stack[16], *native = stack;
     uint32_t i;
-    if (!RECORDING(command) || count > 65536 || (count && !barriers)) return E_INVALIDARG;
+    HRESULT hr;
+    if (!RECORDING(command) || command->command_type == 1 || count > 65536 || (count && !barriers)) return E_INVALIDARG;
     /* Validate all resources, command types and UAV flags before issuing even
      * the first barrier. A rejected late element cannot alter recording. */
     for (i = 0; i < count; ++i) {
@@ -632,11 +933,26 @@ int32_t vkdu_command_barriers(vkdu_object *command, uint32_t count, const struct
         if (resource && ((!VALID(resource, VKDU_BUFFER) && !VALID(resource, VKDU_TEXTURE2D)) ||
                 !vkdu_same_device(command, resource))) return E_INVALIDARG;
         if (barriers[i].type == VKDU_BARRIER_TRANSITION) {
-            if (!resource) return E_INVALIDARG;
+            if (!resource || barriers[i].alias_after) return E_INVALIDARG;
+            if (barriers[i].subresource_plus_one) {
+                D3D12_RESOURCE_DESC desc = ID3D12Resource_GetDesc(OBJ(ID3D12Resource, resource));
+                uint64_t subresources = (uint64_t)desc.MipLevels * desc.DepthOrArraySize;
+                if (vkdu_stencil_format(desc.Format)) subresources *= 2;
+                if (!subresources || subresources > UINT32_MAX || barriers[i].subresource_plus_one > subresources)
+                    return E_INVALIDARG;
+            }
         } else if (barriers[i].type == VKDU_BARRIER_UAV) {
             if (command->command_type == D3D12_COMMAND_LIST_TYPE_COPY ||
-                barriers[i].before || barriers[i].after ||
+                barriers[i].before || barriers[i].after || barriers[i].alias_after || barriers[i].subresource_plus_one ||
                 (resource && !(resource->resource_flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))) return E_INVALIDARG;
+        } else if (barriers[i].type == VKDU_BARRIER_ALIASING) {
+            vkdu_object *after = barriers[i].alias_after;
+            if (barriers[i].before || barriers[i].after || barriers[i].subresource_plus_one ||
+                    (after && ((!VALID(after, VKDU_BUFFER) && !VALID(after, VKDU_TEXTURE2D)) ||
+                     !vkdu_same_device(command, after)))) return E_INVALIDARG;
+            /* Image activation/initialization has a separate contract. Keep
+             * it closed until the native texture alias path is implemented. */
+            if ((resource && !VALID(resource, VKDU_BUFFER)) || (after && !VALID(after, VKDU_BUFFER))) return E_NOTIMPL;
         } else return E_INVALIDARG;
     }
     if (!count) return S_OK;
@@ -646,13 +962,33 @@ int32_t vkdu_command_barriers(vkdu_object *command, uint32_t count, const struct
         if (barriers[i].type == VKDU_BARRIER_TRANSITION) {
             native[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
             native[i].Transition.pResource = OBJ(ID3D12Resource, barriers[i].resource);
-            native[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            native[i].Transition.Subresource = barriers[i].subresource_plus_one ?
+                barriers[i].subresource_plus_one - 1 : D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
             native[i].Transition.StateBefore = barriers[i].before;
             native[i].Transition.StateAfter = barriers[i].after;
-        } else {
+        } else if (barriers[i].type == VKDU_BARRIER_UAV) {
             native[i].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
             native[i].UAV.pResource = barriers[i].resource ? OBJ(ID3D12Resource, barriers[i].resource) : NULL;
+        } else {
+            native[i].Type = D3D12_RESOURCE_BARRIER_TYPE_ALIASING;
+            native[i].Aliasing.pResourceBefore = barriers[i].resource ? OBJ(ID3D12Resource, barriers[i].resource) : NULL;
+            native[i].Aliasing.pResourceAfter = barriers[i].alias_after ? OBJ(ID3D12Resource, barriers[i].alias_after) : NULL;
         }
+    }
+    /* Retain barrier-only references until legal allocator reset/completion.
+     * Validation/allocation precedes retention and all retention precedes GPU
+     * commands. An OOM may leave harmless extra owners until reset, never a
+     * partially recorded batch or an unretained alias endpoint. */
+    for (i = 0; i < count; ++i) {
+        ID3D12Resource *owners[2] = {
+            barriers[i].resource ? OBJ(ID3D12Resource, barriers[i].resource) : NULL,
+            barriers[i].alias_after ? OBJ(ID3D12Resource, barriers[i].alias_after) : NULL};
+#if !defined(VKDU_ENABLE_TEST_DEVICE) || !defined(VKDU_TEST_ALIAS_DROP_OWNER)
+        hr = vkd3d_wddm_command_retain_resources(OBJ(ID3D12GraphicsCommandList, command), 2, owners);
+#else
+        hr = S_OK; (void)owners;
+#endif
+        if (FAILED(hr)) { if (native != stack) free(native); return hr; }
     }
     ID3D12GraphicsCommandList_ResourceBarrier(OBJ(ID3D12GraphicsCommandList, command), count, native);
     if (native != stack) free(native);
@@ -752,9 +1088,21 @@ int32_t vkdu_pipeline_create(vkdu_device *device, vkdu_object *root, const void 
 }
 int32_t vkdu_command_root(vkdu_object *command, vkdu_object *root)
 {
-    if (!RECORDING(command) || !VALID(root, VKDU_ROOT) || !vkdu_same_device(command, root)) return E_INVALIDARG;
-    ID3D12GraphicsCommandList_SetComputeRootSignature(OBJ(ID3D12GraphicsCommandList, command), OBJ(ID3D12RootSignature, root));
-    command->slot_count = root->slot_count; memcpy(command->slots, root->slots, sizeof(root->slots)); return S_OK;
+    if (!RECORDING(command) || (command->command_type != 0 && command->command_type != 1 && command->command_type != 2) ||
+            (root && (!VALID(root, VKDU_ROOT) || !vkdu_same_device(command, root)))) return E_INVALIDARG;
+    if (FAILED(vkdu_bundle_hold_if_recording(command, root))) return E_OUTOFMEMORY;
+    command->bundle_changed |= VKDU_BUNDLE_COMPUTE_ROOT;
+    /* NULL is the API/DDI unbind operation. The embedded implementation clears
+     * its signature/static sampler and invalidates state on the next bind. */
+#if defined(VKDU_ENABLE_TEST_DEVICE) && defined(VKDU_TEST_COMPUTE_UNBIND_DROP)
+    if (root)
+#endif
+    ID3D12GraphicsCommandList_SetComputeRootSignature(OBJ(ID3D12GraphicsCommandList, command),
+            root ? OBJ(ID3D12RootSignature, root) : NULL);
+    command->slot_count = root ? root->slot_count : 0;
+    if (root) memcpy(command->slots, root->slots, sizeof(root->slots));
+    else memset(command->slots, 0, sizeof(command->slots));
+    return S_OK;
 }
 /* Native SM5 compute DDIs receive SHEX tokens, not an application DXBC blob. */
 void vkd3d_compute_dxbc_checksum(const void *dxbc, size_t size, uint32_t checksum[4]);
@@ -778,46 +1126,67 @@ int32_t vkdu_pipeline_create_tokens(vkdu_device *device, vkdu_object *root, cons
 }
 int32_t vkdu_command_pipeline(vkdu_object *command, vkdu_object *pipeline)
 {
-    if (!RECORDING(command) || !VALID(pipeline, VKDU_PIPELINE) || !vkdu_same_device(command, pipeline)) return E_INVALIDARG;
+    if (!RECORDING(command) || !VALID(pipeline, VKDU_PIPELINE) || !vkdu_same_device(command, pipeline) ||
+            (command->command_type == 1 && !pipeline->graphics_pipeline)) return E_INVALIDARG;
+    if (FAILED(vkdu_bundle_hold_if_recording(command, pipeline))) return E_OUTOFMEMORY;
+    command->bundle_changed |= VKDU_BUNDLE_PIPELINE;
     ID3D12GraphicsCommandList_SetPipelineState(OBJ(ID3D12GraphicsCommandList, command), OBJ(ID3D12PipelineState, pipeline));
     command->graphics_pipeline = pipeline->graphics_pipeline;
+    command->pipeline_samples = pipeline->pipeline_samples; command->pipeline_quality = pipeline->pipeline_quality;
     return S_OK;
 }
 #include "backend_graphics.inc"
-int32_t vkdu_command_uav(vkdu_object *command, uint32_t index, vkdu_object *buffer, uint64_t offset)
-{
-    if (!RECORDING(command) || index >= command->slot_count || command->slots[index].type != D3D12_ROOT_PARAMETER_TYPE_UAV ||
-        !VALID(buffer, VKDU_BUFFER) || !vkdu_same_device(command, buffer) || offset >= buffer->bytes || (offset & 3)) return E_INVALIDARG;
-    ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(OBJ(ID3D12GraphicsCommandList, command), index, vkdu_buffer_address(buffer) + offset); return S_OK;
-}
-int32_t vkdu_command_cbv(vkdu_object *command, uint32_t index, vkdu_object *buffer, uint64_t offset)
+#include "backend_depth.inc"
+#include "backend_format.inc"
+static int32_t vkdu_command_root_buffer(vkdu_object *command, uint32_t index, vkdu_object *buffer,
+        uint64_t offset, uint32_t type, int graphics)
 {
     uint64_t address;
-    if (!RECORDING(command) || index >= command->slot_count ||
-        command->slots[index].type != D3D12_ROOT_PARAMETER_TYPE_CBV || (offset & 255) ||
-        !VALID(buffer, VKDU_BUFFER) || !vkdu_same_device(command, buffer) || offset >= buffer->bytes) return E_INVALIDARG;
+    const uint64_t mask = type == D3D12_ROOT_PARAMETER_TYPE_CBV ? 255 : 3;
+    const struct vkdu_root_slot *slot = vkdu_command_slot(command, index, graphics);
+    int inherited = vkdu_bundle_inherits_root(command, graphics);
+    if (index >= 64 || (!inherited && (!slot || slot->type != type)) || (offset & mask) ||
+        !VALID(buffer, VKDU_BUFFER) || !vkdu_same_device(command, buffer) || offset >= buffer->bytes ||
+        (type == D3D12_ROOT_PARAMETER_TYPE_SRV && (buffer->resource_flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)) ||
+        (type == D3D12_ROOT_PARAMETER_TYPE_UAV && !(buffer->resource_flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)))
+        return E_INVALIDARG;
     /* Root descriptors are raw GPU addresses, with no descriptor bounds or
      * null-read guarantee. Only forward addresses in a live owned buffer. */
-    address = vkdu_buffer_address(buffer) + offset;
-    if (!address || (address & 255)) return E_INVALIDARG;
-    ID3D12GraphicsCommandList_SetComputeRootConstantBufferView(OBJ(ID3D12GraphicsCommandList, command), index, address);
-    return S_OK;
-}
-int32_t vkdu_command_srv(vkdu_object *command, uint32_t index, vkdu_object *buffer, uint64_t offset)
-{
-    uint64_t address;
-    if (!RECORDING(command) || command->command_type == 3 || index >= command->slot_count ||
-        command->slots[index].type != D3D12_ROOT_PARAMETER_TYPE_SRV || (offset & 3) ||
-        !VALID(buffer, VKDU_BUFFER) || !vkdu_same_device(command, buffer) || offset >= buffer->bytes ||
-        (buffer->resource_flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)) return E_INVALIDARG;
     address = vkdu_buffer_address(buffer);
-    if (!address || offset > UINT64_MAX - address || ((address + offset) & 3)) return E_INVALIDARG;
-    ID3D12GraphicsCommandList_SetComputeRootShaderResourceView(OBJ(ID3D12GraphicsCommandList, command), index, address + offset);
+    if (!address || offset > UINT64_MAX - address || ((address + offset) & mask)) return E_INVALIDARG;
+#if defined(VKDU_ENABLE_TEST_DEVICE) && defined(VKDU_TEST_GRAPHICS_ROOT_DROP_OFFSET)
+    if (graphics) offset = 0;
+#endif
+    if (FAILED(vkdu_bundle_hold_if_recording(command, buffer))) return E_OUTOFMEMORY;
+    if (inherited && FAILED(vkdu_bundle_require(command, graphics, index, type, 0, 0, 0, 1))) return E_OUTOFMEMORY;
+    address += offset;
+    if (type == D3D12_ROOT_PARAMETER_TYPE_CBV) {
+        if (graphics) ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(OBJ(ID3D12GraphicsCommandList, command), index, address);
+        else ID3D12GraphicsCommandList_SetComputeRootConstantBufferView(OBJ(ID3D12GraphicsCommandList, command), index, address);
+    } else if (type == D3D12_ROOT_PARAMETER_TYPE_SRV) {
+        if (graphics) ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(OBJ(ID3D12GraphicsCommandList, command), index, address);
+        else ID3D12GraphicsCommandList_SetComputeRootShaderResourceView(OBJ(ID3D12GraphicsCommandList, command), index, address);
+    } else {
+        if (graphics) ID3D12GraphicsCommandList_SetGraphicsRootUnorderedAccessView(OBJ(ID3D12GraphicsCommandList, command), index, address);
+        else ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(OBJ(ID3D12GraphicsCommandList, command), index, address);
+    }
     return S_OK;
 }
+int32_t vkdu_command_uav(vkdu_object *command, uint32_t index, vkdu_object *buffer, uint64_t offset)
+{ return vkdu_command_root_buffer(command, index, buffer, offset, D3D12_ROOT_PARAMETER_TYPE_UAV, 0); }
+int32_t vkdu_command_cbv(vkdu_object *command, uint32_t index, vkdu_object *buffer, uint64_t offset)
+{ return vkdu_command_root_buffer(command, index, buffer, offset, D3D12_ROOT_PARAMETER_TYPE_CBV, 0); }
+int32_t vkdu_command_srv(vkdu_object *command, uint32_t index, vkdu_object *buffer, uint64_t offset)
+{ return vkdu_command_root_buffer(command, index, buffer, offset, D3D12_ROOT_PARAMETER_TYPE_SRV, 0); }
+int32_t vkdu_command_graphics_uav(vkdu_object *command, uint32_t index, vkdu_object *buffer, uint64_t offset)
+{ return vkdu_command_root_buffer(command, index, buffer, offset, D3D12_ROOT_PARAMETER_TYPE_UAV, 1); }
+int32_t vkdu_command_graphics_cbv(vkdu_object *command, uint32_t index, vkdu_object *buffer, uint64_t offset)
+{ return vkdu_command_root_buffer(command, index, buffer, offset, D3D12_ROOT_PARAMETER_TYPE_CBV, 1); }
+int32_t vkdu_command_graphics_srv(vkdu_object *command, uint32_t index, vkdu_object *buffer, uint64_t offset)
+{ return vkdu_command_root_buffer(command, index, buffer, offset, D3D12_ROOT_PARAMETER_TYPE_SRV, 1); }
 int32_t vkdu_command_dispatch(vkdu_object *command, uint32_t x, uint32_t y, uint32_t z)
 {
-    if (!RECORDING(command) || command->command_type == 3 || x > 65535 || y > 65535 || z > 65535) return E_INVALIDARG;
+    if (!RECORDING(command) || command->command_type == 1 || command->command_type == 3 || x > 65535 || y > 65535 || z > 65535) return E_INVALIDARG;
     ID3D12GraphicsCommandList_Dispatch(OBJ(ID3D12GraphicsCommandList, command), x, y, z); return S_OK;
 }
 int32_t vkdu_dispatch_signature_create(vkdu_device *device, uint32_t stride, vkdu_object **out)
@@ -839,7 +1208,7 @@ int32_t vkdu_dispatch_signature_create(vkdu_device *device, uint32_t stride, vkd
 int32_t vkdu_command_execute_indirect(vkdu_object *command, vkdu_object *signature, uint32_t maximum,
         vkdu_object *arguments, uint64_t argument_offset, vkdu_object *count, uint64_t count_offset)
 {
-    if (!RECORDING(command) || command->command_type == D3D12_COMMAND_LIST_TYPE_COPY ||
+    if (!RECORDING(command) || command->command_type == 1 || command->command_type == D3D12_COMMAND_LIST_TYPE_COPY ||
             !VALID(signature, VKDU_COMMAND_SIGNATURE) || !vkdu_same_device(command, signature) ||
             !VALID(arguments, VKDU_BUFFER) || !vkdu_same_device(command, arguments) ||
             (argument_offset & 3) || argument_offset > arguments->bytes ||
@@ -854,19 +1223,38 @@ int32_t vkdu_command_execute_indirect(vkdu_object *command, vkdu_object *signatu
             count ? OBJ(ID3D12Resource, count) : NULL, count_offset);
     return S_OK;
 }
-int32_t vkdu_command_constants(vkdu_object *command, uint32_t index, uint32_t offset,
-        uint32_t count, const uint32_t *values)
+static int32_t vkdu_command_constants_mode(vkdu_object *command, uint32_t index, uint32_t offset,
+        uint32_t count, const uint32_t *values, int graphics)
 {
-    if (!RECORDING(command) || command->command_type == 3 || index >= command->slot_count ||
-        command->slots[index].type != D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS ||
-        offset > command->slots[index].extent || count > command->slots[index].extent - offset ||
+    const struct vkdu_root_slot *slot = vkdu_command_slot(command, index, graphics);
+    int inherited = vkdu_bundle_inherits_root(command, graphics);
+    if (index >= 64 || count > 64 || offset > 64 - count ||
+        (!inherited && (!slot || slot->type != D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS ||
+         offset > slot->extent || count > slot->extent - offset)) || offset > UINT32_MAX - count ||
         (count && !values)) return E_INVALIDARG;
+    if (inherited && FAILED(vkdu_bundle_require(command, graphics, index,
+            D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS, offset + count, 0, 0, 1))) return E_OUTOFMEMORY;
     /* The backend records an immediate copy. No caller pointer survives this
      * call, and validation completes before any root constants can change. */
-    if (count) ID3D12GraphicsCommandList_SetComputeRoot32BitConstants(
-            OBJ(ID3D12GraphicsCommandList, command), index, count, values, offset);
+    if (count) {
+#ifdef VKDU_TEST_TESS_DROP_HULL_CONSTANTS
+        uint32_t replacement[64], i;
+        if (graphics && (command->graphics_pipeline & 4)) {
+            for (i = 0; i < count && i < 64; ++i) replacement[i] = 0x3f800000;
+            values = replacement;
+        }
+#endif
+        if (graphics) ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(
+                OBJ(ID3D12GraphicsCommandList, command), index, count, values, offset);
+        else ID3D12GraphicsCommandList_SetComputeRoot32BitConstants(
+                OBJ(ID3D12GraphicsCommandList, command), index, count, values, offset);
+    }
     return S_OK;
 }
+int32_t vkdu_command_constants(vkdu_object *command, uint32_t index, uint32_t offset, uint32_t count, const uint32_t *values)
+{ return vkdu_command_constants_mode(command, index, offset, count, values, 0); }
+int32_t vkdu_command_graphics_constants(vkdu_object *command, uint32_t index, uint32_t offset, uint32_t count, const uint32_t *values)
+{ return vkdu_command_constants_mode(command, index, offset, count, values, 1); }
 int32_t vkdu_queue_execute(vkdu_object *queue, uint32_t count, vkdu_object *const *commands)
 {
     ID3D12CommandList *native[64]; uint32_t i;

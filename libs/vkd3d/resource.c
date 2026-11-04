@@ -4018,6 +4018,9 @@ static void d3d12_resource_destroy(struct d3d12_resource *resource, struct d3d12
     else if (resource->flags & VKD3D_RESOURCE_RESERVED)
         VK_CALL(vkDestroyBuffer(device->vk_device, resource->res.vk_buffer, NULL));
 
+    if (resource->wddm_native_memory)
+        VK_CALL(vkFreeMemory(device->vk_device, resource->wddm_native_memory, NULL));
+
     d3d12_resource_close_export_kmt(resource, device);
 
     if ((resource->flags & VKD3D_RESOURCE_ALLOCATION) && resource->mem.device_allocation.vk_memory)
@@ -4332,6 +4335,8 @@ HRESULT d3d12_resource_create_borrowed(struct d3d12_device *device, const D3D12_
     *resource = object;
     return hr;
 }
+
+#include "wddm_native_resource.inc"
 
 HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12_RESOURCE_DESC1 *desc,
         const D3D12_HEAP_PROPERTIES *heap_properties, D3D12_HEAP_FLAGS heap_flags, D3D12_RESOURCE_STATES initial_state,
@@ -5899,12 +5904,14 @@ static void d3d12_descriptor_heap_write_null_descriptor_template(vkd3d_cpu_descr
      * For MUTABLE, this would normally just be one descriptor set, but
      * we need MUTABLE + STORAGE_BUFFER, or 6 sets for non-mutable :\ */
     const struct d3d12_null_descriptor_template *null_descriptor_template;
+    const struct vkd3d_bindless_set_info *set_info;
     VkWriteDescriptorSet writes[VKD3D_MAX_BINDLESS_DESCRIPTOR_SETS];
     const struct vkd3d_vk_device_procs *vk_procs;
     struct vkd3d_bindless_state *bindless_state;
     struct vkd3d_bound_buffer_range *buffer_ranges;
     struct d3d12_desc_split desc;
     unsigned int num_writes, i;
+    uint32_t set_info_mask;
     unsigned int offset;
     VkDeviceAddress *va;
     const uint8_t *src;
@@ -5936,19 +5943,21 @@ static void d3d12_descriptor_heap_write_null_descriptor_template(vkd3d_cpu_descr
         return;
 
     num_writes = null_descriptor_template->num_writes;
+    set_info_mask = null_descriptor_template->set_info_mask;
+    bindless_state = &desc.heap->device->bindless_state;
     offset = desc.offset;
 
     if (null_descriptor_template->has_descriptor_buffer)
     {
-        bindless_state = &desc.heap->device->bindless_state;
-
         for (i = 0; i < num_writes; i++)
         {
+            set_info = &bindless_state->legacy.set_info[vkd3d_bitmask_iter32(&set_info_mask)];
             dst = desc.heap->sets[i].mapped_set;
             dst += offset * null_descriptor_template->writes.payloads[i].desc_size;
             src = null_descriptor_template->writes.payloads[i].src_payload;
             if (!src)
-                src = vkd3d_bindless_state_get_null_descriptor_payload(bindless_state, vk_mutable_descriptor_type);
+                src = vkd3d_bindless_state_get_null_descriptor_payload(bindless_state,
+                        vkd3d_bindless_resolve_null_descriptor_type(bindless_state, set_info, vk_mutable_descriptor_type));
             memcpy(dst, src, null_descriptor_template->writes.payloads[i].desc_size);
         }
     }
@@ -5958,9 +5967,11 @@ static void d3d12_descriptor_heap_write_null_descriptor_template(vkd3d_cpu_descr
 
         for (i = 0; i < num_writes; i++)
         {
+            set_info = &bindless_state->legacy.set_info[vkd3d_bitmask_iter32(&set_info_mask)];
             writes[i] = null_descriptor_template->writes.descriptors.writes[i];
             if (writes[i].descriptorType == VK_DESCRIPTOR_TYPE_MUTABLE_EXT)
-                writes[i].descriptorType = vk_mutable_descriptor_type;
+                writes[i].descriptorType = vkd3d_bindless_resolve_null_descriptor_type(
+                        bindless_state, set_info, vk_mutable_descriptor_type);
             writes[i].dstArrayElement = offset;
         }
 
@@ -9481,9 +9492,7 @@ static HRESULT d3d12_descriptor_heap_create_descriptor_buffer(struct d3d12_descr
                 /* Similar rationale as descriptor set implementation, need to pick some descriptor type,
                  * there is no generic null descriptor. */
                 src_null_payloads[set_count] = vkd3d_bindless_state_get_null_descriptor_payload(
-                        &device->bindless_state,
-                        set_info->vk_descriptor_type == VK_DESCRIPTOR_TYPE_MUTABLE_EXT ?
-                                VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE : set_info->vk_descriptor_type);
+                        &device->bindless_state, set_info->vk_init_null_descriptor_type);
             }
 
             src_null_payload_sizes[set_count] = set_info->host_mapping_descriptor_size;

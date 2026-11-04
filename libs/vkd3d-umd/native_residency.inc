@@ -3,20 +3,26 @@
  * provider enumerates actual descriptor/query backing allocations. */
 #ifdef VKDU_TEST_NATIVE_RESIDENCY_CONTROLS
 static bool native_residency_drop_pending, native_residency_skip_evict;
+static bool native_residency_skip_alias_holds, native_residency_alias_release_active;
 #endif
 struct NativeResidencyBatch {
     Context *ctx;
     std::array<NativeHeap *, 192> heaps{};
+    std::array<bool, 192> listed{};
     std::array<D3DKMT_HANDLE, 192> allocations{};
     std::array<vkdu_object *, 64> owners{};
     UINT count = 0;
+    UINT allocation_count = 0;
     UINT owner_count = 0;
     explicit NativeResidencyBatch(Context *value) : ctx(value) {}
     HRESULT clear() {
         HRESULT result = S_OK;
         // Backend destructors can unmap/release their BOs. Drop exclusion first
         // while the batch still owns every allocation token independently.
-        for (UINT i = 0; i < count; ++i) --heaps[i]->residency_operations;
+        for (UINT i = 0; i < count; ++i) {
+            --heaps[i]->residency_operations;
+            if (heaps[i]->native_mapping) --heaps[i]->native_mapping->residency_operations;
+        }
         while (owner_count) {
             NativeBackendCall call(ctx);
             vkdu_object_destroy(owners[--owner_count]);
@@ -26,26 +32,71 @@ struct NativeResidencyBatch {
             const HRESULT hr = native_runtime_release(ctx, heap);
             if (FAILED(hr) && SUCCEEDED(result)) result = hr;
         }
+        allocation_count = 0;
         return result;
     }
     ~NativeResidencyBatch() { clear(); }
+    void list_allocation(D3DKMT_HANDLE allocation) {
+        UINT index = 0;
+        while (index < allocation_count && allocations[index] != allocation) ++index;
+        if (index == allocation_count) allocations[allocation_count++] = allocation;
+    }
+    void hold(NativeHeap *heap, bool requested, bool adopted) {
+        if (!adopted) ++heap->users;
+        ++heap->residency_operations;
+        if (heap->native_mapping) ++heap->native_mapping->residency_operations;
+        heaps[count] = heap; listed[count++] = requested;
+    }
     HRESULT add(NativeHeap *heap, bool evict, bool adopted) {
         if (!heap || !heap->allocation || heap->pending || !heap->users ||
                 (!adopted && heap->users == UINT32_MAX)) return E_INVALIDARG;
+        const auto *mapping = heap->native_mapping.get();
+        if ((heap->flags & MWD_ALLOCATION_NATIVE_SURFACE) &&
+                (!mapping || mapping->released || heap->native_uncertain ||
+                 !heap->native_key || !heap->resource_created)) return E_INVALIDARG;
         for (UINT j = 0; j < count; ++j) {
             if (heaps[j] != heap) continue;
-            return adopted ? native_runtime_release(ctx, heap) : E_INVALIDARG;
+            if (listed[j]) return adopted ? native_runtime_release(ctx, heap) : E_INVALIDARG;
+            // This alias already has a lifetime hold, but is now explicitly
+            // requested too. A provider enumeration supplied one extra retain.
+            listed[j] = true; list_allocation(heap->allocation);
+            return adopted ? native_runtime_release(ctx, heap) : S_OK;
         }
         if (count == heaps.size()) return E_OUTOFMEMORY;
         // An ICD-owned descriptor/query allocation can remain persistently CPU
         // mapped. Forward eviction to the runtime, which decides whether that
         // backing can be evicted; never fake success or silently unmap pointers
         // the ICD still uses. Direct native MapHeap owners keep the busy guard.
-        if (heap->residency_operations || (evict && (heap->submitted || (heap->locked && !adopted))))
+        if (heap->residency_operations ||
+                (mapping && mapping->residency_operations) ||
+                (evict && (heap->submitted || (heap->locked && !adopted))))
             return DXGI_ERROR_WAS_STILL_DRAWING;
-        if (!adopted) ++heap->users;
-        ++heap->residency_operations;
-        heaps[count] = heap; allocations[count++] = heap->allocation;
+        // Pin every open of the mapping, including ones absent from the runtime
+        // allocation list. A callback can destroy an unlisted alias and its
+        // backend import: that last reference must be released AFTER paging,
+        // not lost when cleanup returns busy inside the callback.
+        if (mapping) {
+            UINT aliases = 0;
+            for (auto *other = ctx->native_heaps; other; other = other->next)
+                if (other->native_mapping.get() == mapping) {
+                    if (other->pending || other->native_uncertain || !other->allocation ||
+                            !other->users || (other->users == UINT32_MAX && !(other == heap && adopted)))
+                        return E_INVALIDARG;
+                    if (other->residency_operations || (evict && other->submitted))
+                        return DXGI_ERROR_WAS_STILL_DRAWING;
+                    ++aliases;
+                }
+            if (aliases > heaps.size() - count) return E_OUTOFMEMORY;
+            for (auto *other = ctx->native_heaps; other; other = other->next) {
+                if (other->native_mapping.get() != mapping) continue;
+#ifdef VKDU_TEST_NATIVE_RESIDENCY_CONTROLS
+                if (native_residency_skip_alias_holds && native_residency_alias_release_active && other != heap) continue;
+#endif
+                hold(other, other == heap, other == heap && adopted);
+            }
+        } else hold(heap, true, adopted);
+        // Keep each KMT handle once, independently of the per-open holds.
+        list_allocation(heap->allocation);
         return S_OK;
     }
     HRESULT collect(UINT number, const D3D12DDI_HANDLE_AND_TYPE *objects, bool evict) {
@@ -118,10 +169,10 @@ HRESULT APIENTRY native_make_resident(D3D12DDI_HDEVICE device, D3D12DDIARG_MAKER
     hr = native_heap_generation(op.ctx);
     if (FAILED(hr)) return hr;
     D3DDDI_MAKERESIDENT make{};
-    make.NumAllocations = batch.count;
+    make.NumAllocations = batch.allocation_count;
     make.AllocationList = batch.allocations.data();
     make.Flags = request.Flags;
-    const UINT count = batch.count;
+    const UINT count = batch.allocation_count;
     // The runtime translates its opaque paging-queue handle. hPagingQueue in
     // the kernel request stays zero; no pointer is reinterpreted as a KMT ID.
     if (count) hr = op.ctx->runtime_callbacks.pfnMakeResidentCb(op.ctx->runtime_device, paging_queue, &make);
@@ -160,7 +211,7 @@ HRESULT APIENTRY native_evict(D3D12DDI_HDEVICE device, const D3D12DDIARG_EVICT *
     hr = native_heap_generation(op.ctx);
     if (FAILED(hr)) return hr;
     D3DDDICB_EVICT evict{};
-    evict.NumAllocations = batch.count;
+    evict.NumAllocations = batch.allocation_count;
     evict.AllocationList = batch.allocations.data();
     evict.Flags = request.Flags;
     bool dispatch = batch.count != 0;

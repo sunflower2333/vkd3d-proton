@@ -392,6 +392,7 @@ struct vkd3d_shader_transform_feedback_info
     unsigned int element_count;
     const unsigned int *buffer_strides;
     unsigned int buffer_stride_count;
+    unsigned int rasterized_stream;
 };
 
 enum vkd3d_shader_target

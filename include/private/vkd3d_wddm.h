@@ -14,6 +14,8 @@ HRESULT vkd3d_create_device_wddm(const struct vkd3d_device_create_info *info,
         const struct mwd_device_create_info *runtime, REFIID iid, void **device);
 HRESULT vkd3d_create_heap_wddm(ID3D12Device *device, const D3D12_HEAP_DESC *desc,
         void *owner, void *token, ID3D12Heap **heap);
+HRESULT vkd3d_create_native_image_wddm(ID3D12Device *device, const D3D12_RESOURCE_DESC *desc,
+        void *owner, void *token, uint32_t stride, int preserve_contents, ID3D12Resource **resource);
 HRESULT vkd3d_wddm_queue_bind(ID3D12CommandQueue *queue, void *owner, void *token);
 HRESULT vkd3d_wddm_queue_drain_enqueue(ID3D12CommandQueue *queue);
 /* Retained by the actual submission allocator through GPU completion/reset. */
@@ -21,6 +23,15 @@ HRESULT vkd3d_wddm_command_retain_query(ID3D12GraphicsCommandList *command,
         ID3D12QueryHeap *heap, ID3D12Resource *destination);
 HRESULT vkd3d_wddm_command_retain_resources(ID3D12GraphicsCommandList *command,
         UINT count, ID3D12Resource *const *resources);
+HRESULT vkd3d_wddm_command_prepare_present(ID3D12GraphicsCommandList *command,
+        ID3D12Resource *source, ID3D12Resource *destination);
+/* Clear both root-argument domains without resetting unrelated list state. */
+HRESULT vkd3d_wddm_command_clear_root_arguments(ID3D12GraphicsCommandList *command);
+/* Unlike the void API, propagate predicate scratch/command allocation errors. */
+HRESULT vkd3d_wddm_command_set_predication(ID3D12GraphicsCommandList *command,
+        ID3D12Resource *buffer, UINT64 offset, D3D12_PREDICATION_OP operation);
+HRESULT vkd3d_wddm_command_prepare_attachment_clear(ID3D12GraphicsCommandList *command,
+        D3D12_CPU_DESCRIPTOR_HANDLE handle, BOOL depth);
 /* Private embedded-fence event ownership, not an OS monitored-fence import. */
 struct vkd3d_wddm_fence_event;
 HRESULT vkd3d_wddm_device_lost(ID3D12Device *device, HRESULT reason);
@@ -29,4 +40,8 @@ HRESULT vkd3d_wddm_fence_event_create(ID3D12Fence *fence, UINT64 value,
 HRESULT vkd3d_wddm_fence_event_wait(struct vkd3d_wddm_fence_event *event, UINT timeout_ms);
 void vkd3d_wddm_fence_event_cancel(struct vkd3d_wddm_fence_event *event);
 void vkd3d_wddm_fence_event_destroy(struct vkd3d_wddm_fence_event *event);
+/* Internal UMD bundle bridge: caller validates primary type and owner identity. */
+HRESULT vkd3d_wddm_command_retain_objects(ID3D12GraphicsCommandList *command, UINT count, IUnknown *const *objects);
+HRESULT vkd3d_wddm_bundle_clear_root_arguments(ID3D12GraphicsCommandList *command);
+
 #endif

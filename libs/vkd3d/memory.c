@@ -1842,6 +1842,8 @@ static HRESULT vkd3d_memory_chunk_create(struct d3d12_device *device, struct vkd
         return hr;
     }
 
+    object->original_heap_type = info->heap_properties.Type;
+
     if (VKD3D_CONFIG_FLAG_IS_SET(DEBUG_UTILS))
     {
         char name_buffer[1024];
@@ -1996,9 +1998,12 @@ static HRESULT vkd3d_memory_allocator_try_suballocate_memory(struct vkd3d_memory
 
         /* Match heap type so that we know we get the appropriate memory property flags.
          * These types are normalized, so that different CUSTOM heaps will be considered to be different heap types.
+         * Also preserve the original type: READBACK and UPLOAD global buffers have narrower
+         * usage flags than CUSTOM heaps with the same normalized memory properties.
          * Beyond that, there's just a distinction which explicit global buffer usage we have.
          * In practice, we're toggling between BUFFER heaps and non-BUFFER heaps here. */
         if (chunk->allocation.heap_type != normalized_heap_type ||
+                chunk->original_heap_type != heap_properties->Type ||
                 chunk->allocation.explicit_global_buffer_usage != explicit_global_buffer_usage)
             continue;
 

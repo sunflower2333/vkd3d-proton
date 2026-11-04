@@ -79,7 +79,8 @@ HRESULT vkd3d_create_device_wddm(const struct vkd3d_device_create_info *info,
     if (!device) return E_POINTER;
     *device = NULL;
     if (!info || !info->independent || !runtime || runtime->sType != MWD_STYPE_DEVICE ||
-            runtime->pNext || !runtime->owner || !mwd_callbacks_valid(runtime->callbacks)) return E_INVALIDARG;
+            !runtime->owner || !mwd_callbacks_valid(runtime->callbacks) ||
+            !mwd_native_surface_device_valid(runtime->pNext, runtime->owner)) return E_INVALIDARG;
     return create_device(info, runtime, iid, device);
 }
 

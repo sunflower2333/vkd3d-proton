@@ -2517,8 +2517,7 @@ static VkShaderStageFlags vkd3d_pipeline_state_desc_get_shader_stages(const stru
 
     /* If we use rasterizer discard, force fragment shader to not exist.
      * Required for VUID 06894. */
-    if (desc->stream_output.NumEntries &&
-            desc->stream_output.RasterizedStream == D3D12_SO_NO_RASTERIZED_STREAM)
+    if (desc->stream_output.RasterizedStream == D3D12_SO_NO_RASTERIZED_STREAM)
     {
         result &= ~VK_SHADER_STAGE_FRAGMENT_BIT;
     }
@@ -2852,24 +2851,32 @@ static struct vkd3d_shader_transform_feedback_info *vkd3d_shader_transform_feedb
     if (!xfb_info)
         return NULL;
 
-    new_buffer_strides = vkd3d_malloc(so_desc->NumStrides * sizeof(*new_buffer_strides));
-    if (!new_buffer_strides)
-        goto fail;
-    memcpy(new_buffer_strides, so_desc->pBufferStrides, so_desc->NumStrides * sizeof(*new_buffer_strides));
+    if (so_desc->NumStrides)
+    {
+        new_buffer_strides = vkd3d_malloc(so_desc->NumStrides * sizeof(*new_buffer_strides));
+        if (!new_buffer_strides) goto fail;
+        memcpy(new_buffer_strides, so_desc->pBufferStrides, so_desc->NumStrides * sizeof(*new_buffer_strides));
+    }
     xfb_info->buffer_strides = new_buffer_strides;
 
-    new_entries = vkd3d_malloc(so_desc->NumEntries * sizeof(*new_entries));
-    if (!new_entries)
-        goto fail;
-    memcpy(new_entries, so_desc->pSODeclaration, so_desc->NumEntries * sizeof(*new_entries));
+    if (so_desc->NumEntries)
+    {
+        new_entries = vkd3d_malloc(so_desc->NumEntries * sizeof(*new_entries));
+        if (!new_entries) goto fail;
+        memcpy(new_entries, so_desc->pSODeclaration, so_desc->NumEntries * sizeof(*new_entries));
+    }
     xfb_info->elements = new_entries;
 
     for (i = 0; i < so_desc->NumEntries; i++, num_duped++)
-        if (!(new_entries[i].semantic_name = vkd3d_strdup(new_entries[i].semantic_name)))
+        /* A NULL semantic denotes a stream-output gap. Keep it NULL rather
+         * than passing it to strdup; the shader interface consumes the gap. */
+        if (new_entries[i].semantic_name &&
+                !(new_entries[i].semantic_name = vkd3d_strdup(new_entries[i].semantic_name)))
             goto fail;
 
     xfb_info->buffer_stride_count = so_desc->NumStrides;
     xfb_info->element_count = so_desc->NumEntries;
+    xfb_info->rasterized_stream = so_desc->RasterizedStream;
 
     return xfb_info;
 
@@ -3807,28 +3814,6 @@ static void rs_depth_clip_info_from_d3d12(VkPipelineRasterizationDepthClipStateC
     depth_clip_info->depthClipEnable = d3d12_desc->DepthClipEnable;
 
     vk_prepend_struct(vk_rs_desc, depth_clip_info);
-}
-
-static void rs_stream_info_from_d3d12(VkPipelineRasterizationStateStreamCreateInfoEXT *stream_info,
-        VkPipelineRasterizationStateCreateInfo *vk_rs_desc, const D3D12_STREAM_OUTPUT_DESC *so_desc,
-        const struct vkd3d_vulkan_info *vk_info)
-{
-    if (!so_desc->NumEntries || !so_desc->RasterizedStream
-            || so_desc->RasterizedStream == D3D12_SO_NO_RASTERIZED_STREAM)
-        return;
-
-    if (!vk_info->rasterization_stream)
-    {
-        FIXME("Rasterization stream select is not supported by Vulkan implementation.\n");
-        return;
-    }
-
-    stream_info->sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_STREAM_CREATE_INFO_EXT;
-    stream_info->pNext = NULL;
-    stream_info->flags = 0;
-    stream_info->rasterizationStream = so_desc->RasterizedStream;
-
-    vk_prepend_struct(vk_rs_desc, stream_info);
 }
 
 static void rs_line_info_from_d3d12(struct d3d12_device *device, VkPipelineRasterizationLineStateCreateInfoEXT *vk_line_info,
@@ -5188,20 +5173,21 @@ static bool vkd3d_shader_semantic_is_generated_for_stage(enum vkd3d_sysval_seman
 
 static bool vkd3d_validate_shader_io_signatures(VkShaderStageFlagBits output_stage,
         const struct vkd3d_shader_signature *out_sig, VkShaderStageFlagBits input_stage,
-        const struct vkd3d_shader_signature *in_sig)
+        const struct vkd3d_shader_signature *in_sig, unsigned int rasterized_stream)
 {
     const struct vkd3d_shader_signature_element *in_element, *out_element;
     unsigned int i;
     bool mismatch;
 
-    /* D3D12 does not appear to take the rasterized stream index from the pipeline
-     * into account for interface matching, so only stream 0 works in practice. */
+    /* The pixel shader consumes the selected GS stream. Register and component
+     * matching still follows the ordinary D3D interface contract. */
     for (i = 0; i < in_sig->element_count; i++)
     {
         in_element = &in_sig->elements[i];
 
         out_element = vkd3d_shader_find_signature_element(out_sig, in_element->semantic_name,
-                in_element->semantic_index, in_element->stream_index);
+                in_element->semantic_index, output_stage == VK_SHADER_STAGE_GEOMETRY_BIT &&
+                input_stage == VK_SHADER_STAGE_FRAGMENT_BIT ? rasterized_stream : in_element->stream_index);
 
         if (!out_element)
         {
@@ -5727,20 +5713,34 @@ static HRESULT d3d12_pipeline_state_init_graphics_create_info(struct d3d12_pipel
     }
 
     graphics->xfb_buffer_count = 0u;
-    if (so_desc->NumEntries)
+    if (so_desc->NumEntries || so_desc->RasterizedStream)
     {
-        if (!(state->root_signature->d3d12_flags & D3D12_ROOT_SIGNATURE_FLAG_ALLOW_STREAM_OUTPUT))
+        if (so_desc->NumEntries && !(state->root_signature->d3d12_flags & D3D12_ROOT_SIGNATURE_FLAG_ALLOW_STREAM_OUTPUT))
         {
             WARN("Stream output is used without D3D12_ROOT_SIGNATURE_FLAG_ALLOW_STREAM_OUTPUT.\n");
             hr = E_INVALIDARG;
             goto fail;
         }
 
-        if (!vk_info->EXT_transform_feedback)
+        if (so_desc->NumEntries && !vk_info->EXT_transform_feedback)
         {
             FIXME("Transform feedback is not supported by Vulkan implementation.\n");
             hr = E_NOTIMPL;
             goto fail;
+        }
+
+        /* D3D allows strides up to 2048 bytes, while Vulkan implementations
+         * may expose only 512. Do not compile an invalid XfbStride decoration
+         * even if a permissive driver happens to execute it. */
+        for (i = 0; i < so_desc->NumStrides; ++i)
+        {
+            if (so_desc->pBufferStrides[i] > device->device_info.xfb_properties.maxTransformFeedbackBufferDataStride)
+            {
+                WARN("Stream output stride %u exceeds Vulkan limit %u.\n", so_desc->pBufferStrides[i],
+                        device->device_info.xfb_properties.maxTransformFeedbackBufferDataStride);
+                hr = E_NOTIMPL;
+                goto fail;
+            }
         }
 
         graphics->cached_desc.xfb_info = vkd3d_shader_transform_feedback_info_dup(so_desc);
@@ -5804,7 +5804,7 @@ static HRESULT d3d12_pipeline_state_init_graphics_create_info(struct d3d12_pipel
         {
             vkd3d_shader_parse_patch_constant_signature(&dxbc, &pc_input_signature);
 
-            if (!vkd3d_validate_shader_io_signatures(prev_stage, &pc_output_signature, curr_stage, &pc_input_signature))
+            if (!vkd3d_validate_shader_io_signatures(prev_stage, &pc_output_signature, curr_stage, &pc_input_signature, 0))
             {
                 hr = E_INVALIDARG;
                 goto fail;
@@ -5829,7 +5829,8 @@ static HRESULT d3d12_pipeline_state_init_graphics_create_info(struct d3d12_pipel
             else
             {
                 if (!vkd3d_validate_shader_io_signatures(prev_stage,
-                        &io_output_signature, curr_stage, &io_input_signature))
+                        &io_output_signature, curr_stage, &io_input_signature,
+                        so_desc->RasterizedStream))
                 {
                     hr = E_INVALIDARG;
                     goto fail;
@@ -6063,11 +6064,12 @@ static HRESULT d3d12_pipeline_state_init_graphics_create_info(struct d3d12_pipel
     have_attachment = graphics->rt_count || graphics->dsv_format ||
             d3d12_graphics_pipeline_state_has_unknown_dsv_format_with_test(graphics);
     if ((!have_attachment && !(graphics->stage_flags & VK_SHADER_STAGE_FRAGMENT_BIT))
-            || (graphics->xfb_buffer_count && so_desc->RasterizedStream == D3D12_SO_NO_RASTERIZED_STREAM))
+            || so_desc->RasterizedStream == D3D12_SO_NO_RASTERIZED_STREAM)
         graphics->rs_desc.rasterizerDiscardEnable = VK_TRUE;
 
     rs_line_info_from_d3d12(device, &graphics->rs_line_info, &graphics->rs_desc, &desc->rasterizer_state);
-    rs_stream_info_from_d3d12(&graphics->rs_stream_info, &graphics->rs_desc, so_desc, vk_info);
+    /* GS lowering maps the selected logical raster stream to Vulkan stream 0.
+     * This also works on devices without rasterizationStreamSelect. */
     if (vk_info->EXT_conservative_rasterization)
         rs_conservative_info_from_d3d12(&graphics->rs_conservative_info, &graphics->rs_desc, &desc->rasterizer_state);
     if (vk_info->EXT_depth_clip_enable)
@@ -7295,6 +7297,25 @@ static uint32_t vkd3d_bindless_build_mutable_type_list(VkDescriptorType *list, u
     }
 
     return count;
+}
+
+VkDescriptorType vkd3d_bindless_resolve_null_descriptor_type(const struct vkd3d_bindless_state *bindless_state,
+        const struct vkd3d_bindless_set_info *set_info, VkDescriptorType requested_type)
+{
+    VkDescriptorType types[VKD3D_MAX_MUTABLE_DESCRIPTOR_TYPES];
+    uint32_t count, i;
+
+    if (set_info->vk_descriptor_type != VK_DESCRIPTOR_TYPE_MUTABLE_EXT)
+        return set_info->vk_descriptor_type;
+
+    /* A null write covers every companion set, but split raw and typed sets
+     * have different allowed active types. Use the same list as the layout. */
+    count = vkd3d_bindless_build_mutable_type_list(types, bindless_state->flags, set_info->flags);
+    for (i = 0; i < count; i++)
+        if (types[i] == requested_type)
+            return requested_type;
+
+    return set_info->vk_init_null_descriptor_type;
 }
 
 /* Make sure copy sizes are deducible to constants by compiler, especially the single descriptor case.

@@ -87,7 +87,7 @@ int32_t vkdu_texture2d_create(vkdu_device *device, uint32_t width, uint32_t heig
     if (!out) return E_POINTER;
     *out = NULL;
     if (!device || !width || !height || width > 16384 || height > 16384 ||
-            (format != DXGI_FORMAT_R32_FLOAT && format != DXGI_FORMAT_R8G8B8A8_UNORM)) return E_INVALIDARG;
+            (format != DXGI_FORMAT_R32_FLOAT && !vkdu_color_resource_format(format))) return E_INVALIDARG;
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; desc.Width = width; desc.Height = height;
     desc.DepthOrArraySize = desc.MipLevels = desc.SampleDesc.Count = 1; desc.Format = format;
     heap.Type = D3D12_HEAP_TYPE_DEFAULT; heap.CreationNodeMask = heap.VisibleNodeMask = 1;
@@ -99,16 +99,50 @@ int32_t vkdu_texture2d_create(vkdu_device *device, uint32_t width, uint32_t heig
 }
 
 int32_t vkdu_texture2d_srv(vkdu_object *heap, uint32_t index, vkdu_object *texture)
+{ return vkdu_texture2d_srv_format(heap, index, texture, vkdu_texture2d_format(texture)); }
+int32_t vkdu_texture2d_srv_format(vkdu_object *heap, uint32_t index, vkdu_object *texture, uint32_t format)
+{ return vkdu_texture2d_srv_range(heap, index, texture, format, 0, 1, 0, 1); }
+int32_t vkdu_texture2d_srv_range(vkdu_object *heap, uint32_t index, vkdu_object *texture, uint32_t format,
+        uint32_t mip, uint32_t mip_count, uint32_t layer, uint32_t layer_count)
 {
     D3D12_SHADER_RESOURCE_VIEW_DESC desc = {0};
+    D3D12_RESOURCE_DESC resource;
     D3D12_CPU_DESCRIPTOR_HANDLE handle;
     if (!VALID(heap, VKDU_DESCRIPTOR_HEAP) || heap->heap_type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV ||
             index >= heap->descriptor_count || !VALID(texture, VKDU_TEXTURE2D) ||
-            !vkdu_same_device(heap, texture)) return E_INVALIDARG;
-    desc.Format = texture->format; desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; desc.Texture2D.MipLevels = 1;
+            !vkdu_same_device(heap, texture) || !vkdu_texture_view_compatible(texture->format, format) ||
+            (texture->resource_flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)) return E_INVALIDARG;
+    resource = ID3D12Resource_GetDesc(OBJ(ID3D12Resource, texture));
+    if (resource.SampleDesc.Count != 1 || resource.SampleDesc.Quality ||
+            mip >= resource.MipLevels || !mip_count || layer >= resource.DepthOrArraySize || !layer_count ||
+            layer_count > resource.DepthOrArraySize - layer) return E_INVALIDARG;
+    if (mip_count == UINT32_MAX) mip_count = resource.MipLevels - mip;
+    if (mip_count > resource.MipLevels - mip) return E_INVALIDARG;
+#if defined(VKDU_ENABLE_TEST_DEVICE) && defined(VKDU_TEST_SUBRESOURCE_VIEW_BASE_ZERO)
+    mip = layer = 0;
+#endif
+    desc.Format = format;
+    desc.ViewDimension = layer || layer_count > 1 ? D3D12_SRV_DIMENSION_TEXTURE2DARRAY : D3D12_SRV_DIMENSION_TEXTURE2D;
+#if defined(VKDU_ENABLE_TEST_DEVICE) && defined(VKDU_TEST_TYPELESS_DROP_SRGB)
+    if (texture->format == DXGI_FORMAT_R8G8B8A8_TYPELESS && format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)
+        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    if (texture->format == DXGI_FORMAT_B8G8R8A8_TYPELESS && format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)
+        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+#endif
+#if defined(VKDU_ENABLE_TEST_DEVICE) && defined(VKDU_TEST_SRGB_DROP_DECODE)
+    if (desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    if (desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+#endif
+    desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    if (desc.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY) {
+        desc.Texture2DArray.MostDetailedMip = mip; desc.Texture2DArray.MipLevels = mip_count;
+        desc.Texture2DArray.FirstArraySlice = layer; desc.Texture2DArray.ArraySize = layer_count;
+    } else {
+        desc.Texture2D.MostDetailedMip = mip; desc.Texture2D.MipLevels = mip_count;
+    }
     handle.ptr = (SIZE_T)(vkdu_heap_start(heap, 0) + (uint64_t)index * heap->descriptor_stride);
     ID3D12Device_CreateShaderResourceView(heap->owner, OBJ(ID3D12Resource, texture), &desc, handle);
+    memset(&heap->uav_records[index], 0, sizeof(*heap->uav_records));
     return ID3D12Device_GetDeviceRemovedReason(heap->owner);
 }
 
@@ -117,10 +151,11 @@ int32_t vkdu_command_texture_upload(vkdu_object *command, vkdu_object *texture,
 {
     D3D12_TEXTURE_COPY_LOCATION dst = {0}, src = {0};
     uint64_t size;
-    if (!RECORDING(command) || !VALID(texture, VKDU_TEXTURE2D) || !VALID(upload, VKDU_BUFFER) ||
+    if (!RECORDING(command) || command->command_type == 1 || !VALID(texture, VKDU_TEXTURE2D) || !VALID(upload, VKDU_BUFFER) ||
             !vkdu_same_device(command, texture) || !vkdu_same_device(command, upload) ||
             upload->heap_type != D3D12_HEAP_TYPE_UPLOAD || offset % 512 || row_pitch % 256 ||
             row_pitch < texture->width * 4) return E_INVALIDARG;
+    if (ID3D12Resource_GetDesc(OBJ(ID3D12Resource, texture)).SampleDesc.Count != 1) return E_INVALIDARG;
     size = (uint64_t)row_pitch * (texture->height - 1) + texture->width * 4;
     if (offset > upload->bytes || size > upload->bytes - offset) return E_INVALIDARG;
     dst.pResource = OBJ(ID3D12Resource, texture); dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;

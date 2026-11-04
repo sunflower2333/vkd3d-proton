@@ -188,7 +188,7 @@ void run_os_fence_probe(LUID luid, bool controls) {
     NativeAdapter identity{};
     identity.runtime.handle = &runtime;
     identity.callbacks.pfnQueryAdapterInfoCb = probe_query;
-    check(native_query_identity(identity, identity.luid, identity.generation), "KMD adapter identity");
+    check(native_query_adapter_facts(identity, identity), "KMD adapter identity");
     require(!std::memcmp(identity.luid.data(), &luid, sizeof(luid)), "exact requested VIOGPU LUID");
     std::printf("KMT_FENCE_ADAPTER luid=%08x:%08x generation=%llu device=%08x device_flags=00000000\n",
         static_cast<unsigned>(luid.HighPart), luid.LowPart,

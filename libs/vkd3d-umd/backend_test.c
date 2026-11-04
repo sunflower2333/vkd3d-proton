@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #ifndef _WIN32
 #include <dlfcn.h>
 #endif
@@ -19,10 +20,61 @@
 #define CHECK(expr) do { int32_t r = (expr); if (r < 0) { fprintf(stderr, "%s:%d: %s returned %08x\n", __FILE__, __LINE__, #expr, (unsigned)r); exit(1); } } while (0)
 #define REJECT(expr) do { if ((expr) >= 0) { fprintf(stderr, "unexpected success: %s\n", #expr); exit(1); } } while (0)
 
+static float test_linear_to_srgb(float value)
+{
+    return value <= 0.0031308f ? 12.92f * value : 1.055f * powf(value, 1.0f / 2.4f) - 0.055f;
+}
+
 #include "backend_samplers_test.inc"
 #include "backend_textures_test.inc"
+#ifdef VKDU_ENABLE_TEST_DEVICE
+#include "backend_subresources_test.inc"
+#include "backend_resinfo_test.inc"
+#endif
 #include "backend_graphics_test.inc"
+#include "backend_bundles_test.inc"
+#include "backend_sm51_test.inc"
+#ifdef VKDU_TEST_TOPOLOGY_OBSERVER
+#include "backend_topology_clear_test.inc"
+#endif
+#include "backend_graphics_roots_test.inc"
+#include "backend_format_test.inc"
+#include "backend_depth_test.inc"
+#include "backend_stencil_test.inc"
+#include "backend_stencil_pixels_test.inc"
+#include "backend_msaa_test.inc"
+#include "backend_msaa_copy_test.inc"
+#include "backend_msaa_bundle_test.inc"
+#include "backend_msaa_observer_test.inc"
+#include "backend_blend_test.inc"
+#include "backend_typeless_test.inc"
+#include "backend_root_clear_test.inc"
+#include "backend_bundle_root_data_test.inc"
+#include "backend_root_unbind_test.inc"
+#include "backend_uav_clear_test.inc"
+#include "backend_predication_test.inc"
+#include "backend_predicated_attachments_test.inc"
+#include "backend_attachment_subresources_test.inc"
+#include "backend_mrt_test.inc"
+#ifndef VKDU_TEST_MRT_BASELINE_ADAPTER
+#include "backend_mrt_contracts_test.inc"
+#endif
+#include "backend_resource_copy_test.inc"
+#include "backend_cached_heap_test.inc"
+#include "backend_alias_test.inc"
 #include "backend_vertex_test.inc"
+#include "backend_heap_usage_test.inc"
+#include "backend_native_compute_test.inc"
+#include "backend_shader_stages_test.inc"
+#include "backend_stream_output_limits_test.inc"
+#include "backend_split_clip_test.inc"
+#include "backend_distance_output_test.inc"
+#include "backend_distance_link_test.inc"
+#include "stage_stream_test_tokens.h"
+#include "backend_multistream_test.inc"
+#include "backend_multistream_raster_test.inc"
+#include "backend_tessellation_test.inc"
+#include "backend_tessellation_lines_test.inc"
 #include "backend_queries_test.inc"
 
 #ifdef VKDU_GPU_PROBE
@@ -635,6 +687,14 @@ static void check_indirect_dispatch(vkdu_device *device, vkdu_device *other)
 
 int main(int argc, char **argv)
 {
+#ifdef VKDU_ENABLE_TEST_DEVICE
+    if (argc == 2 && !strcmp(argv[1], "--sm50-converter-control")) { check_sm50_converter_control(); return 0; }
+    if (argc == 3 && !strcmp(argv[1], "--sm51-converter")) {
+        char *end; unsigned long index = strtoul(argv[2], &end, 10);
+        if (!*argv[2] || *end || index >= 6) return 2;
+        check_sm51_converter(index); return 0;
+    }
+#endif
     PFN_vkGetInstanceProcAddr loader;
     vkdu_device *device = NULL, *wrong = NULL;
     vkdu_object *upload = NULL, *buffer = NULL, *readback = NULL;
@@ -676,9 +736,244 @@ int main(int argc, char **argv)
     loader = module ? (PFN_vkGetInstanceProcAddr)dlsym(module, "vkGetInstanceProcAddr") : NULL;
 #endif
     if (!loader) { fprintf(stderr, "Vulkan loader is required\n"); return 1; }
+#ifdef VKDU_TEST_MSAA_DIAGNOSTICS
+    msaa_real_gipa = loader; loader = msaa_observe_gipa;
+#endif
     REJECT(vkdu_device_create(loader, &absent, &wrong));
     if (wrong) return 1;
     CHECK(validation_device_create(loader, &device));
+#ifdef VKDU_ENABLE_TEST_DEVICE
+    if (argc == 2 && (!strcmp(argv[1], "--msaa-bundle-requirements") || !strcmp(argv[1], "--msaa-bundle-state") || !strcmp(argv[1], "--msaa-bundle-pixels"))) {
+        uint32_t mode = !strcmp(argv[1], "--msaa-bundle-requirements") ? 0 : !strcmp(argv[1], "--msaa-bundle-state") ? 1 : 2;
+        check_msaa_bundles(device,mode); CHECK(vkdu_device_status(device)); vkdu_device_destroy(device); return 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--bundle-root-data-only")) {
+        check_bundle_root_data(device);vkdu_device_destroy(device);return 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--bundles-only")) {
+        CHECK(validation_device_create(loader, &wrong));check_bundles(device,wrong);
+        vkdu_device_destroy(wrong);vkdu_device_destroy(device);return 0;
+    }
+    if (argc == 2 && (!strcmp(argv[1], "--msaa-only") || !strcmp(argv[1], "--msaa-full-viewport-control") || !strcmp(argv[1], "--msaa-adjacent-only") || !strcmp(argv[1], "--msaa-nonrt-only") || !strcmp(argv[1], "--msaa-alias-copy-only") || !strcmp(argv[1], "--msaa-mask-controls") || !strcmp(argv[1], "--msaa-copy-samples"))) {
+        CHECK(validation_device_create(loader, &wrong));
+        if (!strcmp(argv[1], "--msaa-nonrt-only")) check_msaa_copy_nonrt(device);
+        else if (!strcmp(argv[1], "--msaa-copy-samples")) check_msaa_copy_samples(device,wrong);
+        else if (!strcmp(argv[1], "--msaa-mask-controls")) check_msaa_mask_controls(device,wrong);
+        else if (!strcmp(argv[1], "--msaa-alias-copy-only")) check_msaa_alias_copy(device);
+        else if (strcmp(argv[1], "--msaa-adjacent-only")) check_msaa_pixels(device, wrong, !strcmp(argv[1], "--msaa-only"));
+        else {
+            check_texture_copies(device, wrong); check_resource_copies(device, wrong);
+            check_attachment_lifetime(device); check_predication_lifetime(device);
+            check_attachment_subresources(device); check_mrt_contracts(device, wrong);
+            puts("PASS MSAA adjacent single-sample copies, attachments and command lifetime");
+        }
+        CHECK(vkdu_device_status(device)); CHECK(vkdu_device_status(wrong));
+        vkdu_device_destroy(wrong); vkdu_device_destroy(device);
+#ifdef _WIN32
+        FreeLibrary(module);
+#else
+        dlclose(module);
+#endif
+        return 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--stencil-only")) {
+        CHECK(validation_device_create(loader, &wrong));
+        check_stencil_pixels(device, wrong);
+        CHECK(vkdu_device_status(device)); CHECK(vkdu_device_status(wrong));
+        vkdu_device_destroy(wrong); vkdu_device_destroy(device);
+#ifdef _WIN32
+        FreeLibrary(module);
+#else
+        dlclose(module);
+#endif
+        return 0;
+    }
+    if (argc == 2 && (!strcmp(argv[1], "--stencil-baseline-d24s8") ||
+            !strcmp(argv[1], "--stencil-baseline-d32s8"))) {
+        int result = check_stencil_allocation(device, !strcmp(argv[1], "--stencil-baseline-d24s8") ?
+            DXGI_FORMAT_D24_UNORM_S8_UINT : DXGI_FORMAT_D32_FLOAT_S8X24_UINT);
+        CHECK(vkdu_device_status(device));
+        vkdu_device_destroy(device);
+#ifdef _WIN32
+        FreeLibrary(module);
+#else
+        dlclose(module);
+#endif
+        return result;
+    }
+#ifdef VKDU_TEST_TOPOLOGY_OBSERVER
+    if (argc == 2 && (!strcmp(argv[1], "--topology-clear-only") || !strcmp(argv[1], "--topology-engine-only") || !strcmp(argv[1], "--topology-indexed-only"))) {
+        int result;
+        CHECK(validation_device_create(loader, &wrong));
+        result = check_topology_clear(device, !strcmp(argv[1], "--topology-engine-only"), !strcmp(argv[1], "--topology-indexed-only"));
+        vkdu_device_destroy(wrong); vkdu_device_destroy(device);
+#ifdef _WIN32
+        FreeLibrary(module);
+#else
+        dlclose(module);
+#endif
+        return result;
+    }
+#endif
+    if (argc == 2 && !strcmp(argv[1], "--native-compute-only")) {
+        check_native_compute_layout(device);
+        CHECK(vkdu_device_status(device)); vkdu_device_destroy(device);
+#ifdef _WIN32
+        FreeLibrary(module);
+#else
+        dlclose(module);
+#endif
+        return 0;
+    }
+    if (argc == 2 && (!strcmp(argv[1], "--sm51-only") || !strcmp(argv[1], "--sm51-negative-space-swap"))) {
+        uint32_t fixture;
+        CHECK(validation_device_create(loader, &wrong));
+        for (fixture=0;fixture<6;++fixture) check_sm51_converter(fixture);
+        check_sm51_rejections();
+        if (!strcmp(argv[1], "--sm51-only")) check_sm51_vs_pixels(device);
+        check_sm51_ps_spaces(device, !strcmp(argv[1], "--sm51-negative-space-swap"));
+        CHECK(vkdu_device_status(device)); CHECK(vkdu_device_status(wrong));
+        vkdu_device_destroy(wrong);vkdu_device_destroy(device);
+#ifdef _WIN32
+        FreeLibrary(module);
+#else
+        dlclose(module);
+#endif
+        return 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--mrt-only")) {
+        CHECK(validation_device_create(loader, &wrong));
+        check_mrt(device, wrong);
+#ifndef VKDU_TEST_MRT_BASELINE_ADAPTER
+        check_mrt_contracts(device, wrong);
+#endif
+        vkdu_device_destroy(wrong); vkdu_device_destroy(device);
+        return 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--root-unbind-only")) {
+        CHECK(validation_device_create(loader, &wrong));
+        check_root_unbind(device, wrong); check_root_argument_clear(device);
+        CHECK(vkdu_device_status(device)); CHECK(vkdu_device_status(wrong));
+        vkdu_device_destroy(wrong); vkdu_device_destroy(device);
+#ifdef _WIN32
+        FreeLibrary(module);
+#else
+        dlclose(module);
+#endif
+        return 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--heap-usage-original-only")) {
+        vkdu_object *seed;
+        CHECK(validation_device_create(loader, &wrong));
+        /* Keep an actual READBACK chunk alive before creating CUSTOM heaps. */
+        CHECK(vkdu_buffer_create(device, 4096, D3D12_HEAP_TYPE_READBACK, 0, D3D12_RESOURCE_STATE_COPY_DEST, &seed));
+        check_cached_heaps(device, wrong); check_buffer_alias_copy(device);
+        check_vertex_inputs(device, wrong, 0);
+        check_vertex_inputs(device, wrong, 1); check_vertex_inputs(device, wrong, 2);
+        vkdu_object_destroy(seed);
+        CHECK(vkdu_device_status(device)); CHECK(vkdu_device_status(wrong));
+        vkdu_device_destroy(wrong); vkdu_device_destroy(device);
+#ifdef _WIN32
+        FreeLibrary(module);
+#else
+        dlclose(module);
+#endif
+        return 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--heap-usage-adjacent-only")) {
+        const char *text = getenv("VKDU_TEST_HEAP_USAGE_CASE");
+        char *end;
+        unsigned long test_case;
+        if (!text || !*text) return 2;
+        test_case = strtoul(text, &end, 10);
+        if (*end || test_case > 3) return 2;
+        check_heap_usage_pair(device, test_case);
+        CHECK(vkdu_device_status(device)); vkdu_device_destroy(device);
+#ifdef _WIN32
+        FreeLibrary(module);
+#else
+        dlclose(module);
+#endif
+        return 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--attachment-subresources-only")) {
+        check_attachment_subresources(device);
+        CHECK(vkdu_device_status(device)); vkdu_device_destroy(device);
+#ifdef _WIN32
+        FreeLibrary(module);
+#else
+        dlclose(module);
+#endif
+        return 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--so-partial-only")) {
+        CHECK(validation_device_create(loader, &wrong));
+        check_geometry_output(device, wrong); check_stream_output_limits(device);
+        check_split_clip_stream_output(device);
+        check_stream_output_lifetime(device);
+        CHECK(vkdu_device_status(device)); CHECK(vkdu_device_status(wrong));
+        vkdu_device_destroy(wrong); vkdu_device_destroy(device);
+#ifdef _WIN32
+        FreeLibrary(module);
+#else
+        dlclose(module);
+#endif
+        return 0;
+    }
+    if (argc == 2 && (!strcmp(argv[1], "--resinfo-only") || !strcmp(argv[1], "--resinfo-valid-only") || !strcmp(argv[1], "--resinfo-null-only"))) {
+        check_resinfo_dimensions(device, !strcmp(argv[1], "--resinfo-valid-only") ? 1 : !strcmp(argv[1], "--resinfo-null-only") ? 2 : 0);
+        CHECK(vkdu_device_status(device)); vkdu_device_destroy(device);
+#ifdef _WIN32
+        FreeLibrary(module);
+#else
+        dlclose(module);
+#endif
+        return 0;
+    }
+    if (argc == 2 && (!strcmp(argv[1], "--subresources-only") || !strcmp(argv[1], "--subresources-uniform-only"))) {
+        check_texture_subresources(device, !strcmp(argv[1], "--subresources-uniform-only"));
+        CHECK(vkdu_device_status(device)); vkdu_device_destroy(device);
+#ifdef _WIN32
+        FreeLibrary(module);
+#else
+        dlclose(module);
+#endif
+        return 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--attachments-only")) {
+        check_predicated_attachments(device); check_attachment_lifetime(device);
+        CHECK(vkdu_device_status(device)); vkdu_device_destroy(device);
+#ifdef _WIN32
+        FreeLibrary(module);
+#else
+        dlclose(module);
+#endif
+        return 0;
+    }
+#endif
+#ifdef VKDU_ENABLE_TEST_DEVICE
+    if (argc==2 && !strcmp(argv[1],"--so-stream-only")) {
+        puts("TEST ONLY: scoped multistream CPU Vulkan semantics");
+        check_multistream_output(device);check_multistream_raster(device);
+        vkdu_device_destroy(device);return 0;
+    }
+    if (argc==2 && !strcmp(argv[1],"--distance-link-only")) {
+        check_distance_link(device); vkdu_device_destroy(device); return 0;
+    }
+    if (argc==2 && !strcmp(argv[1],"--so-distance-only")) {
+        puts("TEST ONLY: scoped distance output CPU Vulkan semantics");
+        check_split_clip_stream_output(device); check_distance_output(device);
+        vkdu_device_destroy(device);return 0;
+    }
+#endif
+    {
+        vkdu_object *native = (vkdu_object *)(uintptr_t)1;
+        /* A normal device has no native provider or image opt-in. Never
+         * interpret an arbitrary token as memory or fall back to a CPU copy. */
+        if (vkdu_native_image_import(device, (void *)(uintptr_t)1, (void *)(uintptr_t)2,
+                17, 7, 28, 128, 1, 0, &native) != (int32_t)0x887a0004 || native)
+        { fprintf(stderr, "Native image import escaped explicit device opt-in\n"); return 1; }
+    }
 #ifdef VKDU_GPU_PROBE
     puts("Embedded backend GPU validation; Windows runtime DDI/Present acceptance remains separate");
 #else
@@ -702,7 +997,7 @@ int main(int argc, char **argv)
     REJECT(vkdu_pipeline_create(device, root, "invalid", 7, &pipeline));
     if (pipeline) return 1;
     /* Use the same token form the native SM5 compute DDI receives. */
-    CHECK(vkdu_pipeline_create_tokens(device, root, execute_indirect_cs_code_dxbc + 21,
+    CHECK(vkdu_pipeline_create_tokens(device, root, (const uint32_t *)execute_indirect_cs_code_dxbc + 21,
             execute_indirect_cs_code_dxbc[22], &pipeline));
     CHECK(vkdu_command_copy(command, buffer, 0, upload, 0, 4096));
     CHECK(vkdu_command_transition(command, buffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
@@ -752,7 +1047,7 @@ int main(int argc, char **argv)
         CHECK(vkdu_buffer_uav(cpu_heap, 2, buffer, DXGI_FORMAT_R32_TYPELESS, 0, 1024, 0, 1, NULL, 0));
         CHECK(vkdu_descriptor_copy(gpu_heap, 4, cpu_heap, 2, 1));
         CHECK(vkdu_root_create(device, &table, 1, 0, &table_root));
-        CHECK(vkdu_pipeline_create_tokens(device, table_root, execute_indirect_cs_code_dxbc + 21,
+        CHECK(vkdu_pipeline_create_tokens(device, table_root, (const uint32_t *)execute_indirect_cs_code_dxbc + 21,
                 execute_indirect_cs_code_dxbc[22], &table_pipeline));
     }
     CHECK(vkdu_allocator_reset(allocator));
@@ -782,7 +1077,30 @@ int main(int argc, char **argv)
     CHECK(vkdu_device_status(device));
     check_constant_buffers(device, wrong);
     check_root_constants(device);
+#ifdef VKDU_ENABLE_TEST_DEVICE
+    check_root_unbind(device, wrong);
+    check_root_argument_clear(device);
+#endif
     check_shader_resources(device, wrong);
+    check_uav_clears(device, wrong);
+    check_predication(device, wrong);
+#ifdef VKDU_ENABLE_TEST_DEVICE
+    check_predicated_attachments(device);
+    check_attachment_subresources(device);
+    check_mrt(device, wrong);
+#ifndef VKDU_TEST_MRT_BASELINE_ADAPTER
+    check_mrt_contracts(device, wrong);
+#endif
+    check_texture_subresources(device, argc == 2 && !strcmp(argv[1], "--uniform-query-control"));
+    check_resinfo_dimensions(device, 0);
+    check_attachment_lifetime(device);
+    check_predication_lifetime(device);
+    check_predication_snapshot(device);
+    check_predication_fallback(device, wrong);
+#endif
+#ifdef VKDU_ENABLE_TEST_DEVICE
+    check_uav_clear_lifetime(device);
+#endif
     check_uav_barriers(device, wrong);
     check_indirect_dispatch(device, wrong);
     check_retained_queue(device);
@@ -791,9 +1109,36 @@ int main(int argc, char **argv)
 #ifdef VKDU_ENABLE_TEST_DEVICE
     check_query_lifetime(device, wrong);
     check_vertex_lifetime(device);
+    check_stream_output_lifetime(device);
 #endif
     check_graphics(device, wrong);
-    check_vertex_inputs(device, wrong);
+    for (i=0;i<6;++i) check_sm51_converter(i);
+    check_sm51_rejections();check_sm51_vs_pixels(device);check_sm51_ps_spaces(device,0);
+    check_graphics_roots(device, wrong);
+    check_native_formats(device);
+    check_depth(device, wrong);
+    check_stencil_pixels(device, wrong);
+    check_blend(device);
+    check_typeless_color(device);
+    check_resource_copies(device, wrong);
+    check_geometry_output(device, wrong);
+    check_stream_output_limits(device);
+    check_split_clip_stream_output(device);
+    check_distance_output(device);
+    check_distance_link(device);
+    check_multistream_output(device);
+    check_multistream_raster(device);
+    check_tessellation(device);
+    check_tessellation_lines(device);
+    check_vertex_inputs(device, wrong, 0);
+#ifdef VKDU_ENABLE_TEST_DEVICE
+    check_cached_heaps(device, wrong);
+    check_buffer_alias_copy(device);
+    check_alias_lifetime(device);
+    check_alias_switch(device, wrong);
+    check_vertex_inputs(device, wrong, 1);
+    check_vertex_inputs(device, wrong, 2);
+#endif
     /* Caller follows D3D12 lifetime rules: reset/destroy only after completion. */
     vkdu_object_destroy(command); vkdu_object_destroy(allocator);
     vkdu_object_destroy(table_pipeline); vkdu_object_destroy(table_root);

@@ -5,11 +5,9 @@
 #include <unordered_map>
 
 namespace {
-struct NativeAdapter {
+struct NativeAdapter : NativeAdapterFacts {
     D3D12DDI_HRTADAPTER runtime{};
     D3DDDI_ADAPTERCALLBACKS callbacks{};
-    std::array<uint8_t, 8> luid{};
-    uint64_t generation = 0;
 };
 std::mutex native_adapters_lock;
 std::unordered_map<void *, std::shared_ptr<NativeAdapter>> native_adapters;
@@ -20,28 +18,58 @@ std::shared_ptr<NativeAdapter> native_adapter(D3D12DDI_HADAPTER handle) {
     return found == native_adapters.end() ? nullptr : found->second;
 }
 
-HRESULT native_query_identity(const NativeAdapter &adapter, std::array<uint8_t, 8> &luid, uint64_t &generation) {
+HRESULT native_query_adapter_facts(const NativeAdapter &adapter, NativeAdapterFacts &facts,
+        bool require_queue_protocol = false) {
     // VIOGPU v0 128-byte prefix + independently versioned VLID trailer.
+    // Runtime queues additionally require the independently versioned VQDC
+    // trailer. Old KMDs write only160 bytes and leave its zeroed tail absent.
+    // Never infer shared-domain support from a package or driver version.
     // Output-only callback: never encode a request in its output buffer.
-    std::array<uint8_t, 160> reply{};
+    std::array<uint8_t, 192> reply{};
+    const UINT expected_size = require_queue_protocol ? 192u : 160u;
     D3DDDICB_QUERYADAPTERINFO args{};
     args.pPrivateDriverData = reply.data();
-    args.PrivateDriverDataSize = static_cast<UINT>(reply.size());
+    args.PrivateDriverDataSize = expected_size;
     HRESULT hr = adapter.callbacks.pfnQueryAdapterInfoCb(adapter.runtime.handle, &args);
     if (FAILED(hr)) return hr;
-    if (args.PrivateDriverDataSize != reply.size()) return DXGI_ERROR_UNSUPPORTED;
+    if (args.PrivateDriverDataSize != expected_size || args.pPrivateDriverData != reply.data())
+        return DXGI_ERROR_UNSUPPORTED;
     auto u32 = [&](size_t i) {
         return uint32_t(reply[i]) | (uint32_t(reply[i+1]) << 8) |
             (uint32_t(reply[i+2]) << 16) | (uint32_t(reply[i+3]) << 24);
     };
-    if (u32(0) != 0x504d5644 || u32(4) || u32(8) != 128 || u32(12) ||
+    if (u32(0) != 0x504d5644 || u32(4) || u32(8) != 128 || u32(12) || u32(16) || u32(20) ||
             u32(112) || u32(116) || u32(120) || u32(124) ||
             u32(128) != 0x44494c56 || u32(132) != 1 || u32(136) != 32 ||
             u32(140) != 1 || u32(152) != 1 || u32(156)) return DXGI_ERROR_UNSUPPORTED;
-    generation = uint64_t(u32(24)) | (uint64_t(u32(28)) << 32);
-    std::memcpy(luid.data(), reply.data() + 144, luid.size());
-    if (!generation || luid == std::array<uint8_t, 8>{}) return DXGI_ERROR_UNSUPPORTED;
+    if (require_queue_protocol && (u32(160) != 0x43445156 || u32(164) != 1 ||
+            u32(168) != 32 || u32(172) != 1 || u32(176) != 32 || u32(180) != 40 ||
+            u32(184) != 64 || u32(188))) return DXGI_ERROR_UNSUPPORTED;
+    // HasCachedCoherentMemory is an existing UINT32 boolean at byte76 of the
+    // original prefix. It is not a VQDC flag or a complete ICD memory profile.
+    if (u32(76) > 1) return DXGI_ERROR_UNSUPPORTED;
+    NativeAdapterFacts current{};
+    current.generation = uint64_t(u32(24)) | (uint64_t(u32(28)) << 32);
+    std::memcpy(current.luid.data(), reply.data() + 144, current.luid.size());
+    if (!current.generation || current.luid == std::array<uint8_t, 8>{}) return DXGI_ERROR_UNSUPPORTED;
+    current.has_cached_coherent_memory = {true, u32(76) == 1};
+    if (require_queue_protocol) current.owned_allocations_only = {true, true};
+    // Commit only after the complete response is validated. Callers use
+    // independent storage across runtime callbacks.
+    facts = current;
     return S_OK;
+}
+
+bool native_same_identity_facts(const NativeAdapterFacts &a, const NativeAdapterFacts &b) {
+    return a.luid == b.luid && a.generation == b.generation &&
+        a.has_cached_coherent_memory.known == b.has_cached_coherent_memory.known &&
+        (!a.has_cached_coherent_memory.known ||
+         a.has_cached_coherent_memory.value == b.has_cached_coherent_memory.value);
+}
+
+bool native_owned_facts_valid(const NativeAdapterFacts &facts) {
+    return facts.has_cached_coherent_memory.known && facts.has_cached_coherent_memory.value &&
+        facts.owned_allocations_only.known && facts.owned_allocations_only.value;
 }
 
 bool native_version(UINT interface_version, UINT runtime_version, D3D12DDI_CREATE_DEVICE_FLAGS flags) {
@@ -56,8 +84,8 @@ bool native_contract_complete() {
     D3D12DDI_COMMAND_LIST_FUNCS_3D_0003 commands{};
     D3D12DDI_COMMAND_QUEUE_FUNCS_CORE_0001 queue{};
     VioGpuD3D12BridgeGetTables(&device, &commands, &queue);
-    // These mandatory native contracts are still absent. This is a prerequisite
-    // gate, NOT automatic feature-level certification if these become non-null.
+    // These lifecycle entrypoints are wired, but are only prerequisites.
+    // Non-null callbacks do not certify their complete feature-level semantics.
     // Full FL11_0 graphics/format/residency/Present validation must replace this
     // gate as one coherent change before any version is advertised.
     const bool prerequisites = device.pfnCreateHeapAndResource && device.pfnCreateFence &&
@@ -82,11 +110,34 @@ HRESULT APIENTRY native_optional_tables(D3D12DDI_HADAPTER handle, UINT32 *count,
     return S_OK;
 }
 
+HRESULT native_adapter_memory_facts(D3D12DDI_HADAPTER handle, vkdu_memory_facts *output);
+
 HRESULT APIENTRY native_caps(D3D12DDI_HADAPTER handle, const D3D12DDIARG_GETCAPS *args) {
-    if (!native_adapter(handle) || !args || !args->pData || !args->DataSize) return E_INVALIDARG;
-    // The embedded API feature level is not the native driver's feature level.
-    // Bounded compute/graphics callbacks do not satisfy the complete FL11_0 contract.
-    return DXGI_ERROR_UNSUPPORTED;
+    if (!native_adapter(handle) || !args) return E_INVALIDARG;
+    // Runtime callbacks may invalidate the request and node storage. Retain
+    // only entry snapshots; the facts query separately validates registration.
+    const auto request = *args;
+    if (!request.pData || !request.DataSize) return E_INVALIDARG;
+    if (request.Type != D3D12DDICAPS_TYPE_MEMORY_ARCHITECTURE) return DXGI_ERROR_UNSUPPORTED;
+    static_assert(sizeof(D3D12DDI_MEMORY_ARCHITECTURE_CAPS) == 12, "original R0 memory caps");
+    if (!request.pInfo || request.DataSize != sizeof(D3D12DDI_MEMORY_ARCHITECTURE_CAPS)) return E_INVALIDARG;
+    UINT node;
+    std::memcpy(&node, request.pInfo, sizeof(node));
+    if (node) return E_INVALIDARG;
+    vkdu_memory_facts facts{};
+    HRESULT hr = native_adapter_memory_facts(handle, &facts);
+    if (FAILED(hr)) return hr;
+    // S_OK can preserve valid raw false/unknown facts. Those facts cannot be
+    // represented by publishing three false BOOLs as a different architecture.
+    if (!vkdu_memory_facts_qualified(&facts)) return DXGI_ERROR_UNSUPPORTED;
+    const D3D12DDI_MEMORY_ARCHITECTURE_CAPS caps{
+        facts.uma.value ? TRUE : FALSE,
+        facts.io_coherent.value ? TRUE : FALSE,
+        facts.cache_coherent.value ? TRUE : FALSE};
+    std::memcpy(request.pData, &caps, sizeof(caps));
+    // This metadata answer does not certify a complete native feature level.
+    // Supported versions and public table publication remain closed.
+    return S_OK;
 }
 
 HRESULT APIENTRY native_fill_table(D3D12DDI_HADAPTER handle, D3D12DDI_TABLE_TYPE type,
@@ -137,13 +188,58 @@ HRESULT native_load_vulkan(HMODULE *module, PFN_vkGetInstanceProcAddr *loader) {
     return S_OK;
 }
 
+vkdu_memory_expectation native_memory_expectation(const NativeAdapterFacts &facts) {
+    vkdu_memory_expectation expected{};
+    std::memcpy(expected.luid, facts.luid.data(), 8);
+    expected.generation = facts.generation;
+    expected.cached_coherent = {facts.has_cached_coherent_memory.known, facts.has_cached_coherent_memory.value};
+    expected.owned_allocations_only = {facts.owned_allocations_only.known, facts.owned_allocations_only.value};
+    return expected;
+}
+
+// Internal future caps input. The public GetCaps/version gates remain closed.
+// Only independent local storage survives callbacks; no VkPhysicalDevice handle
+// escapes the instance owned by the backend query.
+HRESULT native_adapter_memory_facts(D3D12DDI_HADAPTER handle, vkdu_memory_facts *output) {
+    auto adapter = native_adapter(handle);
+    if (!adapter || !output) return E_INVALIDARG;
+    NativeAdapterFacts before{}, after{};
+    HRESULT hr = native_query_adapter_facts(*adapter, before, true);
+    if (native_adapter(handle) != adapter) return DXGI_ERROR_DEVICE_REMOVED;
+    if (FAILED(hr)) return hr;
+    if (!native_same_identity_facts(before, *adapter)) return DXGI_ERROR_DEVICE_REMOVED;
+    const auto expected = native_memory_expectation(before);
+    vkdu_memory_facts result{};
+    HMODULE module = nullptr;
+    PFN_vkGetInstanceProcAddr loader = nullptr;
+    hr = native_load_vulkan(&module, &loader);
+    if (native_adapter(handle) != adapter) hr = DXGI_ERROR_DEVICE_REMOVED;
+    if (SUCCEEDED(hr)) hr = vkdu_query_adapter_memory_facts(loader, &expected, &result);
+    if (module) FreeLibrary(module);
+    if (native_adapter(handle) != adapter) return DXGI_ERROR_DEVICE_REMOVED;
+    if (FAILED(hr)) return hr;
+    hr = native_query_adapter_facts(*adapter, after, true);
+    if (native_adapter(handle) != adapter) return DXGI_ERROR_DEVICE_REMOVED;
+    if (hr == DXGI_ERROR_UNSUPPORTED) hr = DXGI_ERROR_DEVICE_REMOVED;
+    if (FAILED(hr)) return hr;
+    if (!native_same_identity_facts(before, after) ||
+            !after.owned_allocations_only.known || !after.owned_allocations_only.value)
+        return DXGI_ERROR_DEVICE_REMOVED;
+    *output = result;
+    return S_OK;
+}
+
 #include "native_heap.inc"
+#include "native_open.inc"
+#include "native_buffer_child.inc"
 #include "native_samplers.inc"
 #include "native_textures.inc"
 #include "native_graphics.inc"
 #include "native_fences.inc"
+#include "native_node_metadata.inc"
 #include "native_query_heap.inc"
 #include "native_residency.inc"
+#include "native_present.inc"
 
 // error_mutex owns these lists. Compare opaque slots before dereferencing them.
 Object *native_submission_find(Object *head, void *slot) {
@@ -227,6 +323,9 @@ void native_queue_execute(Object *queue, UINT count, const D3D12DDI_HCOMMANDLIST
     if (!native_submission_find(ctx->native_queue_objects, queue) || !commands || !count || count > 64) {
         error(ctx, E_INVALIDARG); return;
     }
+    if (queue->runtime_route && queue->runtime_route->preparing_present) {
+        error(ctx, DXGI_ERROR_WAS_STILL_DRAWING); return;
+    }
     vkdu_object *native[64]{};
     auto *queue_backend = queue->backend;
     if (!vkdu_object_retain(queue_backend)) { error(ctx, E_OUTOFMEMORY); return; }
@@ -261,7 +360,7 @@ HRESULT native_command_create(Context *ctx, const D3D12DDIARG_CREATE_COMMAND_LIS
     void *slot = args->hDrvCommandList.pDrvPrivate;
     const auto runtime = args->hRTCommandList;
     auto *allocator = backend(args->hDrvCommandAllocator.pDrvPrivate, VKDU_ALLOCATOR);
-    const auto type = command_type(args->QueueFlags);
+    const auto type = command_list_type(args->Type, args->QueueFlags);
     vkdu_object *value = nullptr;
     HRESULT hr;
     {
@@ -304,24 +403,50 @@ HRESULT APIENTRY native_create_device(D3D12DDI_HADAPTER handle, const D3D12DDIAR
             !args->pKTCallbacks || !args->p12UMCallbacks || !args->p12UMCallbacks->pfnSetErrorCb)
         return E_INVALIDARG;
     if (!native_version(args->Interface, args->Version, args->Flags)) return DXGI_ERROR_UNSUPPORTED;
+    // The callback may close the adapter and invalidate the original inputs.
+    const auto request = *args;
+    const auto kernel_callbacks = *args->pKTCallbacks;
+    const auto runtime_callbacks = *args->p12UMCallbacks;
     // Never inspect uninitialized runtime-owned storage before constructing it.
-    std::array<uint8_t, 8> current_luid{}; uint64_t current_generation = 0;
-    HRESULT hr = native_query_identity(*adapter, current_luid, current_generation);
+    NativeAdapterFacts current_facts{};
+    HRESULT hr = native_query_adapter_facts(*adapter, current_facts, true);
+    if (native_adapter(handle) != adapter) return DXGI_ERROR_DEVICE_REMOVED;
     if (FAILED(hr)) return hr;
-    if (current_luid != adapter->luid || current_generation != adapter->generation) return DXGI_ERROR_DEVICE_REMOVED;
+    // The current owned-allocation KMD path requires cached-coherent memory;
+    // a valid false fact is not permission to silently use another cache mode.
+    if (!native_owned_facts_valid(current_facts)) return DXGI_ERROR_UNSUPPORTED;
+    if (!native_same_identity_facts(current_facts, *adapter)) return DXGI_ERROR_DEVICE_REMOVED;
     auto *ctx = new (std::nothrow) Context;
     if (!ctx) return E_OUTOFMEMORY;
     PFN_vkGetInstanceProcAddr loader = nullptr;
     hr = native_load_vulkan(&ctx->vulkan_module, &loader);
+    if (native_adapter(handle) != adapter) hr = DXGI_ERROR_DEVICE_REMOVED;
     ctx->native_adapter = adapter;
-    ctx->runtime_device = args->hRTDevice;
-    ctx->kernel_callbacks = *args->pKTCallbacks;
-    ctx->runtime_callbacks = *args->p12UMCallbacks;
-    if (SUCCEEDED(hr)) hr = vkdu_device_create_shared(loader, adapter->luid.data(), &native_runtime_callbacks, ctx, &ctx->backend);
+    ctx->native_facts = current_facts;
+    ctx->runtime_device = request.hRTDevice;
+    ctx->kernel_callbacks = kernel_callbacks;
+    ctx->runtime_callbacks = runtime_callbacks;
+    if (SUCCEEDED(hr)) {
+        // VQDC Flags1 certifies only owned allocations sharing a domain.
+        // Cross-context imported native surfaces require a separate lifetime
+        // and ordering contract. ICD image support alone cannot grant that
+        // KMD capability: keep native Open/Present/provider opt-in disabled.
+        ctx->native_surfaces = false;
+        const auto expected = native_memory_expectation(current_facts);
+        hr = vkdu_device_create_shared(loader, &expected, &native_runtime_callbacks, ctx,
+                &ctx->native_memory_facts, &ctx->backend);
+        if (hr != S_OK && SUCCEEDED(hr)) hr = E_FAIL;
+    }
+    if (native_adapter(handle) != adapter || ctx->native_retiring) hr = DXGI_ERROR_DEVICE_REMOVED;
     // Backend creation may race a KMD reset; revalidate before publishing state.
-    if (SUCCEEDED(hr)) hr = native_query_identity(*adapter, current_luid, current_generation);
-    if (SUCCEEDED(hr) && (current_luid != adapter->luid || current_generation != adapter->generation))
+    if (SUCCEEDED(hr)) {
+        hr = native_query_adapter_facts(*adapter, current_facts, true);
+        if (hr == DXGI_ERROR_UNSUPPORTED) hr = DXGI_ERROR_DEVICE_REMOVED;
+    }
+    if (SUCCEEDED(hr) && (!native_owned_facts_valid(current_facts) ||
+            !native_same_identity_facts(current_facts, ctx->native_facts)))
         hr = DXGI_ERROR_DEVICE_REMOVED;
+    if (native_adapter(handle) != adapter || ctx->native_retiring) hr = DXGI_ERROR_DEVICE_REMOVED;
     if (FAILED(hr)) {
         ctx->native_retiring = true;
         native_heap_retire(ctx);
@@ -329,12 +454,12 @@ HRESULT APIENTRY native_create_device(D3D12DDI_HADAPTER handle, const D3D12DDIAR
         release(ctx); return hr;
     }
     ctx->native_adapter = std::move(adapter);
-    ctx->runtime_device = args->hRTDevice;
-    ctx->kernel_callbacks = *args->pKTCallbacks;
-    ctx->runtime_callbacks = *args->p12UMCallbacks;
+    ctx->runtime_device = request.hRTDevice;
+    ctx->kernel_callbacks = kernel_callbacks;
+    ctx->runtime_callbacks = runtime_callbacks;
     ctx->report = native_report;
     ctx->report_context = ctx;
-    new (args->hDrvDevice.pDrvPrivate) NativeDevice{native_device_magic, ctx};
+    new (request.hDrvDevice.pDrvPrivate) NativeDevice{native_device_magic, ctx};
     return S_OK;
 }
 
@@ -393,7 +518,7 @@ extern "C" HRESULT APIENTRY OpenAdapter12(D3D12DDIARG_OPENADAPTER *args) {
         auto adapter = std::make_shared<NativeAdapter>();
         adapter->runtime = args->hRTAdapter;
         adapter->callbacks = *args->pAdapterCallbacks;
-        HRESULT hr = native_query_identity(*adapter, adapter->luid, adapter->generation);
+        HRESULT hr = native_query_adapter_facts(*adapter, *adapter);
         if (FAILED(hr)) return hr;
         {
             std::lock_guard<std::mutex> lock(native_adapters_lock);

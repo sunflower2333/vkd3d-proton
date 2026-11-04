@@ -8,8 +8,11 @@ static UINT64 returned_paging;
 static bool partial_residency;
 static std::function<void()> nested_residency;
 static void check_residency(UINT number, const D3DKMT_HANDLE *handles, UINT flags) {
-    if (number != expected_residency.size() || flags != expected_residency_flags || !handles)
+    if (number != expected_residency.size() || flags != expected_residency_flags || !handles) {
+        std::fprintf(stderr, "FAIL residency list: actual allocations %u, expected unique allocations %zu, flags %u/%u\n",
+            number, expected_residency.size(), flags, expected_residency_flags);
         fixture_abort(__LINE__);
+    }
     for (UINT i = 0; i < number; ++i)
         if (handles[i] != expected_residency[i] || !kernel_heaps.count(handles[i])) fixture_abort(__LINE__);
 }
@@ -45,6 +48,7 @@ static int test_native_residency() {
     D3DDDI_DEVICECALLBACKS kt{};
     kt.pfnCreateContextCb = heap_context_create; kt.pfnDestroyContextCb = heap_context_destroy;
     kt.pfnEscapeCb = heap_escape; kt.pfnAllocateCb = heap_allocate; kt.pfnDeallocateCb = heap_deallocate;
+    kt.pfnDeallocate2Cb = heap_deallocate2;
     kt.pfnLockCb = heap_lock; kt.pfnUnlockCb = heap_unlock; kt.pfnRenderCb = heap_render;
     kt.pfnSignalSynchronizationObject2Cb = heap_signal;
     D3D12DDI_CORELAYER_DEVICECALLBACKS_0003 um{}; um.pfnSetErrorCb = test_error;

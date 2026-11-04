@@ -329,8 +329,11 @@ static ULONG STDMETHODCALLTYPE d3d12_bundle_Release(d3d12_command_list_iface *if
 
     if (!refcount)
     {
-        if (bundle->allocator && bundle->allocator->current_bundle == bundle)
-            bundle->allocator->current_bundle = NULL;
+        if (bundle->allocator) {
+            if (bundle->allocator->current_bundle == bundle)
+                bundle->allocator->current_bundle = NULL;
+            ID3D12CommandAllocator_Release(&bundle->allocator->ID3D12CommandAllocator_iface);
+        }
 
         d3d_destruction_notifier_free(&bundle->destruction_notifier);
         vkd3d_private_store_destroy(&bundle->private_store);
@@ -432,6 +435,14 @@ static HRESULT STDMETHODCALLTYPE d3d12_bundle_Reset(d3d12_command_list_iface *if
         return E_INVALIDARG;
     }
 
+    /* Every bundle owns its allocator independently of completion owner order.
+     * Switching must detach the old weak current-bundle link before release. */
+    ID3D12CommandAllocator_AddRef(allocator);
+    if (bundle->allocator) {
+        struct d3d12_bundle_allocator *old = bundle->allocator;
+        if (old->current_bundle == bundle) old->current_bundle = NULL;
+        ID3D12CommandAllocator_Release(&old->ID3D12CommandAllocator_iface);
+    }
     bundle->is_recording = true;
     bundle->allocator = bundle_allocator;
     bundle->head = NULL;
@@ -1906,6 +1917,23 @@ HRESULT d3d12_bundle_create(struct d3d12_device *device,
     d3d_destruction_notifier_init(&object->destruction_notifier, (IUnknown*)&object->ID3D12GraphicsCommandList_iface);
     d3d12_device_add_ref(device);
     *bundle = object;
+    return S_OK;
+}
+
+static void d3d12_bundle_exec_clear_root_arguments(d3d12_command_list_iface *list, const void *args)
+{
+    (void)args;
+#ifdef VKDU_TEST_BUNDLE_CLEAR_DROP
+    return;
+#endif
+    vkd3d_wddm_command_clear_root_arguments((ID3D12GraphicsCommandList *)list);
+}
+
+HRESULT vkd3d_wddm_bundle_clear_root_arguments(ID3D12GraphicsCommandList *command)
+{
+    struct d3d12_bundle *bundle = d3d12_bundle_from_iface(command);
+    if (!bundle || !bundle->is_recording) return E_INVALIDARG;
+    d3d12_bundle_add_command(bundle, d3d12_bundle_exec_clear_root_arguments, sizeof(struct d3d12_bundle_command));
     return S_OK;
 }
 

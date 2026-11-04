@@ -190,6 +190,7 @@ struct vkd3d_vulkan_info
     bool EXT_dynamic_rendering_unused_attachments;
     bool EXT_line_rasterization;
     bool EXT_image_compression_control;
+    bool EXT_image_drm_format_modifier;
     bool EXT_device_fault;
     bool EXT_memory_budget;
     bool EXT_device_address_binding_report;
@@ -911,6 +912,7 @@ struct vkd3d_memory_free_range
 struct vkd3d_memory_chunk
 {
     struct vkd3d_memory_allocation allocation;
+    D3D12_HEAP_TYPE original_heap_type;
     struct vkd3d_memory_free_range *free_ranges;
     size_t free_ranges_size;
     size_t free_ranges_count;
@@ -1187,6 +1189,8 @@ struct d3d12_resource
     struct vkd3d_memory_allocation private_mem;
     struct vkd3d_unique_resource res;
     D3DKMT_HANDLE kmt_local;
+    /* Dedicated native AHB import; not an allocator-owned memory slice. */
+    VkDeviceMemory wddm_native_memory;
 
     struct d3d12_heap *heap;
 
@@ -2877,6 +2881,8 @@ struct vkd3d_pipeline_bindings
     struct vkd3d_root_descriptor_info root_descriptors[D3D12_MAX_ROOT_COST];
     uint64_t root_descriptor_dirty_mask;
     uint64_t root_descriptor_active_mask;
+    /* WDDM clearing also applies before a root signature is bound. */
+    uint64_t wddm_root_descriptor_zero_mask;
 
     uint32_t root_constants[D3D12_MAX_ROOT_COST];
     uint64_t root_constant_dirty_mask;
@@ -4653,6 +4659,9 @@ static inline VkDescriptorType vkd3d_bindless_state_get_cbv_descriptor_type(cons
             : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
 }
 
+VkDescriptorType vkd3d_bindless_resolve_null_descriptor_type(const struct vkd3d_bindless_state *bindless_state,
+        const struct vkd3d_bindless_set_info *set_info, VkDescriptorType requested_type);
+
 static inline uint8_t *vkd3d_bindless_state_get_null_descriptor_payload(struct vkd3d_bindless_state *bindless_state,
         VkDescriptorType type)
 {
@@ -5039,7 +5048,20 @@ struct vkd3d_predicate_ops
     VkPipelineLayout vk_resolve_pipeline_layout;
     VkPipeline vk_command_pipelines[VKD3D_PREDICATE_COMMAND_COUNT];
     VkPipeline vk_resolve_pipeline;
+    VkPipelineLayout vk_buffer_pipeline_layout;
+    VkPipeline vk_buffer_pipeline;
+    VkPipeline vk_buffer_bytes_pipeline;
     uint32_t data_sizes[VKD3D_PREDICATE_COMMAND_COUNT];
+};
+
+struct vkd3d_predicate_buffer_args
+{
+    VkDeviceAddress predicate_va;
+    VkDeviceAddress src_va;
+    VkDeviceAddress dst_va;
+    uint32_t count;
+    uint32_t fill;
+    VkBool32 is_fill;
 };
 
 struct vkd3d_multi_dispatch_indirect_info
@@ -5983,6 +6005,8 @@ struct d3d12_device
     void *wddm_runtime_owner;
     struct mwd_callbacks wddm_runtime_callbacks;
     mwd_pageable_acquire_fn wddm_pageable_acquire;
+    bool wddm_native_surfaces;
+    bool wddm_native_present;
 };
 
 HRESULT d3d12_device_create(struct vkd3d_instance *instance,

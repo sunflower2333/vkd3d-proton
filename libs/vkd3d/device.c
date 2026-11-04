@@ -132,6 +132,7 @@ static const struct vkd3d_optional_extension_info optional_device_extensions[] =
     VK_EXTENSION(EXT_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS, EXT_dynamic_rendering_unused_attachments),
     VK_EXTENSION(EXT_LINE_RASTERIZATION, EXT_line_rasterization),
     VK_EXTENSION(EXT_IMAGE_COMPRESSION_CONTROL, EXT_image_compression_control),
+    VK_EXTENSION(EXT_IMAGE_DRM_FORMAT_MODIFIER, EXT_image_drm_format_modifier),
     VK_EXTENSION_COND(EXT_DEVICE_FAULT, EXT_device_fault, VKD3D_CONFIG_FLAG_STATIC(FAULT)),
     VK_EXTENSION(EXT_MEMORY_BUDGET, EXT_memory_budget),
     VK_EXTENSION_COND(EXT_DEVICE_ADDRESS_BINDING_REPORT, EXT_device_address_binding_report, VKD3D_CONFIG_FLAG_STATIC(FAULT)),
@@ -4174,6 +4175,7 @@ static HRESULT vkd3d_create_vk_device(struct d3d12_device *device,
         const struct vkd3d_device_create_info *create_info, const struct mwd_device_create_info *runtime)
 {
     struct mwd_device_create_info runtime_info;
+    struct mwd_native_surface_device_info native_surface_info;
     const struct vkd3d_vk_instance_procs *vk_procs = &device->vkd3d_instance->vk_procs;
     struct vkd3d_device_queue_info device_queue_info;
     VkPhysicalDeviceProperties device_properties;
@@ -4286,11 +4288,17 @@ static HRESULT vkd3d_create_vk_device(struct d3d12_device *device,
     device_info.pNext = device->device_info.features2.pNext;
     if (runtime)
     {
-        struct mwd_support support = {MWD_STYPE_SUPPORT};
+        struct mwd_support support = {MWD_STYPE_SUPPORT_V2};
+        struct mwd_support native_surface = {MWD_STYPE_NATIVE_SURFACE_SUPPORT_V2};
+        struct mwd_support native_present = {MWD_STYPE_NATIVE_PRESENT_SUPPORT_V2};
         struct mwd_pageable_support pageable = {MWD_STYPE_PAGEABLE_SUPPORT};
         VkPhysicalDeviceProperties2 properties = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
         properties.pNext = &support;
         support.pNext = &pageable;
+        if (runtime->pNext) {
+            pageable.pNext = &native_surface;
+            native_surface.pNext = &native_present;
+        }
         VK_CALL(vkGetPhysicalDeviceProperties2(physical_device, &properties));
         if (support.magic != MWD_RUNTIME_MAGIC || support.version != MWD_RUNTIME_ABI_VERSION ||
                 support.size != sizeof(struct mwd_callbacks) || support.flags != 1)
@@ -4305,6 +4313,32 @@ static HRESULT vkd3d_create_vk_device(struct d3d12_device *device,
         runtime_info = *runtime;
         runtime_info.pNext = device_info.pNext;
         device_info.pNext = &runtime_info;
+        if (runtime->pNext)
+        {
+            if (native_surface.magic != MWD_RUNTIME_MAGIC || native_surface.version != MWD_RUNTIME_ABI_VERSION ||
+                    native_surface.size != sizeof(struct mwd_callbacks) ||
+                    native_surface.flags != MWD_SUPPORT_NATIVE_SURFACE || !device->vk_info.EXT_image_drm_format_modifier)
+            {
+                vkd3d_free(user_extension_supported);
+                vkd3d_free(extensions);
+                return DXGI_ERROR_UNSUPPORTED;
+            }
+            native_surface_info = *(const struct mwd_native_surface_device_info *)runtime->pNext;
+            if (native_surface_info.flags & MWD_SUPPORT_NATIVE_PRESENT)
+            {
+                if (native_present.magic != MWD_RUNTIME_MAGIC || native_present.version != MWD_RUNTIME_ABI_VERSION ||
+                        native_present.size != sizeof(struct mwd_callbacks) || native_present.flags != MWD_SUPPORT_NATIVE_PRESENT)
+                {
+                    vkd3d_free(user_extension_supported);
+                    vkd3d_free(extensions);
+                    return DXGI_ERROR_UNSUPPORTED;
+                }
+                device->wddm_native_present = true;
+            }
+            native_surface_info.pNext = runtime_info.pNext;
+            runtime_info.pNext = &native_surface_info;
+            device->wddm_native_surfaces = true;
+        }
     }
     device_info.flags = 0;
     device_info.queueCreateInfoCount = device_queue_info.vk_family_count;

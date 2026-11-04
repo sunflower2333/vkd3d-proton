@@ -406,7 +406,7 @@ static dxil_spv_bool dxil_input_remap(void *userdata, const dxil_spv_d3d_vertex_
     return DXIL_SPV_TRUE;
 }
 
-static dxil_spv_bool dxil_output_remap(void *userdata, const dxil_spv_d3d_stream_output *d3d_output,
+static dxil_spv_bool dxil_output_remap(void *userdata, const dxil_spv_d3d_stream_output_component *d3d_output,
                                        dxil_spv_vulkan_stream_output *vk_output)
 {
     const struct vkd3d_shader_transform_feedback_info *xfb_info = userdata;
@@ -421,8 +421,11 @@ static dxil_spv_bool dxil_output_remap(void *userdata, const dxil_spv_d3d_stream
     {
         const struct vkd3d_shader_transform_feedback_element *e = &xfb_info->elements[i];
 
-        /* TODO: Stream index matching? */
-        if (!ascii_strcasecmp(e->semantic_name, d3d_output->semantic) && e->semantic_index == d3d_output->semantic_index)
+        if (e->semantic_name && e->stream_index == d3d_output->stream_index &&
+                !ascii_strcasecmp(e->semantic_name, d3d_output->semantic) &&
+                e->semantic_index == d3d_output->semantic_index &&
+                d3d_output->component >= e->component_index &&
+                d3d_output->component - e->component_index < e->component_count)
         {
             xfb_element = e;
             break;
@@ -454,7 +457,8 @@ static dxil_spv_bool dxil_output_remap(void *userdata, const dxil_spv_d3d_stream
     }
 
     vk_output->enable = DXIL_SPV_TRUE;
-    vk_output->offset = buffer_offsets[xfb_element->output_slot];
+    vk_output->offset = buffer_offsets[xfb_element->output_slot] +
+            4 * (d3d_output->component - xfb_element->component_index);
     vk_output->stride = stride;
     vk_output->buffer_index = xfb_element->output_slot;
     return DXIL_SPV_TRUE;
@@ -1565,8 +1569,12 @@ int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
 
     dxil_spv_converter_set_vertex_input_remapper(converter, dxil_input_remap, (void *)shader_interface_info);
 
+    if (stage == DXIL_SPV_STAGE_GEOMETRY)
+        dxil_spv_converter_set_geometry_rasterization_stream(converter, shader_interface_info->xfb_info ?
+                shader_interface_info->xfb_info->rasterized_stream : 0);
+
     if (shader_interface_info->xfb_info)
-        dxil_spv_converter_set_stream_output_remapper(converter, dxil_output_remap, (void *)shader_interface_info->xfb_info);
+        dxil_spv_converter_set_stream_output_component_remapper(converter, dxil_output_remap, (void *)shader_interface_info->xfb_info);
 
     if (shader_interface_info->stage_input_map)
         dxil_spv_converter_set_stage_input_remapper(converter, dxil_shader_stage_input_remap, (void *)shader_interface_info->stage_input_map);

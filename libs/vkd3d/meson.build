@@ -17,6 +17,8 @@ vkd3d_shaders =[
   'shaders/cs_emit_nv_memory_decompression_regions.comp',
   'shaders/cs_emit_nv_memory_decompression_workgroups.comp',
   'shaders/cs_predicate_command.comp',
+  'shaders/cs_predicate_buffer.comp',
+  'shaders/cs_predicate_buffer_bytes.comp',
   'shaders/cs_resolve_binary_queries.comp',
   'shaders/cs_resolve_predicate.comp',
   'shaders/cs_resolve_query.comp',

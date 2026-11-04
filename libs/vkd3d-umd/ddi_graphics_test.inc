@@ -22,6 +22,7 @@ static void graphics_poison() {
     if (graphics_rect_input) std::memset(graphics_rect_input, 0xcc, sizeof(*graphics_rect_input));
     if (graphics_color_input) std::memset(graphics_color_input, 0xcc, sizeof(float) * 4);
 }
+#include "ddi_mrt_test.inc"
 static int check_native_graphics() {
     Context ctx, foreign; ctx.backend = reinterpret_cast<vkdu_device *>(&next_base); ctx.report = capture;
     foreign.backend = reinterpret_cast<vkdu_device *>(&calls); foreign.report = capture;
@@ -30,6 +31,13 @@ static int check_native_graphics() {
     D3D12DDI_DEVICE_FUNCS_CORE_0003 device{}; D3D12DDI_COMMAND_LIST_FUNCS_3D_0003 commands{};
     D3D12DDI_COMMAND_QUEUE_FUNCS_CORE_0001 queue{};
     REQUIRE(VioGpuD3D12BridgeGetTables(&device, &commands, &queue) == S_OK);
+    REQUIRE(commands.pfnClearRootArguments != nullptr);
+    REQUIRE(commands.pfnClearUnorderedAccessViewUint && commands.pfnClearUnorderedAccessViewFloat);
+    REQUIRE(commands.pfnSetPredication);
+    REQUIRE(device.pfnCreateGeometryShader != nullptr);
+    REQUIRE(device.pfnCalcPrivateGeometryShaderWithStreamOutput != nullptr);
+    REQUIRE(device.pfnCreateGeometryShaderWithStreamOutput != nullptr);
+    REQUIRE(commands.pfnSOSetTargets != nullptr);
     Object root{}, vs{}, ps{}, wrong{}, blend{}, raster{}, depth{}, pipeline{}, command{}, texture{}, heap{}, buffer{}, layout{};
     REQUIRE(bind(&ctx, &root, make_peer(ctx.backend, VKDU_ROOT), VKDU_ROOT) == S_OK);
     // Token validation and signature copying use the production DXBC builder.
@@ -80,6 +88,37 @@ static int check_native_graphics() {
     REQUIRE(graphics_state.input_count == 1 && graphics_elements[0].reg == 7 && graphics_elements[0].offset == 12 &&
         graphics_elements[0].slot == 5 && graphics_elements[0].step_rate == 2 && graphics_elements[0].per_instance == 1);
     device.pfnDestroyPipelineState(h, {&pipeline});
+    REQUIRE(!check_native_mrt_pipeline(&ctx,h,device,pso,bs,blend));
+    for (const auto format : {DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_B8G8R8A8_UNORM,
+            DXGI_FORMAT_B8G8R8A8_UNORM_SRGB}) {
+        pso.RTVFormats[0] = format;
+        REQUIRE(device.pfnCreatePipelineState(h, &pso) == S_OK && graphics_state.format == format);
+        device.pfnDestroyPipelineState(h, {&pipeline});
+    }
+    pso.RTVFormats[0] = DXGI_FORMAT_B8G8R8X8_UNORM;
+    REQUIRE(device.pfnCreatePipelineState(h, &pso) == DXGI_ERROR_UNSUPPORTED);
+    pso.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    device.pfnDestroyDepthStencilState(h, {&depth});
+    ds.DepthEnable = TRUE; ds.DepthWriteMask = D3D12DDI_DEPTH_WRITE_MASK_ALL; ds.DepthFunc = D3D12DDI_COMPARISON_FUNC_LESS;
+    device.pfnCreateDepthStencilState(h, &ds, {&depth}); pso.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+    REQUIRE(device.pfnCreatePipelineState(h, &pso) == S_OK && graphics_state.depth_format == DXGI_FORMAT_D32_FLOAT &&
+        graphics_state.depth_enable == 1 && graphics_state.depth_write == 1 && graphics_state.depth_func == 2);
+    device.pfnDestroyPipelineState(h, {&pipeline}); pso.DSVFormat = DXGI_FORMAT_D16_UNORM;
+    REQUIRE(device.pfnCreatePipelineState(h, &pso) == S_OK && graphics_state.depth_format == DXGI_FORMAT_D16_UNORM &&
+        graphics_state.depth_enable == 1 && graphics_state.depth_write == 1 && graphics_state.depth_func == 2);
+    device.pfnDestroyPipelineState(h, {&pipeline}); device.pfnDestroyDepthStencilState(h, {&depth});
+    ds = {}; pso.DSVFormat = DXGI_FORMAT_UNKNOWN; device.pfnCreateDepthStencilState(h, &ds, {&depth});
+    device.pfnDestroyBlendState(h, {&blend});
+    bs.IndependentBlendEnable = TRUE; bs.RenderTarget[0].BlendEnable = TRUE;
+    bs.RenderTarget[0].SrcBlend = bs.RenderTarget[0].SrcBlendAlpha = D3D12DDI_BLEND_BLEND_FACTOR;
+    bs.RenderTarget[0].DestBlend = bs.RenderTarget[0].DestBlendAlpha = D3D12DDI_BLEND_INVBLEND_FACTOR;
+    bs.RenderTarget[0].BlendOp = D3D12DDI_BLEND_OP_SUBTRACT; bs.RenderTarget[0].BlendOpAlpha = D3D12DDI_BLEND_OP_ADD;
+    device.pfnCreateBlendState(h, &bs, {&blend});
+    REQUIRE(device.pfnCreatePipelineState(h, &pso) == S_OK && graphics_state.blend_enable == 1 &&
+        graphics_state.src_blend == 14 && graphics_state.dst_blend == 15 && graphics_state.blend_op == 2 &&
+        graphics_state.src_blend_alpha == 14 && graphics_state.dst_blend_alpha == 15 && graphics_state.blend_op_alpha == 1);
+    device.pfnDestroyPipelineState(h, {&pipeline}); device.pfnDestroyBlendState(h, {&blend});
+    bs = {}; bs.RenderTarget[0].RenderTargetWriteMask = 15; device.pfnCreateBlendState(h, &bs, {&blend});
     pso.hElementLayout = {reinterpret_cast<void *>(1)};
     REQUIRE(device.pfnCreatePipelineState(h, &pso) == E_INVALIDARG); pso.hElementLayout = {&layout};
     auto *layout_registry = ctx.graphics_objects; ctx.graphics_objects = layout.next;
@@ -88,7 +127,7 @@ static int check_native_graphics() {
     pso.hPixelShader = {reinterpret_cast<void *>(1)};
     REQUIRE(device.pfnCreatePipelineState(h, &pso) == E_INVALIDARG); pso.hPixelShader = {&ps};
     pso.NumRenderTargets = 2; REQUIRE(device.pfnCreatePipelineState(h, &pso) == DXGI_ERROR_UNSUPPORTED); pso.NumRenderTargets = 1;
-    bs.RenderTarget[0].BlendEnable = TRUE;
+    bs.RenderTarget[0].LogicOpEnable = TRUE;
     device.pfnCreateBlendState(h, &bs, {&wrong}); pso.hBlendState = {&wrong};
     REQUIRE(device.pfnCreatePipelineState(h, &pso) == DXGI_ERROR_UNSUPPORTED);
     device.pfnDestroyBlendState(h, {&wrong}); pso.hBlendState = {&blend};
@@ -115,6 +154,19 @@ static int check_native_graphics() {
     rtv.ResourceDimension = D3D12DDI_RD_TEXTURE2D; rtv.Format = DXGI_FORMAT_R8G8B8A8_UNORM; rtv.Tex2D.ArraySize = 1;
     device.pfnCreateRenderTargetView(h, &rtv, target);
     REQUIRE(graphics_resource == texture.backend && graphics_index == 3);
+    rtv.Tex2D.MipSlice = 1; rtv.Tex2D.FirstArraySlice = 1; rtv.Tex2D.ArraySize = 2;
+    for (const auto format : {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+            DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB}) {
+        peer(texture.backend)->type = format; rtv.Format = format;
+        const auto prior = graphics_calls;
+        device.pfnCreateRenderTargetView(h, &rtv, target);
+        REQUIRE(graphics_calls == prior + 1 && graphics_resource == texture.backend && graphics_index == 3 &&
+            attachment_view_mip == 1 && attachment_view_first_layer == 1 && attachment_view_layers == 2);
+        rtv.Format = DXGI_FORMAT_R32_FLOAT;
+        device.pfnCreateRenderTargetView(h, &rtv, target);
+        REQUIRE(graphics_calls == prior + 1 && reported == E_INVALIDARG);
+    }
+    peer(texture.backend)->type = DXGI_FORMAT_R8G8B8A8_UNORM; rtv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     unsigned before = graphics_calls;
     rtv.hDrvResource = {reinterpret_cast<void *>(1)}; device.pfnCreateRenderTargetView(h, &rtv, target);
     REQUIRE(graphics_calls == before && reported == E_INVALIDARG); rtv.hDrvResource = {&texture};
@@ -122,6 +174,7 @@ static int check_native_graphics() {
     REQUIRE(graphics_calls == before && reported == E_INVALIDARG); ctx.resources = saved;
     heap.descriptor_flags = 0; device.pfnCreateRenderTargetView(h, &rtv, target);
     REQUIRE(graphics_calls == before && reported == E_INVALIDARG); heap.descriptor_flags = hd.Flags;
+    REQUIRE(!check_native_mrt_om(&ctx,&foreign,commands));
     commands.pfnOMSetRenderTargets({&command}, 1, &target, TRUE, nullptr);
     REQUIRE(graphics_resource == heap.backend && graphics_index == 3);
     commands.pfnDrawInstanced({&command}, 17, 3, 5, 7);
@@ -138,6 +191,11 @@ static int check_native_graphics() {
     commands.pfnRsSetViewports({&command}, 1, &viewport);
     REQUIRE(graphics_locks_free && graphics_view.x == 2 && graphics_view.y == 3 && graphics_view.width == 16);
     graphics_view_input = nullptr; graphics_hook = nullptr;
+    float factor[4] = {0.25f, 0.5f, 0.75f, 0.125f};
+    graphics_color_input = factor; graphics_hook = graphics_poison;
+    commands.pfnOmSetBlendFactor({&command}, factor);
+    REQUIRE(graphics_locks_free && graphics_color[0] == 0.25f && graphics_color[2] == 0.75f && graphics_color[3] == 0.125f);
+    graphics_color_input = nullptr; graphics_hook = nullptr;
     D3D12DDI_RECT rect{1, 2, 7, 8}; float color[4] = {0.25f, 0.5f, 0.75f, 1};
     graphics_rect_input = &rect; graphics_color_input = color; graphics_hook = graphics_poison;
     commands.pfnClearRenderTargetView({&command}, target, color, 1, &rect);

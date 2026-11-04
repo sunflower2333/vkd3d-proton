@@ -30,8 +30,18 @@ static_assert(sizeof(NativeContextCreate) == 32 && sizeof(NativeContextInfo) == 
 static_assert(sizeof(NativeContextCreateShared) == 40, "shared domain context ABI");
 static_assert(sizeof(NativeAllocationInfo) == 80 && offsetof(NativeAllocationInfo, context_id) == 76, "v0 allocation ABI");
 constexpr uint64_t native_heap_alignment = 65536;
+static_assert((D3D12DDI_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER | D3D12DDI_RESOURCE_STATE_INDEX_BUFFER |
+        D3D12DDI_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12DDI_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+        D3D12DDI_RESOURCE_STATE_INDIRECT_ARGUMENT | D3D12DDI_RESOURCE_STATE_COPY_SOURCE) == 0xac3, "buffer read states");
 struct NativeHeapSlot { uint32_t magic; };
 constexpr uint32_t native_heap_magic = 0x564b484d;
+// Each runtime open has its own NativeHeap/association, while all opens of a
+// native key share one GPU mapping and VA reservation until the final owner.
+struct NativeSurfaceMapping {
+    long closing = 0;
+    uint32_t residency_operations = 0;
+    bool released = false;
+};
 struct NativeHeap {
     NativeHeap *next = nullptr;
     void *slot = nullptr;
@@ -45,7 +55,20 @@ struct NativeHeap {
     uint32_t residency_operations = 0;
     uint64_t alignment = native_heap_alignment;
     bool cpu_visible = false, locked = false, pending = false, resource_created = false;
+    // Public pageable heaps/resources have synchronous destruction semantics.
+    // This survives slot retirement and backend token references. Internal ICD
+    // scratch allocations retain their separate legacy deallocation policy.
+    bool pageable = false;
+    uint64_t native_key = 0;
+    bool native_uncertain = false;
+    std::shared_ptr<NativeSurfaceMapping> native_mapping;
 };
+HRESULT native_surface_cleanup(Context *, NativeHeap *, bool);
+
+bool native_heap_residency_busy(const NativeHeap *heap) {
+    return heap->residency_operations ||
+        (heap->native_mapping && heap->native_mapping->residency_operations);
+}
 
 // One retained context and recursive lock cover every callback. A synchronous
 // DestroyDevice may retire callbacks while the call is on the stack. Check
@@ -90,20 +113,33 @@ bool native_header_valid(const NativeAbiHeader &h, uint32_t size) {
 
 HRESULT native_heap_generation(Context *ctx) {
     if (ctx->native_retiring || !ctx->runtime_device.handle) return DXGI_ERROR_DEVICE_REMOVED;
-    std::array<uint8_t, 8> luid{};
-    uint64_t generation = 0;
-    HRESULT hr = native_query_identity(*ctx->native_adapter, luid, generation);
-    if (ctx->native_retiring) return DXGI_ERROR_DEVICE_REMOVED;
+    NativeAdapterFacts current_facts{};
+    HRESULT hr = native_query_adapter_facts(*ctx->native_adapter, current_facts);
+    if (ctx->native_retiring || hr == DXGI_ERROR_UNSUPPORTED) return DXGI_ERROR_DEVICE_REMOVED;
     if (FAILED(hr)) return hr;
-    return luid == ctx->native_adapter->luid && generation == ctx->native_adapter->generation
+    return native_same_identity_facts(current_facts, ctx->native_facts)
         ? S_OK : DXGI_ERROR_DEVICE_REMOVED;
 }
 
+vkdu_texture2d_shape native_texture_shape(const D3D12DDIARG_CREATERESOURCE_0003 &r) {
+    return {static_cast<UINT>(r.Width), r.Height, static_cast<UINT>(r.Format), r.MipLevels, r.DepthOrArraySize,
+        static_cast<UINT>(r.Flags) & 3u, r.SampleDesc.Count, r.SampleDesc.Quality};
+}
+bool native_texture_subresources(const D3D12DDIARG_CREATERESOURCE_0003 &r) {
+    return r.ResourceType == D3D12DDI_RT_TEXTURE2D && (r.MipLevels != 1 || r.DepthOrArraySize != 1 || r.SampleDesc.Count != 1);
+}
 HRESULT native_heap_desc(const D3D12DDIARG_CREATEHEAP_0001 *heap,
         const D3D12DDIARG_CREATERESOURCE_0003 *resource) {
-    if (!heap || !heap->ByteSize || heap->ByteSize % native_heap_alignment ||
+    // Preserve unsupported-shape rejection before applying the MSAA heap contract.
+    if (resource && resource->ResourceType == D3D12DDI_RT_TEXTURE2D && resource->SampleDesc.Count != 1) {
+        const auto shape = native_texture_shape(*resource);
+        if (resource->Width > 16384 || !vkdu_texture2d_shape_valid(&shape)) return DXGI_ERROR_UNSUPPORTED;
+    }
+    const uint64_t alignment = resource && resource->ResourceType == D3D12DDI_RT_TEXTURE2D &&
+        resource->SampleDesc.Count > 1 ? 4194304 : native_heap_alignment;
+    if (!heap || !heap->ByteSize || heap->ByteSize % alignment ||
             heap->ByteSize > (UINT32_MAX & ~uint64_t(4095)) ||
-            (heap->Alignment && heap->Alignment != native_heap_alignment) ||
+            (alignment == 4194304 ? heap->Alignment != alignment : heap->Alignment && heap->Alignment != alignment) ||
             heap->CreationNodeMask != 1 || heap->VisibleNodeMask != 1) return E_INVALIDARG;
     if ((heap->Flags != D3D12DDI_HEAP_FLAG_BUFFERS && heap->Flags != D3D12DDI_HEAP_FLAG_NON_RT_DS_TEXTURES &&
              heap->Flags != D3D12DDI_HEAP_FLAG_RT_DS_TEXTURES) ||
@@ -113,29 +149,39 @@ HRESULT native_heap_desc(const D3D12DDIARG_CREATEHEAP_0001 *heap,
     if (heap->Flags == D3D12DDI_HEAP_FLAG_NON_RT_DS_TEXTURES || heap->Flags == D3D12DDI_HEAP_FLAG_RT_DS_TEXTURES) {
         const bool rt = heap->Flags == D3D12DDI_HEAP_FLAG_RT_DS_TEXTURES;
         if (!resource || heap->CPUPageProperty != D3D12DDI_CPU_PAGE_PROPERTY_NOT_AVAILABLE) return DXGI_ERROR_UNSUPPORTED;
+        const bool depth = rt && resource->Flags == D3D12DDI_RESOURCE_FLAG_0003_DEPTH_STENCIL;
+        const UINT resource_flags = static_cast<UINT>(resource->Flags);
+        const UINT color_flags = resource_flags & ~static_cast<UINT>(D3D12DDI_RESOURCE_FLAG_0003_SHADER_RESOURCE);
         D3D12DDIARG_BUFFER_PLACEMENT no_reuse{};
-        if (resource->ResourceType != D3D12DDI_RT_TEXTURE2D || !resource->Width || resource->Width > 16384 ||
-                !resource->Height || resource->Height > 16384 || resource->DepthOrArraySize != 1 || resource->MipLevels != 1 ||
-                (resource->Format != DXGI_FORMAT_R32_FLOAT && resource->Format != DXGI_FORMAT_R8G8B8A8_UNORM) ||
-                resource->SampleDesc.Count != 1 || resource->SampleDesc.Quality ||
-                static_cast<UINT>(resource->Flags) != (rt ? 1u : 0u) ||
-                (rt && resource->Format != DXGI_FORMAT_R8G8B8A8_UNORM) || resource->pRowMajorLayout ||
+        const auto shape = native_texture_shape(*resource);
+        if (resource->ResourceType != D3D12DDI_RT_TEXTURE2D || resource->Width > 16384 ||
+                !vkdu_texture2d_shape_valid(&shape) ||
+                (depth ? !vkdu_depth_format(resource->Format) :
+                 resource->Format != DXGI_FORMAT_R32_FLOAT && !vkdu_color_resource_format(resource->Format)) ||
+                (depth && resource->SampleDesc.Count != 1) ||
+                (depth ? resource_flags != 2u : color_flags != (rt ? 1u : 0u)) ||
+                (rt && !depth && !vkdu_color_resource_format(resource->Format)) || resource->pRowMajorLayout ||
                 (resource->Layout != D3D12DDI_TL_UNDEFINED && resource->Layout != D3D12DDI_TL_DEVICE_DEPENDENT_SWIZZLE_0) ||
                 std::memcmp(&resource->ReuseBufferGPUVA, &no_reuse, sizeof(no_reuse))) return DXGI_ERROR_UNSUPPORTED;
         const UINT state = resource->InitialResourceState;
-        return !state || (rt && state == 4) || state == 0x400 || state == 0x800 || state == 0x40 || state == 0x80 || state == 0xc0 ? S_OK : DXGI_ERROR_UNSUPPORTED;
+        if (depth) return !state || state == D3D12DDI_RESOURCE_STATE_DEPTH_WRITE ||
+            state == D3D12DDI_RESOURCE_STATE_DEPTH_READ || state == 0x400 || state == 0x800 ? S_OK : DXGI_ERROR_UNSUPPORTED;
+        return !state || (rt && state == 4) || state == 0x400 || state == 0x800 || state == 0x40 || state == 0x80 || state == 0xc0 || state == 0x1000 || state == 0x2000 ? S_OK : DXGI_ERROR_UNSUPPORTED;
     }
     if (resource) {
         D3D12DDIARG_BUFFER_PLACEMENT no_reuse{};
         if (resource->ResourceType != D3D12DDI_RT_BUFFER || !resource->Width || resource->Width > heap->ByteSize ||
                 resource->Height != 1 || resource->DepthOrArraySize != 1 || resource->MipLevels != 1 ||
                 resource->Format != DXGI_FORMAT_UNKNOWN || resource->SampleDesc.Count != 1 || resource->SampleDesc.Quality ||
-                resource->Layout != D3D12DDI_TL_ROW_MAJOR || resource->Flags || resource->pRowMajorLayout ||
+                resource->Layout != D3D12DDI_TL_ROW_MAJOR ||
+                (static_cast<UINT>(resource->Flags) & ~static_cast<UINT>(D3D12DDI_RESOURCE_FLAG_0003_SHADER_RESOURCE)) || resource->pRowMajorLayout ||
                 std::memcmp(&resource->ReuseBufferGPUVA, &no_reuse, sizeof(no_reuse))) return DXGI_ERROR_UNSUPPORTED;
         const uint32_t state = static_cast<uint32_t>(resource->InitialResourceState);
-        if (state != 0 && state != 0x400 && state != 0x800 && state != D3D12DDI_RESOURCE_STATE_UNORDERED_ACCESS)
+        if (!vkdu_buffer_read_state(state) && state != 0x400 && state != D3D12DDI_RESOURCE_STATE_UNORDERED_ACCESS &&
+                state != D3D12DDI_RESOURCE_STATE_STREAM_OUT)
             return DXGI_ERROR_UNSUPPORTED;
-        if (heap->CPUPageProperty == D3D12DDI_CPU_PAGE_PROPERTY_WRITE_BACK && state != 0x400)
+        if (heap->CPUPageProperty == D3D12DDI_CPU_PAGE_PROPERTY_WRITE_BACK &&
+                !vkdu_buffer_read_state(state) && state != 0x400 && state != D3D12DDI_RESOURCE_STATE_STREAM_OUT)
             return DXGI_ERROR_UNSUPPORTED;
     }
     return S_OK;
@@ -164,18 +210,34 @@ HRESULT native_heap_unlock(Context *ctx, NativeHeap *heap) {
     return hr;
 }
 
+HRESULT native_heap_deallocate(Context *ctx, NativeHeap *heap) {
+    if (heap->pageable) {
+        if (!ctx->kernel_callbacks.pfnDeallocate2Cb) return DXGI_ERROR_UNSUPPORTED;
+        D3DDDICB_DEALLOCATE2 args{};
+        if (heap->resource_created) args.hResource = heap->runtime_resource;
+        else { args.NumAllocations = 1; args.HandleList = &heap->allocation; }
+        args.Flags.AssumeNotInUse = 1;
+        args.Flags.SynchronousDestroy = 1;
+        const HRESULT hr = ctx->kernel_callbacks.pfnDeallocate2Cb(ctx->runtime_device.handle, &args);
+        return hr == S_OK ? S_OK : FAILED(hr) ? hr : E_FAIL;
+    }
+    D3DDDICB_DEALLOCATE args{};
+    if (heap->resource_created) args.hResource = heap->runtime_resource;
+    else { args.NumAllocations = 1; args.HandleList = &heap->allocation; }
+    return ctx->kernel_callbacks.pfnDeallocateCb(ctx->runtime_device.handle, &args);
+}
+
 HRESULT native_heap_cleanup(Context *ctx, NativeHeap *heap, bool retirement = false) {
-    if (heap->pending || heap->residency_operations) return DXGI_ERROR_WAS_STILL_DRAWING;
+    if (heap->flags & MWD_ALLOCATION_NATIVE_SURFACE)
+        return native_surface_cleanup(ctx, heap, retirement);
+    if (heap->pending || native_heap_residency_busy(heap)) return DXGI_ERROR_WAS_STILL_DRAWING;
     heap->pending = true;
     HRESULT hr = native_heap_unlock(ctx, heap);
     // During normal operation DestroyDevice may have run inside UnlockCb.
     if (SUCCEEDED(hr) && (retirement || !ctx->native_retiring) && (heap->allocation || heap->resource_created)) {
-        D3DDDICB_DEALLOCATE args{};
         // This slice owns exactly one heap per runtime resource. Releasing only
         // its allocation leaks the kernel resource (see DeallocateCb contract).
-        if (heap->resource_created) args.hResource = heap->runtime_resource;
-        else { args.NumAllocations = 1; args.HandleList = &heap->allocation; }
-        hr = ctx->kernel_callbacks.pfnDeallocateCb(ctx->runtime_device.handle, &args);
+        hr = native_heap_deallocate(ctx, heap);
         if (SUCCEEDED(hr)) { heap->allocation = 0; heap->resource_created = false; }
     }
     heap->pending = false;
@@ -272,7 +334,9 @@ void APIENTRY native_allocation_info(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREAT
         D3D12DDI_RESOURCE_ALLOCATION_INFO *out) {
     NativeHeapOperation op(context(h));
     if (!op.live()) { error(op.ctx, DXGI_ERROR_DEVICE_REMOVED); return; }
-    if (!resource || !out || visible != 1 || (restriction && restriction != native_heap_alignment)) {
+    const uint64_t required_alignment = resource && resource->ResourceType == D3D12DDI_RT_TEXTURE2D &&
+        resource->SampleDesc.Count > 1 ? 4194304 : native_heap_alignment;
+    if (!resource || !out || visible != 1 || (restriction && restriction != required_alignment)) {
         error(op.ctx, E_INVALIDARG); return;
     }
     auto request = *resource;
@@ -284,27 +348,34 @@ void APIENTRY native_allocation_info(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREAT
     // Validate the same resource subset as creation, independently of its
     // initial state. This description is only a validation bound, not a heap.
     D3D12DDIARG_CREATEHEAP_0001 bound{};
-    bound.ByteSize = UINT32_MAX & ~(native_heap_alignment - 1); bound.Alignment = native_heap_alignment;
+    bound.ByteSize = UINT32_MAX & ~(required_alignment - 1); bound.Alignment = required_alignment;
     bound.MemoryPool = D3D12DDI_MEMORY_POOL_L0; bound.CPUPageProperty = D3D12DDI_CPU_PAGE_PROPERTY_NOT_AVAILABLE;
     const bool render_target = texture && (request.Flags & D3D12DDI_RESOURCE_FLAG_0003_RENDER_TARGET);
-    bound.Flags = render_target ? D3D12DDI_HEAP_FLAG_RT_DS_TEXTURES :
+    const bool depth = texture && (request.Flags & D3D12DDI_RESOURCE_FLAG_0003_DEPTH_STENCIL);
+    bound.Flags = render_target || depth ? D3D12DDI_HEAP_FLAG_RT_DS_TEXTURES :
         texture ? D3D12DDI_HEAP_FLAG_NON_RT_DS_TEXTURES : D3D12DDI_HEAP_FLAG_BUFFERS;
     bound.CreationNodeMask = bound.VisibleNodeMask = 1;
     request.InitialResourceState = D3D12DDI_RESOURCE_STATE_COMMON;
     HRESULT hr = native_heap_desc(&bound, &request);
     if (FAILED(hr)) { error(op.ctx, hr); return; }
     D3D12DDI_RESOURCE_ALLOCATION_INFO result{};
+    const auto shape = native_texture_shape(request);
     {
         NativeBackendCall call(op.ctx);
-        hr = render_target ? vkdu_render_target_allocation(op.ctx->backend, static_cast<UINT>(request.Width), request.Height,
+        hr = native_texture_subresources(request) ? vkdu_texture2d_shape_allocation(op.ctx->backend, &shape,
+                &result.ResourceDataSize, &result.ResourceDataAlignment) :
+            depth ? vkdu_depth_allocation(op.ctx->backend, static_cast<UINT>(request.Width), request.Height, request.Format,
+                &result.ResourceDataSize, &result.ResourceDataAlignment) :
+            render_target ? vkdu_render_target_allocation_format(op.ctx->backend, static_cast<UINT>(request.Width), request.Height, request.Format,
                 &result.ResourceDataSize, &result.ResourceDataAlignment) :
             texture ? vkdu_texture2d_allocation(op.ctx->backend, static_cast<UINT>(request.Width), request.Height,
                 request.Format, &result.ResourceDataSize, &result.ResourceDataAlignment) :
             vkdu_buffer_allocation(op.ctx->backend, request.Width, &result.ResourceDataSize, &result.ResourceDataAlignment);
     }
+    if (SUCCEEDED(hr) && op.ctx->native_adapter) hr = native_heap_generation(op.ctx);
     if (!op.live()) hr = DXGI_ERROR_DEVICE_REMOVED;
     if (SUCCEEDED(hr) && (!result.ResourceDataSize || result.ResourceDataSize > bound.ByteSize ||
-            result.ResourceDataAlignment != native_heap_alignment || result.ResourceDataSize % native_heap_alignment)) hr = E_INVALIDARG;
+            result.ResourceDataAlignment != required_alignment || result.ResourceDataSize % required_alignment)) hr = E_INVALIDARG;
     if (FAILED(hr)) { error(op.ctx, hr); return; }
     result.Layout = texture ? D3D12DDI_TL_DEVICE_DEPENDENT_SWIZZLE_0 : D3D12DDI_TL_ROW_MAJOR;
     // Publish once, after any backend callback, without touching retired caller
@@ -312,11 +383,27 @@ void APIENTRY native_allocation_info(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREAT
     *out = result;
 }
 
+HRESULT native_heap_optimized_clear(const D3D12DDIARG_CREATERESOURCE_0003 *resource,
+        const D3D12DDI_CLEAR_VALUES *clear) {
+    if (!clear) return S_OK;
+    if (!resource || resource->ResourceType != D3D12DDI_RT_TEXTURE2D)
+        return E_INVALIDARG;
+    if (resource->Flags & D3D12DDI_RESOURCE_FLAG_0003_RENDER_TARGET)
+        return vkdu_color_target_format(clear->Format) && vkdu_texture_view_compatible(resource->Format, clear->Format)
+            ? S_OK : E_INVALIDARG;
+    if (resource->Flags & D3D12DDI_RESOURCE_FLAG_0003_DEPTH_STENCIL)
+        return clear->Format == resource->Format &&
+            vkdu_depth_format(resource->Format) &&
+            clear->DepthStencil.Depth >= 0 && clear->DepthStencil.Depth <= 1 ? S_OK : E_INVALIDARG;
+    return E_INVALIDARG;
+}
+
 D3D12DDI_HEAP_AND_RESOURCE_SIZES APIENTRY native_heap_sizes(D3D12DDI_HDEVICE h,
         const D3D12DDIARG_CREATEHEAP_0001 *heap, const D3D12DDIARG_CREATERESOURCE_0003 *resource) {
     NativeHeapOperation op(context(h));
     D3D12DDI_HEAP_AND_RESOURCE_SIZES sizes{};
-    if (op.live() && SUCCEEDED(native_heap_desc(heap, resource))) {
+    if (op.live() && !heap) return native_child_sizes(op.ctx, resource);
+    if (op.live() && op.ctx->kernel_callbacks.pfnDeallocate2Cb && SUCCEEDED(native_heap_desc(heap, resource))) {
         sizes.Heap = sizeof(NativeHeapSlot);
         if (resource) sizes.Resource = sizeof(Object);
     }
@@ -327,30 +414,51 @@ HRESULT APIENTRY native_heap_create(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATE
         D3D12DDI_HHEAP slot, D3D12DDI_HRTRESOURCE runtime_resource,
         const D3D12DDIARG_CREATERESOURCE_0003 *resource, const D3D12DDI_CLEAR_VALUES *clear,
         D3D12DDI_HRESOURCE resource_slot) {
+    // Capture Resource GPU VA creates only a logical resource. It does not
+    // create an allocation or acquire another runtime hResource association.
+    if (!args) return native_child_create(h, slot, resource, clear, resource_slot);
     NativeHeapOperation op(context(h));
     if (!op.live()) return DXGI_ERROR_DEVICE_REMOVED;
     HRESULT hr = native_heap_desc(args, resource);
     if (FAILED(hr)) return hr;
+    if (!op.ctx->kernel_callbacks.pfnDeallocate2Cb) return DXGI_ERROR_UNSUPPORTED;
+    // This is an optional performance hint, never an initial clear. Validate
+    // all used fields before any callback can expire the caller's storage.
+    // Vulkan has no matching creation hint and the embedded VKD3D engine also
+    // ignores optimized_clear_value (resource.c). Do not invent GPU work or
+    // a dependency on a clear value after creation.
+    if (FAILED(hr = native_heap_optimized_clear(resource, clear))) return hr;
     auto *ctx = op.ctx;
     const auto heap_request = *args;
     const auto resource_request = resource ? *resource : D3D12DDIARG_CREATERESOURCE_0003{};
     args = &heap_request;
     if (resource) resource = &resource_request;
-    if (!slot.pDrvPrivate || clear || (resource != nullptr) != (resource_slot.pDrvPrivate != nullptr) ||
-            native_heap_find(ctx, slot.pDrvPrivate)) return E_INVALIDARG;
+    if (!slot.pDrvPrivate || (resource != nullptr) != (resource_slot.pDrvPrivate != nullptr) ||
+            native_heap_find(ctx, slot.pDrvPrivate) || native_open_slot_pending(ctx, slot.pDrvPrivate) ||
+            native_open_slot_pending(ctx, resource_slot.pDrvPrivate)) return E_INVALIDARG;
     const bool texture = resource && resource->ResourceType == D3D12DDI_RT_TEXTURE2D;
     const bool render_target = texture && (resource->Flags & D3D12DDI_RESOURCE_FLAG_0003_RENDER_TARGET);
-    if (texture) {
+    const bool depth = texture && (resource->Flags & D3D12DDI_RESOURCE_FLAG_0003_DEPTH_STENCIL);
+    const bool subresources = resource && native_texture_subresources(*resource);
+    const auto shape = resource ? native_texture_shape(*resource) : vkdu_texture2d_shape{};
+    D3D12DDI_RESOURCE_ALLOCATION_INFO resource_info{};
+    if (resource) {
         uint64_t bytes = 0, alignment = 0;
         {
             NativeBackendCall call(ctx);
-            hr = render_target ? vkdu_render_target_allocation(ctx->backend, static_cast<UINT>(resource->Width), resource->Height,
-                    &bytes, &alignment) : vkdu_texture2d_allocation(ctx->backend, static_cast<UINT>(resource->Width), resource->Height,
-                    resource->Format, &bytes, &alignment);
+            hr = subresources ? vkdu_texture2d_shape_allocation(ctx->backend, &shape, &bytes, &alignment) :
+                depth ? vkdu_depth_allocation(ctx->backend, static_cast<UINT>(resource->Width), resource->Height, resource->Format,
+                    &bytes, &alignment) : render_target ? vkdu_render_target_allocation_format(ctx->backend, static_cast<UINT>(resource->Width), resource->Height, resource->Format,
+                    &bytes, &alignment) : texture ? vkdu_texture2d_allocation(ctx->backend, static_cast<UINT>(resource->Width), resource->Height,
+                    resource->Format, &bytes, &alignment) : vkdu_buffer_allocation(ctx->backend, resource->Width, &bytes, &alignment);
         }
         if (!op.live()) return DXGI_ERROR_DEVICE_REMOVED;
         if (FAILED(hr)) return hr;
-        if (alignment != native_heap_alignment || bytes > args->ByteSize) return E_INVALIDARG;
+        if (!bytes || bytes % alignment || alignment != (args->Alignment ? args->Alignment : native_heap_alignment) || bytes > args->ByteSize)
+            return E_INVALIDARG;
+        resource_info.ResourceDataSize = bytes;
+        resource_info.ResourceDataAlignment = alignment;
+        resource_info.Layout = texture ? D3D12DDI_TL_DEVICE_DEPENDENT_SWIZZLE_0 : D3D12DDI_TL_ROW_MAJOR;
     }
     if (runtime_resource.handle)
         for (auto *existing = ctx->native_heaps; existing; existing = existing->next)
@@ -358,7 +466,8 @@ HRESULT APIENTRY native_heap_create(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATE
     if (FAILED(hr = native_heap_generation(ctx)) || FAILED(hr = native_heap_open_context(ctx))) return hr;
     auto *heap = new (std::nothrow) NativeHeap;
     if (!heap) return E_OUTOFMEMORY;
-    heap->bytes = args->ByteSize;
+    heap->bytes = args->ByteSize; heap->alignment = args->Alignment ? args->Alignment : native_heap_alignment;
+    heap->pageable = true;
     heap->slot = slot.pDrvPrivate; heap->runtime_resource = runtime_resource.handle;
     heap->cpu_visible = args->CPUPageProperty == D3D12DDI_CPU_PAGE_PROPERTY_WRITE_BACK;
     // Turnip's coherent Vulkan memory types are CPU visible even when the
@@ -385,7 +494,9 @@ HRESULT APIENTRY native_heap_create(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATE
         heap->slot = nullptr; // No native slot is published while Vulkan imports.
         {
             NativeBackendCall backend_call(ctx);
-            hr = render_target ? vkdu_render_target_heap_import(ctx->backend, ctx, heap, heap->bytes, &memory) :
+            hr = render_target || depth ? (heap->alignment == 4194304 ?
+                vkdu_render_target_heap_import_aligned(ctx->backend, ctx, heap, heap->bytes, heap->alignment, &memory) :
+                vkdu_render_target_heap_import(ctx->backend, ctx, heap, heap->bytes, &memory)) :
                 texture ? vkdu_texture_heap_import(ctx->backend, ctx, heap, heap->bytes, &memory) :
                 vkdu_memory_heap_import(ctx->backend, ctx, heap, heap->bytes, heap->cpu_visible, &memory);
         }
@@ -394,8 +505,12 @@ HRESULT APIENTRY native_heap_create(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATE
         if (SUCCEEDED(hr)) hr = native_heap_generation(ctx);
         {
             NativeBackendCall backend_call(ctx);
-            if (SUCCEEDED(hr)) hr = render_target ? vkdu_render_target_place(ctx->backend, memory,
-                    static_cast<UINT>(resource->Width), resource->Height, static_cast<UINT>(resource->InitialResourceState), &buffer) :
+            if (SUCCEEDED(hr)) hr = subresources ? vkdu_texture2d_shape_place(ctx->backend, memory, 0, &shape,
+                    static_cast<UINT>(resource->InitialResourceState), &buffer) :
+                depth ? vkdu_depth_place(ctx->backend, memory,
+                    static_cast<UINT>(resource->Width), resource->Height, resource->Format, static_cast<UINT>(resource->InitialResourceState), &buffer) :
+                render_target ? vkdu_render_target_place_format(ctx->backend, memory,
+                    static_cast<UINT>(resource->Width), resource->Height, resource->Format, static_cast<UINT>(resource->InitialResourceState), &buffer) :
                 texture ? vkdu_texture2d_place(ctx->backend, memory, 0,
                     static_cast<UINT>(resource->Width), resource->Height, resource->Format,
                     static_cast<UINT>(resource->InitialResourceState), &buffer) :
@@ -407,8 +522,12 @@ HRESULT APIENTRY native_heap_create(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATE
         if (SUCCEEDED(hr) && (!op.live() || (!texture && vkdu_buffer_address(buffer) != heap->address)))
             hr = DXGI_ERROR_DEVICE_REMOVED;
         if (SUCCEEDED(hr)) {
-            hr = bind(ctx, resource_slot.pDrvPrivate, buffer, texture ? VKDU_TEXTURE2D : VKDU_BUFFER);
-            if (SUCCEEDED(hr)) object(resource_slot.pDrvPrivate)->native_heap = heap;
+            hr = bind(ctx, resource_slot.pDrvPrivate, buffer, texture ? VKDU_TEXTURE2D : VKDU_BUFFER, heap);
+            if (SUCCEEDED(hr)) {
+                auto *entry = object(resource_slot.pDrvPrivate);
+                entry->native_heap = heap;
+                entry->native_resource_info = resource_info;
+            }
         }
         if (FAILED(hr)) {
             NativeBackendCall backend_call(ctx);
@@ -435,7 +554,7 @@ HRESULT native_heap_map_record(Context *value, NativeHeap *heap, void **out) {
     if (!op.live()) return DXGI_ERROR_DEVICE_REMOVED;
     auto *ctx = op.ctx;
     if (!heap || !(heap->flags & 2) || heap->pending || !heap->allocation) return E_INVALIDARG;
-    if (heap->residency_operations) return DXGI_ERROR_WAS_STILL_DRAWING;
+    if (native_heap_residency_busy(heap)) return DXGI_ERROR_WAS_STILL_DRAWING;
     // A new LockCb can rename its allocation handle. Preserve the handle used
     // by every outstanding DMA packet until its OS completion event retires.
     if (heap->submitted && !heap->locked) return DXGI_ERROR_WAS_STILL_DRAWING;
@@ -476,7 +595,7 @@ void APIENTRY native_heap_unmap(D3D12DDI_HDEVICE h, D3D12DDI_HHEAP slot) {
     if (!op.live()) return;
     auto *heap = native_heap_find(op.ctx, slot.pDrvPrivate);
     if (!heap || heap->pending || !heap->map_count) { error(op.ctx, E_INVALIDARG); return; }
-    if (heap->residency_operations) { error(op.ctx, DXGI_ERROR_WAS_STILL_DRAWING); return; }
+    if (native_heap_residency_busy(heap)) { error(op.ctx, DXGI_ERROR_WAS_STILL_DRAWING); return; }
     if (heap->map_count > 1) { --heap->map_count; return; }
     heap->pending = true;
     HRESULT hr = native_heap_unlock(op.ctx, heap);
@@ -509,7 +628,7 @@ void APIENTRY native_heap_destroy(D3D12DDI_HDEVICE h, D3D12DDI_HHEAP slot, D3D12
     std::memset(slot.pDrvPrivate, 0, sizeof(NativeHeapSlot));
     if (heap->users > 1) { --heap->users; return; }
     HRESULT hr = op.live() ? native_heap_cleanup(op.ctx, heap) : DXGI_ERROR_DEVICE_REMOVED;
-    if (!heap->allocation && !heap->resource_created) native_heap_erase(op.ctx, heap);
+    if (!heap->allocation && !heap->resource_created && !heap->native_key) native_heap_erase(op.ctx, heap);
     error(op.ctx, hr);
 }
 
@@ -523,10 +642,10 @@ void native_heap_retire(Context *ctx) {
     if (ctx->native_backend_calls || ctx->native_submissions) return;
     bool pending = ctx->native_context_pending || ctx->native_submitting;
     for (auto *heap = ctx->native_heaps; heap; heap = heap->next) {
-        if (heap->pending || heap->residency_operations || ctx->native_submitting) { pending = true; continue; }
+        if (heap->pending || native_heap_residency_busy(heap) || ctx->native_submitting) { pending = true; continue; }
         HRESULT hr = native_heap_cleanup(ctx, heap, true);
         if (FAILED(hr)) ctx->last_error = hr;
-        pending |= heap->allocation != 0 || heap->resource_created;
+        pending |= heap->allocation != 0 || heap->resource_created || heap->native_key != 0;
     }
     if (!pending && ctx->native_heap_context) {
         HRESULT hr = native_heap_close_context(ctx);
@@ -545,8 +664,15 @@ void native_heap_forget(Context *ctx) {
     }
 }
 
+#include "native_resource_queries.inc"
+
 void native_heap_tables(D3D12DDI_DEVICE_FUNCS_CORE_0003 *table) {
+    native_open_tables(table);
     table->pfnCheckResourceAllocationInfo = native_allocation_info;
+    table->pfnCheckExistingResourceAllocationInfo = native_existing_allocation_info;
+    table->pfnCheckResourceAllocationHandle = native_resource_allocation_handle;
+    table->pfnCheckResourceVirtualAddress = native_resource_address;
+    table->pfnCheckSubresourceInfo = native_subresource_info;
     table->pfnCalcPrivateHeapAndResourceSizes = native_heap_sizes;
     table->pfnCreateHeapAndResource = native_heap_create;
     table->pfnDestroyHeapAndResource = native_heap_destroy;

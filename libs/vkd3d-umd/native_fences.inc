@@ -106,7 +106,7 @@ void APIENTRY native_queue_fence(D3D12DDI_HCOMMANDQUEUE handle,
     }
     // A callback must not recursively publish an external packet while this
     // device is still inside RenderCb, before software enqueue is established.
-    if (ctx->native_submitting) { error(ctx, DXGI_ERROR_WAS_STILL_DRAWING); return; }
+    if (ctx->native_submitting || route->preparing_present) { error(ctx, DXGI_ERROR_WAS_STILL_DRAWING); return; }
     const bool owned = native_fence_find(ctx, args->Fence.pDrvPrivate) != nullptr;
 #ifdef VKDU_TEST_NATIVE_FENCE_CONTROLS
     const bool accepted = owned || native_fence_ignore_owner;

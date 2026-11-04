@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include <initializer_list>
 struct Peer {
     vkdu_kind kind;
     vkdu_device *owner;
@@ -13,6 +14,8 @@ struct Peer {
     bool visible;
     uint64_t cpu, gpu;
     unsigned references = 1;
+    uint64_t bytes = 4096;
+    uint32_t mips = 1, layers = 1;
 };
 static Peer *peer(vkdu_object *p) { return reinterpret_cast<Peer *>(p); }
 static uint64_t next_base = 0x10000;
@@ -39,9 +42,10 @@ static vkdu_object *make_peer(vkdu_device *owner, vkdu_kind kind, uint32_t type 
 static int test_is(vkdu_object *p, vkdu_kind kind) { return p && peer(p)->kind == kind; }
 static int test_belongs(vkdu_device *d, vkdu_object *p) { return p && peer(p)->owner == d; }
 static void test_destroy(vkdu_object *p) { if (p && !--peer(p)->references) { ++destroys; delete peer(p); } }
-static int test_retain(vkdu_object *p) { if (!p) return 0; ++peer(p)->references; return 1; }
+static vkdu_object *reject_retain_peer;
+static int test_retain(vkdu_object *p) { if (!p || p == reject_retain_peer) return 0; ++peer(p)->references; return 1; }
 static uint64_t test_address(vkdu_object *p) { return peer(p)->cpu; }
-static uint64_t test_size(vkdu_object *) { return 4096; }
+static uint64_t test_size(vkdu_object *p) { return peer(p)->bytes; }
 static int32_t test_heap_create(vkdu_device *d, uint32_t type, uint32_t count, int visible, vkdu_object **out) {
     ++calls; passed_visibility = visible; *out = nullptr;
     if (FAILED(next_result)) return next_result;
@@ -124,17 +128,27 @@ static int32_t test_static_root(vkdu_device *d, const vkdu_root_parameter *, uin
 static unsigned texture_srv_calls, texture_copy_calls;
 static vkdu_texture_copy_location seen_texture_src, seen_texture_dst;
 static vkdu_box seen_texture_box;
-static uint32_t texture_x, texture_y, texture_z;
+static uint32_t texture_x, texture_y, texture_z, texture_srv_format;
 static void (*texture_hook)();
 static uint32_t test_texture_format(vkdu_object *p) { return peer(p)->type; }
-static int32_t test_texture_srv(vkdu_object *heap, uint32_t index, vkdu_object *texture) {
-    ++texture_srv_calls; srv_index = index; srv_buffer = texture;
+static int32_t test_texture_srv(vkdu_object *heap, uint32_t index, vkdu_object *texture, uint32_t format) {
+    ++texture_srv_calls; srv_index = index; srv_buffer = texture; texture_srv_format = format;
     if (peer(heap)->references < 2 || peer(texture)->references < 2) std::abort();
     if (texture_hook) texture_hook();
     return next_result;
 }
+static uint32_t seen_texture_range[4];
+static int32_t test_texture_srv_range(vkdu_object *heap, uint32_t index, vkdu_object *texture, uint32_t format,
+        uint32_t mip, uint32_t mips, uint32_t layer, uint32_t layers) {
+    seen_texture_range[0] = mip; seen_texture_range[1] = mips; seen_texture_range[2] = layer; seen_texture_range[3] = layers;
+    if (mip >= peer(texture)->mips || !mips || mips > peer(texture)->mips - mip ||
+            layer >= peer(texture)->layers || !layers || layers > peer(texture)->layers - layer) return E_INVALIDARG;
+    return test_texture_srv(heap, index, texture, format);
+}
 static int32_t test_texture_copy(vkdu_object *command, const vkdu_texture_copy_location *dst,
         uint32_t x, uint32_t y, uint32_t z, const vkdu_texture_copy_location *src, const vkdu_box *box) {
+    for (auto *location : {dst, src}) if (!location->footprint &&
+            location->offset >= uint64_t(peer(location->resource)->mips) * peer(location->resource)->layers) return E_INVALIDARG;
     ++texture_copy_calls;
     if (peer(command)->references < 2 || peer(src->resource)->references < 2 || peer(dst->resource)->references < 2) std::abort();
     if (texture_hook) texture_hook();
@@ -142,7 +156,15 @@ static int32_t test_texture_copy(vkdu_object *command, const vkdu_texture_copy_l
     seen_texture_box = box ? *box : vkdu_box{}; texture_x = x; texture_y = y; texture_z = z;
     return next_result;
 }
+static vkdu_resource_barrier seen_subresource_barrier;
+static int32_t test_subresource_barriers(vkdu_object *command, uint32_t count, const vkdu_resource_barrier *args) {
+    if (count != 1 || peer(command)->references < 2 || peer(args->resource)->references < 2) std::abort();
+    seen_subresource_barrier = *args;
+    if (texture_hook) texture_hook();
+    return next_result;
+}
 #include "ddi_graphics_mocks.inc"
+#include "ddi_stencil_mocks.inc"
 #define vkdu_object_is test_is
 #define vkdu_object_belongs test_belongs
 #define vkdu_object_destroy test_destroy
@@ -167,22 +189,79 @@ static int32_t test_texture_copy(vkdu_object *command, const vkdu_texture_copy_l
 #define vkdu_root_create_samplers test_static_root
 #define vkdu_sampler_create test_sampler
 #define vkdu_texture2d_format test_texture_format
-#define vkdu_texture2d_srv test_texture_srv
+#define vkdu_texture2d_srv_format test_texture_srv
+#define vkdu_texture2d_srv_range test_texture_srv_range
 #define vkdu_command_texture_copy test_texture_copy
+#define vkdu_command_barriers test_subresource_barriers
 #include "ddi.cpp"
 
 #define REQUIRE(x) do { if (!(x)) { std::fprintf(stderr, "FAIL native descriptor line %d: %s\n", __LINE__, #x); return 1; } } while (0)
 static void APIENTRY capture(void *, HRESULT hr) { reported = hr; }
 #include "ddi_samplers_test.inc"
 #include "ddi_textures_test.inc"
+#include "ddi_subresources_test.inc"
+#include "ddi_typeless_test.inc"
 #include "ddi_graphics_test.inc"
+#include "ddi_sm51_test.inc"
+#include "ddi_uav_clear_test.inc"
+#include "ddi_attachment_clear_test.inc"
+#include "ddi_predication_test.inc"
+#include "ddi_graphics_roots_test.inc"
+#include "ddi_root_unbind_test.inc"
+#include "ddi_topology_clear_test.inc"
+#include "ddi_format_test.inc"
+#include "ddi_depth_test.inc"
+#include "ddi_stencil_test.inc"
+#include "ddi_stencil_contract_test.inc"
+#include "ddi_msaa_test.inc"
+#include "ddi_resource_copy_test.inc"
 #include "ddi_vertex_test.inc"
+#include "ddi_shader_stages_test.inc"
+#include "ddi_tessellation_test.inc"
 int main(int argc, char **argv) {
+    if (argc == 2 && !std::strcmp(argv[1], "--sm51-only")) {
+        for (uint32_t i=0;i<6;++i) if (check_native_sm51(i)) return 1;
+        return 0;
+    }
+    if (argc == 2 && !std::strcmp(argv[1], "--sm50-native-control")) return check_native_graphics();
+    if (argc == 3 && !std::strcmp(argv[1], "--sm51-native")) {
+        char *end; unsigned long index = std::strtoul(argv[2], &end, 10);
+        if (!*argv[2] || *end || index >= 6) return 2;
+        return check_native_sm51(index);
+    }
+    if (argc == 2 && !std::strcmp(argv[1], "--msaa-only")) return check_native_msaa();
+    if (argc == 2 && !std::strcmp(argv[1], "--stencil-only")) return check_native_stencil_contract();
+    if (argc == 2 && !std::strcmp(argv[1], "--stencil-baseline-ref")) return check_native_stencil_baseline(0);
+    if (argc == 2 && !std::strcmp(argv[1], "--stencil-baseline-pso-d32")) return check_native_stencil_baseline(1);
+    if (argc == 2 && !std::strcmp(argv[1], "--stencil-baseline-pso-d24s8")) return check_native_stencil_baseline(2);
+    if (argc == 2 && !std::strcmp(argv[1], "--stencil-baseline-pso-d32s8")) return check_native_stencil_baseline(3);
+    if (argc == 2 && !std::strcmp(argv[1], "--root-unbind-only")) return check_native_root_unbind();
+#ifdef VKDU_TEST_TOPOLOGY_SOURCE_BODY
+    if (argc == 2 && !std::strcmp(argv[1], "--topology-clear-only")) return check_native_topology_clear();
+    if (check_native_topology_clear()) return 1;
+#endif
     if (argc == 2 && !std::strcmp(argv[1], "--negative-control-vertex-field-order")) vertex_swap_fields = true;
+    else if (argc == 2 && !std::strcmp(argv[1], "--negative-control-graphics-root-offset")) graphics_root_bad_offset = true;
     else if (argc != 1) return 2;
     if (check_native_samplers()) return 1;
     if (check_native_textures()) return 1;
+    if (check_native_subresources()) return 1;
+    if (check_native_typeless_views()) return 1;
     if (check_native_graphics()) return 1;
+    for (uint32_t i=0;i<6;++i) if (check_native_sm51(i)) return 1;
+    if (check_native_shader_stages()) return 1;
+    if (check_stream_output_early_error()) return 1;
+    if (check_native_tessellation()) return 1;
+    if (check_native_uav_clears()) return 1;
+    if (check_native_attachment_clears()) return 1;
+    if (check_native_predication()) return 1;
+    if (check_native_graphics_roots()) return 1;
+    if (check_native_root_unbind()) return 1;
+    if (check_native_buffer_alias_views()) return 1;
+    if (check_native_formats()) return 1;
+    if (check_native_depth()) return 1;
+    if (check_native_stencil_contract()) return 1;
+    if (check_native_resource_copy()) return 1;
     if (check_native_vertex_buffers()) return 1;
     calls = destroys = sampler_calls = 0; next_result = reported = S_OK;
     Context ctx;

@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "ddi.h"
+#include <array>
 #include <atomic>
 #include <cstring>
 #include <new>
@@ -12,10 +13,20 @@ namespace {
 constexpr uint32_t context_magic = 0x564b4455, object_magic = 0x564b4f42;
 constexpr uint32_t native_device_magic = 0x564b4e44;
 struct NativeAdapter;
+// Facts from the validated KMD wire reply, not a complete memory-architecture
+// capability. Unknown must remain distinct from an explicitly reported false.
+struct NativeBooleanFact { bool known = false, value = false; };
+struct NativeAdapterFacts {
+    std::array<uint8_t, 8> luid{};
+    uint64_t generation = 0;
+    NativeBooleanFact has_cached_coherent_memory;
+    NativeBooleanFact owned_allocations_only;
+};
 struct NativeHeap;
 struct NativeSubmission;
 struct NativeRuntimeQueue;
 struct NativeFence;
+struct NativeOpenReservation;
 struct Context;
 struct Object;
 void native_heap_forget(Context *);
@@ -24,9 +35,16 @@ void native_submission_forget(Context *);
 void native_runtime_queues_forget(Context *);
 HRESULT native_submission_reap(Context *);
 void native_heap_tables(D3D12DDI_DEVICE_FUNCS_CORE_0003 *);
+void native_open_tables(D3D12DDI_DEVICE_FUNCS_CORE_0003 *);
+bool native_open_slot_pending(Context *, void *);
+D3D12DDI_HEAP_AND_RESOURCE_SIZES native_child_sizes(Context *, const D3D12DDIARG_CREATERESOURCE_0003 *);
+HRESULT native_child_create(D3D12DDI_HDEVICE, D3D12DDI_HHEAP,
+        const D3D12DDIARG_CREATERESOURCE_0003 *, const D3D12DDI_CLEAR_VALUES *, D3D12DDI_HRESOURCE);
 void native_graphics_tables(D3D12DDI_DEVICE_FUNCS_CORE_0003 *, D3D12DDI_COMMAND_LIST_FUNCS_3D_0003 *);
 void native_fence_tables(D3D12DDI_DEVICE_FUNCS_CORE_0003 *, D3D12DDI_COMMAND_QUEUE_FUNCS_CORE_0001 *);
+void native_node_metadata_tables(D3D12DDI_DEVICE_FUNCS_CORE_0003 *);
 void native_residency_tables(D3D12DDI_DEVICE_FUNCS_CORE_0003 *);
+void native_present_tables(D3D12DDI_DEVICE_FUNCS_CORE_0003 *, D3D12DDI_COMMAND_LIST_FUNCS_3D_0003 *);
 void native_query_tables(D3D12DDI_COMMAND_LIST_FUNCS_3D_0003 *);
 HRESULT native_graphics_pipeline(Context *, const D3D12DDIARG_CREATE_PIPELINE_STATE_0001 *);
 HRESULT native_command_create(Context *, const D3D12DDIARG_CREATE_COMMAND_LIST_0001 *);
@@ -89,16 +107,20 @@ struct Context : NativeContextBuffers {
     Object *indirect_signatures = nullptr; // protected by error_mutex
     Object *graphics_objects = nullptr;
     std::shared_ptr<NativeAdapter> native_adapter;
+    NativeAdapterFacts native_facts;
+    vkdu_memory_facts native_memory_facts{};
     D3D12DDI_HRTDEVICE runtime_device{};
     D3DDDI_DEVICECALLBACKS kernel_callbacks{};
     D3D12DDI_CORELAYER_DEVICECALLBACKS_0003 runtime_callbacks{};
     HMODULE vulkan_module = nullptr;
     NativeCallbackMutex error_mutex;
     NativeHeap *native_heaps = nullptr;
+    NativeOpenReservation *native_open_reservations = nullptr;
     uint64_t native_va_start = 0, native_va_size = 0;
     uint32_t native_context_id = 0;
     uint32_t native_queue_id = 0;
     bool native_submitting = false;
+    bool native_surfaces = false;
     unsigned native_backend_calls = 0;
     bool native_destroying = false;
     bool native_retiring = false;
@@ -125,6 +147,8 @@ struct Object {
     D3D12DDI_HRTCOMMANDQUEUE runtime_queue{};
     NativeRuntimeQueue *runtime_route = nullptr;
     uint32_t native_graphics_tag = 0;
+    D3D12DDI_RESOURCE_ALLOCATION_INFO native_resource_info{};
+    uint64_t native_row_pitch = 0, native_depth_pitch = 0;
 };
 Context *context(D3D12DDI_HDEVICE handle) {
     if (handle.pDrvPrivate) {
@@ -203,9 +227,10 @@ void error(Object *value, HRESULT result) {
     }
     release(ctx);
 }
-HRESULT bind(Context *ctx, void *memory, vkdu_object *value, vkdu_kind kind) {
+HRESULT bind(Context *ctx, void *memory, vkdu_object *value, vkdu_kind kind, NativeHeap *allocation = nullptr) {
     if (!ctx || !memory || !vkdu_object_is(value, kind) || !vkdu_object_belongs(ctx->backend, value) || object(memory)) return E_INVALIDARG;
     auto *entry = new (memory) Object{object_magic, ctx, value, kind, nullptr, 0, nullptr, 0, 0};
+    entry->native_heap = allocation;
     if (kind == VKDU_BUFFER) {
         entry->address = vkdu_buffer_address(value); entry->bytes = vkdu_buffer_size(value);
         if (!entry->address || !entry->bytes || entry->bytes > UINT64_MAX - entry->address) {
@@ -213,7 +238,8 @@ HRESULT bind(Context *ctx, void *memory, vkdu_object *value, vkdu_kind kind) {
         }
         AcquireSRWLockExclusive(&ctx->resources_lock);
         for (auto *p = ctx->resources; p; p = p->next) {
-            if (entry->address < p->address + p->bytes && p->address < entry->address + entry->bytes) {
+            if (p->kind == VKDU_BUFFER && entry->address < p->address + p->bytes &&
+                    p->address < entry->address + entry->bytes && (!allocation || p->native_heap != allocation)) {
                 ReleaseSRWLockExclusive(&ctx->resources_lock); std::memset(entry, 0, sizeof(*entry)); return E_INVALIDARG;
             }
         }
@@ -243,6 +269,11 @@ uint32_t command_type(D3D12DDI_COMMAND_QUEUE_FLAGS flags) {
     if (flags == D3D12DDI_COMMAND_QUEUE_FLAG_3D) return 0;
     if (flags == D3D12DDI_COMMAND_QUEUE_FLAG_COMPUTE) return 2;
     if (flags == D3D12DDI_COMMAND_QUEUE_FLAG_COPY) return 3;
+    return UINT32_MAX;
+}
+uint32_t command_list_type(D3D12DDI_COMMAND_LIST_TYPE type, D3D12DDI_COMMAND_QUEUE_FLAGS flags) {
+    if (type == D3D12DDI_COMMAND_LIST_TYPE_DIRECT) return command_type(flags);
+    if (type == D3D12DDI_COMMAND_LIST_TYPE_BUNDLE && flags == D3D12DDI_COMMAND_QUEUE_FLAG_3D) return 1;
     return UINT32_MAX;
 }
 bool belongs(Context *ctx, void *memory) { auto *o = object(memory); return o && o->context == ctx; }
@@ -291,6 +322,19 @@ Object *find_buffer(Context *ctx, void *handle) {
     for (auto *p = ctx->resources; p; p = p->next)
         if (p == handle && p->kind == VKDU_BUFFER) return p;
     return nullptr;
+}
+// GPU addresses identify memory, not a particular alias. Select a live buffer
+// covering the complete view and the widest remaining range for root views.
+// A newly inserted short child must not mask an older, larger parent buffer.
+Object *find_buffer_address(Context *ctx, uint64_t address, uint64_t bytes = 1) {
+    Object *best = nullptr;
+    uint64_t remaining = 0;
+    for (auto *p = ctx->resources; p; p = p->next) {
+        if (p->kind != VKDU_BUFFER || address < p->address || address - p->address >= p->bytes) continue;
+        const auto available = p->bytes - (address - p->address);
+        if (available >= bytes && available > remaining) { best = p; remaining = available; }
+    }
+    return best;
 }
 Object *find_resource(Context *ctx, void *handle) {
     for (auto *p = ctx->resources; p; p = p->next)
@@ -342,12 +386,8 @@ void APIENTRY create_cbv(D3D12DDI_HDEVICE h, const D3D12DDI_CONSTANT_BUFFER_VIEW
     auto *heap = find_heap(ctx, destination.ptr, false, &index);
     if (heap) {
         if (!args->BufferLocation) hr = vkdu_buffer_cbv(heap->backend, index, nullptr, 0, args->SizeInBytes);
-        else for (auto *p = ctx->resources; p; p = p->next) {
-            if (args->BufferLocation >= p->address && args->BufferLocation - p->address < p->bytes) {
-                hr = vkdu_buffer_cbv(heap->backend, index, p->backend, args->BufferLocation - p->address, args->SizeInBytes);
-                break;
-            }
-        }
+        else if (auto *p = find_buffer_address(ctx, args->BufferLocation, args->SizeInBytes))
+            hr = vkdu_buffer_cbv(heap->backend, index, p->backend, args->BufferLocation - p->address, args->SizeInBytes);
     }
     ReleaseSRWLockShared(&ctx->resources_lock);
     error(ctx, hr);
@@ -436,8 +476,8 @@ void APIENTRY queue_destroy(D3D12DDI_HDEVICE h, D3D12DDI_HCOMMANDQUEUE q) {
 SIZE_T APIENTRY allocator_size(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATECOMMANDALLOCATOR *) { return sizeof(Object); }
 HRESULT APIENTRY allocator_create(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATECOMMANDALLOCATOR *args) {
     auto *ctx = context(h); vkdu_object *value = nullptr;
-    if (!ctx || !args || args->Type != D3D12DDI_COMMAND_LIST_TYPE_DIRECT) return E_INVALIDARG;
-    HRESULT hr = vkdu_allocator_create(ctx->backend, command_type(args->QueueFlags), &value);
+    if (!ctx || !args || command_list_type(args->Type, args->QueueFlags) == UINT32_MAX) return E_INVALIDARG;
+    HRESULT hr = vkdu_allocator_create(ctx->backend, command_list_type(args->Type, args->QueueFlags), &value);
     return finish(ctx, args->hDrvCommandAllocator.pDrvPrivate, value, VKDU_ALLOCATOR, hr);
 }
 void APIENTRY allocator_destroy(D3D12DDI_HDEVICE h, D3D12DDI_HCOMMANDALLOCATOR a) {
@@ -450,10 +490,10 @@ void APIENTRY allocator_reset(D3D12DDI_HCOMMANDALLOCATOR a) {
 SIZE_T APIENTRY command_size(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATE_COMMAND_LIST_0001 *) { return sizeof(Object); }
 HRESULT APIENTRY command_create(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATE_COMMAND_LIST_0001 *args) {
     auto *ctx = context(h); vkdu_object *value = nullptr;
-    if (!ctx || !args || args->Type != D3D12DDI_COMMAND_LIST_TYPE_DIRECT || args->NodeMask > 1 || args->CommandListFlags ||
+    if (!ctx || !args || command_list_type(args->Type, args->QueueFlags) == UINT32_MAX || args->NodeMask > 1 || args->CommandListFlags ||
         !belongs(ctx, args->hDrvCommandAllocator.pDrvPrivate)) return E_INVALIDARG;
     if (ctx->native_adapter) return native_command_create(ctx, args);
-    HRESULT hr = vkdu_command_create(ctx->backend, backend(args->hDrvCommandAllocator.pDrvPrivate, VKDU_ALLOCATOR), command_type(args->QueueFlags), &value);
+    HRESULT hr = vkdu_command_create(ctx->backend, backend(args->hDrvCommandAllocator.pDrvPrivate, VKDU_ALLOCATOR), command_list_type(args->Type, args->QueueFlags), &value);
     return finish(ctx, args->hDrvCommandList.pDrvPrivate, value, VKDU_COMMAND_LIST, hr);
 }
 void APIENTRY command_destroy(D3D12DDI_HDEVICE h, D3D12DDI_HCOMMANDLIST c) {
@@ -482,54 +522,12 @@ void APIENTRY copy(D3D12DDI_HCOMMANDLIST c, D3D12DDIARG_BUFFER_PLACEMENT dst, D3
             backend(dst.BaseAddress.UMD.hResource.pDrvPrivate, VKDU_BUFFER), dst.BaseAddress.UMD.Offset,
             backend(src.BaseAddress.UMD.hResource.pDrvPrivate, VKDU_BUFFER), src.BaseAddress.UMD.Offset, bytes));
 }
-void APIENTRY barriers(D3D12DDI_HCOMMANDLIST c, UINT count, const D3D12DDIARG_RESOURCE_BARRIER_0003 *args) {
-    auto *cmd = object(c.pDrvPrivate);
-    if (!cmd) return;
-    if (cmd->kind != VKDU_COMMAND_LIST || (count && !args) || count > 65536) { error(cmd, E_INVALIDARG); return; }
-    vkdu_resource_barrier stack[16]{};
-    std::unique_ptr<vkdu_resource_barrier[]> allocated;
-    auto *translated = stack;
-    if (count > 16) {
-        allocated.reset(new (std::nothrow) vkdu_resource_barrier[count]{});
-        if (!allocated) { error(cmd, E_OUTOFMEMORY); return; }
-        translated = allocated.get();
-    }
-    auto *ctx = cmd->context;
-    HRESULT hr = S_OK;
-    AcquireSRWLockShared(&ctx->resources_lock);
-    // Resolve opaque runtime resource handles in the owned live registry,
-    // never by dereferencing arbitrary memory. Keep the resources stable until
-    // the backend has consumed the complete translated batch synchronously.
-    for (UINT i = 0; i < count; ++i) {
-        if (args[i].Flags) { hr = E_NOTIMPL; break; }
-        void *handle;
-        if (args[i].Type == D3D12DDI_RESOURCE_BARRIER_TYPE_TRANSITION) {
-            if (args[i].Transition.Subresource != UINT_MAX) { hr = E_NOTIMPL; break; }
-            handle = args[i].Transition.hResource.pDrvPrivate;
-            if (!handle) { hr = E_INVALIDARG; break; }
-            translated[i].type = VKDU_BARRIER_TRANSITION;
-            translated[i].before = args[i].Transition.StateBefore;
-            translated[i].after = args[i].Transition.StateAfter;
-        } else if (args[i].Type == D3D12DDI_RESOURCE_BARRIER_TYPE_UAV) {
-            handle = args[i].UAV.hResource.pDrvPrivate;
-            translated[i].type = VKDU_BARRIER_UAV;
-        } else { hr = E_NOTIMPL; break; }
-        auto *resource = find_resource(ctx, handle);
-        if (handle && !resource) { hr = E_INVALIDARG; break; }
-        translated[i].resource = resource ? resource->backend : nullptr;
-    }
-    if (SUCCEEDED(hr)) hr = vkdu_command_barriers(cmd->backend, count, translated);
-    ReleaseSRWLockShared(&ctx->resources_lock);
-    // The runtime error callback may destroy this command/device and poison
-    // its private slot. No command or caller-array access follows reporting.
-    error(cmd, hr);
-}
+void APIENTRY barriers(D3D12DDI_HCOMMANDLIST, UINT, const D3D12DDIARG_RESOURCE_BARRIER_0003 *);
+
 void APIENTRY dispatch(D3D12DDI_HCOMMANDLIST c, UINT x, UINT y, UINT z) {
     error(object(c.pDrvPrivate), vkdu_command_dispatch(backend(c.pDrvPrivate, VKDU_COMMAND_LIST), x, y, z));
 }
-void APIENTRY root_set(D3D12DDI_HCOMMANDLIST c, D3D12DDI_HROOTSIGNATURE root) {
-    error(object(c.pDrvPrivate), vkdu_command_root(backend(c.pDrvPrivate, VKDU_COMMAND_LIST), backend(root.pDrvPrivate, VKDU_ROOT)));
-}
+void APIENTRY root_set(D3D12DDI_HCOMMANDLIST, D3D12DDI_HROOTSIGNATURE);
 void APIENTRY pipeline_set(D3D12DDI_HCOMMANDLIST c, D3D12DDI_HPIPELINESTATE pipeline) {
     error(object(c.pDrvPrivate), vkdu_command_pipeline(backend(c.pDrvPrivate, VKDU_COMMAND_LIST), backend(pipeline.pDrvPrivate, VKDU_PIPELINE)));
 }
@@ -538,11 +536,8 @@ void APIENTRY root_uav(D3D12DDI_HCOMMANDLIST c, UINT index, D3D12DDI_GPU_VIRTUAL
     if (!cmd) return;
     auto *ctx = cmd->context; HRESULT hr = E_INVALIDARG;
     AcquireSRWLockShared(&ctx->resources_lock);
-    for (auto *p = ctx->resources; p; p = p->next) {
-        if (address >= p->address && address - p->address < p->bytes) {
-            hr = vkdu_command_uav(cmd->backend, index, p->backend, address - p->address); break;
-        }
-    }
+    if (auto *p = find_buffer_address(ctx, address))
+        hr = vkdu_command_uav(cmd->backend, index, p->backend, address - p->address);
     ReleaseSRWLockShared(&ctx->resources_lock);
     error(cmd, hr);
 }
@@ -552,11 +547,8 @@ void APIENTRY root_cbv(D3D12DDI_HCOMMANDLIST c, UINT index, D3D12DDI_GPU_VIRTUAL
     if (!address) { error(cmd, E_INVALIDARG); return; }
     auto *ctx = cmd->context; HRESULT hr = E_INVALIDARG;
     AcquireSRWLockShared(&ctx->resources_lock);
-    for (auto *p = ctx->resources; p; p = p->next) {
-        if (address >= p->address && address - p->address < p->bytes) {
-            hr = vkdu_command_cbv(cmd->backend, index, p->backend, address - p->address); break;
-        }
-    }
+    if (auto *p = find_buffer_address(ctx, address))
+        hr = vkdu_command_cbv(cmd->backend, index, p->backend, address - p->address);
     ReleaseSRWLockShared(&ctx->resources_lock);
     error(cmd, hr);
 }
@@ -566,11 +558,8 @@ void APIENTRY root_srv(D3D12DDI_HCOMMANDLIST c, UINT index, D3D12DDI_GPU_VIRTUAL
     if (!address) { error(cmd, E_INVALIDARG); return; }
     auto *ctx = cmd->context; HRESULT hr = E_INVALIDARG;
     AcquireSRWLockShared(&ctx->resources_lock);
-    for (auto *p = ctx->resources; p; p = p->next) {
-        if (address >= p->address && address - p->address < p->bytes) {
-            hr = vkdu_command_srv(cmd->backend, index, p->backend, address - p->address); break;
-        }
-    }
+    if (auto *p = find_buffer_address(ctx, address))
+        hr = vkdu_command_srv(cmd->backend, index, p->backend, address - p->address);
     ReleaseSRWLockShared(&ctx->resources_lock);
     error(cmd, hr);
 }
@@ -763,7 +752,9 @@ extern "C" HRESULT APIENTRY VioGpuD3D12BridgeGetTables(D3D12DDI_DEVICE_FUNCS_COR
     queue->pfnExecuteCommandLists = execute;
     native_graphics_tables(device, commands);
     native_fence_tables(device, queue);
+    native_node_metadata_tables(device);
     native_residency_tables(device);
+    native_present_tables(device, commands);
     native_query_tables(commands);
     // Single-node fence metadata selects runtime external synchronization. It
     // neither imports monitored-fence GPUVA nor admits a complete D3D12 device.

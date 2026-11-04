@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "../../tests/shaders/descriptors/headers/sampler_rounding.h"
 
-static void check_samplers(vkdu_device *device, vkdu_device *other)
+static void check_samplers_format(vkdu_device *device, vkdu_device *other, uint32_t format)
 {
     vkdu_object *texture = NULL, *foreign = NULL, *staging = NULL, *init = NULL, *output = NULL, *readback = NULL;
     vkdu_object *cpu = NULL, *gpu = NULL, *srv = NULL, *root = NULL, *static_root = NULL, *pipeline = NULL;
@@ -27,11 +27,18 @@ static void check_samplers(vkdu_device *device, vkdu_device *other)
     };
     uint32_t *mapped, round, i;
     float *floats;
-    CHECK(vkdu_texture2d_create(device, 2, 1, DXGI_FORMAT_R32_FLOAT, &texture));
-    CHECK(vkdu_texture2d_create(other, 2, 1, DXGI_FORMAT_R32_FLOAT, &foreign));
+    const int srgb = format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+    const int bgra = format == DXGI_FORMAT_B8G8R8A8_UNORM || format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+    const float scale = format == DXGI_FORMAT_R32_FLOAT ? 1.0f : srgb ? powf((128.0f / 255 + 0.055f) / 1.055f, 2.4f) : 128.0f / 255;
+    CHECK(vkdu_texture2d_create(device, 2, 1, format, &texture));
+    CHECK(vkdu_texture2d_create(other, 2, 1, format, &foreign));
     CHECK(vkdu_buffer_create(device, 512, 2, 0, D3D12_RESOURCE_STATE_GENERIC_READ, &staging));
     CHECK(vkdu_buffer_map(staging, 0, 0, (void **)&floats));
-    floats[0] = 0.0f; floats[1] = 1.0f;
+    if (format == DXGI_FORMAT_R32_FLOAT) { floats[0] = 0.0f; floats[1] = 1.0f; }
+    else {
+        const uint32_t pixels[2] = {bgra ? 0xff003311 : 0xff113300, bgra ? 0xff804413 : 0xff134480};
+        memcpy(floats, pixels, sizeof(pixels));
+    }
     CHECK(vkdu_buffer_unmap(staging, 0, 8));
     CHECK(vkdu_buffer_create(device, 4096, 2, 0, D3D12_RESOURCE_STATE_GENERIC_READ, &init));
     CHECK(vkdu_buffer_map(init, 0, 0, (void **)&mapped));
@@ -78,8 +85,9 @@ static void check_samplers(vkdu_device *device, vkdu_device *other)
         vkdu_object *heaps[2] = {srv, gpu};
         float uv[3] = {cases[round].uv, 0.5f, 0.0f};
         uint32_t constants[3], expected;
-        memcpy(constants, uv, sizeof(constants)); memcpy(&expected, &cases[round].expected, 4);
-        fprintf(stderr, "sampler round %u: %s filter=%x address=%u\n", round,
+        const float expected_value = cases[round].expected * (cases[round].address == 4 ? 1.0f : scale);
+        memcpy(constants, uv, sizeof(constants)); memcpy(&expected, &expected_value, 4);
+        fprintf(stderr, "sampler format%u round %u: %s filter=%x address=%u\n", format, round,
                 cases[round].fixed ? "static" : "dynamic", cases[round].filter, cases[round].address);
         if (round) {
             CHECK(vkdu_allocator_reset(allocator)); CHECK(vkdu_command_reset(command, allocator));
@@ -123,9 +131,24 @@ static void check_samplers(vkdu_device *device, vkdu_device *other)
         CHECK(vkdu_command_close(command)); CHECK(vkdu_queue_execute(queue, 1, &command));
         CHECK(vkdu_queue_signal(queue, fence, round + 1)); CHECK(vkdu_fence_wait(fence, round + 1, 30000));
         CHECK(vkdu_buffer_map(readback, 0, 4096, (void **)&mapped));
-        for (i = 0; i < 1024; ++i) if (mapped[i] != (i < 16 ? expected : 0xdeadbeef)) {
-            fprintf(stderr, "sampler round%u word%u=%08x expected%08x\n", round, i, mapped[i], i < 16 ? expected : 0xdeadbeef);
-            exit(1);
+        for (i = 0; i < 1024; ++i) {
+            float actual;
+            int valid;
+            memcpy(&actual, &mapped[i], sizeof(actual));
+            valid = i >= 16 ? mapped[i] == 0xdeadbeef : format == DXGI_FORMAT_R32_FLOAT ?
+                mapped[i] == expected : isfinite(actual) && fabsf(actual - expected_value) < 0.0001f;
+            /* D3D11.3 functional spec 3.2.3.7 measures <= 0.5 code error on
+             * the sRGB side, not a uniform epsilon in linear space. The
+             * linear cases use exactly 1/2 weight and a zero second texel;
+             * undo that weight before checking the source's 128 code value.
+             * Zero endpoints and border colors retain their strict checks. */
+            if (i < 16 && srgb && cases[round].address != 4 && cases[round].expected > 0)
+                valid = isfinite(actual) && actual >= 0 &&
+                    fabsf(test_linear_to_srgb(actual / cases[round].expected) * 255 - 128) <= 0.5f;
+            if (!valid) {
+                fprintf(stderr, "sampler format%u round%u word%u=%08x expected%08x\n", format, round, i, mapped[i], i < 16 ? expected : 0xdeadbeef);
+                exit(1);
+            }
         }
         CHECK(vkdu_buffer_unmap(readback, 0, 0));
         vkdu_object_destroy(static_pipeline); vkdu_object_destroy(static_root); static_pipeline = static_root = NULL;
@@ -135,5 +158,12 @@ static void check_samplers(vkdu_device *device, vkdu_device *other)
     vkdu_object_destroy(pipeline); vkdu_object_destroy(root); vkdu_object_destroy(cpu); vkdu_object_destroy(gpu);
     vkdu_object_destroy(srv); vkdu_object_destroy(texture); vkdu_object_destroy(foreign); vkdu_object_destroy(staging);
     vkdu_object_destroy(init); vkdu_object_destroy(output); vkdu_object_destroy(readback);
-    puts("PASS dynamic/static samplers: 9 rounds x 1024 words, point/linear, wrap/mirror/clamp/border/mirror-once, copied descriptors, invalid replacement preservation");
+    printf("PASS actual format%u dynamic/static samplers: 9 rounds x 1024 words, channel order/sRGB decode, point/linear, address modes, copied descriptors and sentinel padding\n", format);
+}
+static void check_samplers(vkdu_device *device, vkdu_device *other)
+{
+    const uint32_t formats[] = {DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+        DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB};
+    uint32_t i;
+    for (i = 0; i < sizeof(formats) / sizeof(formats[0]); ++i) check_samplers_format(device, other, formats[i]);
 }

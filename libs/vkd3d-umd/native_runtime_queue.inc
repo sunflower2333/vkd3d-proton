@@ -4,7 +4,7 @@ struct NativeRuntimeQueue : NativeContextBuffers {
     NativeRuntimeQueue *next = nullptr;
     D3D12DDI_HRTCOMMANDQUEUE runtime{};
     uint32_t users = 1, submissions = 0;
-    bool pending = true, closing = false;
+    bool pending = true, closing = false, preparing_present = false;
 };
 
 NativeRuntimeQueue *native_runtime_queue_token(Context *ctx, void *token) {
@@ -59,7 +59,17 @@ HRESULT native_runtime_queue_open(Context *ctx, D3D12DDI_HRTCOMMANDQUEUE runtime
     *out = nullptr;
     if (!ctx->runtime_callbacks.pfnCreateContextCb || !ctx->runtime_callbacks.pfnDestroyContextCb)
         return DXGI_ERROR_UNSUPPORTED;
-    HRESULT hr = native_heap_open_context(ctx);
+    NativeAdapterFacts current_facts{};
+    HRESULT hr = native_query_adapter_facts(*ctx->native_adapter, current_facts, true);
+    // QueryAdapterInfo may synchronously retire this device. The operation
+    // retains Context, but no runtime handle may be used after that callback.
+    if (ctx->native_retiring || ctx->native_destroying || hr == DXGI_ERROR_UNSUPPORTED)
+        return DXGI_ERROR_DEVICE_REMOVED;
+    if (FAILED(hr)) return hr;
+    if (!native_owned_facts_valid(current_facts) ||
+            !native_same_identity_facts(current_facts, ctx->native_facts))
+        return DXGI_ERROR_DEVICE_REMOVED;
+    hr = native_heap_open_context(ctx);
     if (FAILED(hr)) return hr;
     auto *queue = new (std::nothrow) NativeRuntimeQueue;
     if (!queue) return E_OUTOFMEMORY;

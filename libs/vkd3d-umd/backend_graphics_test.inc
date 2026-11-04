@@ -3,8 +3,10 @@
 #include "../../tests/shaders/render_target/headers/ps_flat_color.h"
 #include "../../tests/shaders/render_target/headers/vs_gradient.h"
 #include "../../tests/shaders/render_target/headers/ps_gradient.h"
-static const uint32_t *graphics_tokens(const uint32_t *container)
+static const uint32_t *graphics_tokens(const void *bytecode)
 {
+    /* Generated Windows fixtures use DWORD; their DXBC words are uint32_t. */
+    const uint32_t *container = bytecode;
     uint32_t i;
     for (i = 0; i < container[7]; ++i) {
         const uint32_t *chunk = container + container[8 + i] / 4;

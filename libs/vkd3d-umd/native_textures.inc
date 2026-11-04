@@ -4,10 +4,9 @@ void native_texture_srv(Context *ctx, const D3D12DDIARG_CREATE_SHADER_RESOURCE_V
     NativeHeapOperation op(ctx);
     if (!sampler_operation_live(op)) { error(ctx, DXGI_ERROR_DEVICE_REMOVED); return; }
     const auto desc = *args;
-    if (desc.Shader4ComponentMapping != 5768 || desc.Tex2D.MostDetailedMip || desc.Tex2D.FirstArraySlice ||
-            desc.Tex2D.MipLevels != 1 || desc.Tex2D.ArraySize != 1 || desc.Tex2D.PlaneSlice ||
+    if (desc.Shader4ComponentMapping != 5768 || !desc.Tex2D.MipLevels || !desc.Tex2D.ArraySize || desc.Tex2D.PlaneSlice ||
             desc.Tex2D.ResourceMinLODClamp != 0 ||
-            (desc.Format != DXGI_FORMAT_R32_FLOAT && desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM)) {
+            (desc.Format != DXGI_FORMAT_R32_FLOAT && !vkdu_color_target_format(desc.Format))) {
         error(ctx, E_INVALIDARG); return;
     }
     vkdu_object *texture = nullptr, *heap_value = nullptr;
@@ -25,8 +24,9 @@ void native_texture_srv(Context *ctx, const D3D12DDIARG_CREATE_SHADER_RESOURCE_V
     HRESULT hr = E_INVALIDARG;
     {
         NativeBackendCall call(ctx);
-        if (texture && heap_value && vkdu_texture2d_format(texture) == static_cast<UINT>(desc.Format))
-            hr = vkdu_texture2d_srv(heap_value, index, texture);
+        if (texture && heap_value && vkdu_texture_view_compatible(vkdu_texture2d_format(texture), desc.Format))
+            hr = vkdu_texture2d_srv_range(heap_value, index, texture, desc.Format,
+                    desc.Tex2D.MostDetailedMip, desc.Tex2D.MipLevels, desc.Tex2D.FirstArraySlice, desc.Tex2D.ArraySize);
         vkdu_object_destroy(texture); vkdu_object_destroy(heap_value);
     }
     if (!sampler_operation_live(op)) hr = DXGI_ERROR_DEVICE_REMOVED;
@@ -40,11 +40,13 @@ HRESULT native_copy_location(Context *ctx, const D3D12DDIARG_BUFFER_PLACEMENT *p
     if (!resource) return E_INVALIDARG;
     out.offset = placement->BaseAddress.UMD.Offset;
     if (layout.Layout == D3D12DDI_RL_SELECT_SUBRESOURCE) {
-        if (layout.pLayout || resource->kind != VKDU_TEXTURE2D || out.offset) return E_INVALIDARG;
+        // The R0 WDK explicitly defines Offset as the subresource index here.
+        if (layout.pLayout || resource->kind != VKDU_TEXTURE2D || out.offset > UINT_MAX) return E_INVALIDARG;
     } else if (layout.Layout == D3D12DDI_RL_PLACED_PHYSICAL_SUBRESOURCE_PITCHED) {
         if (!layout.pLayout || resource->kind != VKDU_BUFFER) return E_INVALIDARG;
         const auto &p = *static_cast<const D3D12DDIARG_PHYSICAL_SUBRESOURCE_PITCHED_LAYOUT *>(layout.pLayout);
-        if ((p.Format != DXGI_FORMAT_R32_FLOAT && p.Format != DXGI_FORMAT_R8G8B8A8_UNORM) ||
+        if ((p.Format != DXGI_FORMAT_R32_FLOAT && !vkdu_color_resource_format(p.Format) &&
+             p.Format != DXGI_FORMAT_D32_FLOAT && p.Format != DXGI_FORMAT_D16_UNORM) ||
                 p.PhysicalDepth != 1 || uint64_t(p.Pitch) * p.PhysicalHeight != p.SlicePitch) return E_INVALIDARG;
         out.footprint = 1; out.format = p.Format; out.width = p.PhysicalWidth;
         out.height = p.PhysicalHeight; out.depth = p.PhysicalDepth; out.row_pitch = p.Pitch;

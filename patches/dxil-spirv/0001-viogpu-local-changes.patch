@@ -1,0 +1,502 @@
+--- a/bc/module_dxbc_ir.cpp
++++ b/bc/module_dxbc_ir.cpp
+@@ -37,6 +37,8 @@
+ #include "ir/ir.h"
+ #include "ir/ir_builder.h"
+ #include "dxbc/dxbc_api.h"
++#include "dxbc/dxbc_container.h"
++#include "dxbc/dxbc_signature.h"
+ #include "util/util_log.h"
+ using namespace dxbc_spv;
+ 
+@@ -519,6 +521,7 @@
+ 	bool emit_metadata();
+ 	bool emit_entry_point();
+ 	bool emit_function_bodies();
++	void emit_clip_cull_signature(const dxbc::Signature &signature);
+ 
+ private:
+ 	LLVMContext &context;
+@@ -3957,8 +3960,30 @@
+ 	return context.construct<MDString>(&module, str);
+ }
+ 
++void ParseContext::emit_clip_cull_signature(const dxbc::Signature &signature)
++{
++	// The legalized IR combines each Clip/Cull builtin into a scalar array.
++	// Its eSemantic retains only one entry, so preserve every original semantic
++	// and mask independently for opt-in component stream-output remapping.
++	Vector<MDOperand *> entries;
++	for (const auto &e : signature)
++	{
++		DXIL::Semantic semantic;
++		if (e.getSystemValue() == dxbc::SignatureSysval::eClipDistance)
++			semantic = DXIL::Semantic::ClipDistance;
++		else if (e.getSystemValue() == dxbc::SignatureSysval::eCullDistance)
++			semantic = DXIL::Semantic::CullDistance;
++		else
++			continue;
++		entries.push_back(create_md_node(create_string_meta(e.getSemanticName()),
++		        create_constant_uint_meta(e.getSemanticIndex()), create_constant_uint_meta(e.getStreamIndex()),
++		        create_constant_uint_meta(unsigned(semantic)), create_constant_uint_meta(uint8_t(e.getComponentMask()))));
++	}
++	create_named_md_node("dxbc.clipCullOutputSignature", create_md_node(std::move(entries)));
++}
++
+ // Parses the highly simplified and SSA-ified IR coming from dxbc-spirv.
+-Module *parseDXBCIR(LLVMContext &context, ir::Builder &builder)
++static Module *parse_dxbc_ir(LLVMContext &context, ir::Builder &builder, const dxbc::Signature *signature)
+ {
+ 	auto *module = context.construct<Module>(context);
+ 	ParseContext ctx(context, builder, *module);
+@@ -3966,11 +3991,18 @@
+ 		return nullptr;
+ 	if (!ctx.emit_metadata())
+ 		return nullptr;
++	if (signature)
++		ctx.emit_clip_cull_signature(*signature);
+ 	if (!ctx.emit_function_bodies())
+ 		return nullptr;
+ 	return module;
+ }
+ 
++Module *parseDXBCIR(LLVMContext &context, ir::Builder &builder)
++{
++	return parse_dxbc_ir(context, builder, nullptr);
++}
++
+ Module *parseDXBCBinary(LLVMContext &context, const void* data, size_t size)
+ {
+ 	ScopedLogger logger;
+@@ -4028,7 +4060,12 @@
+ 	if (!builder)
+ 		return nullptr;
+ 
+-	return parseDXBCIR(context, *builder);
++	dxbc::Container container(data, size);
++	auto output_chunk = container.getOutputSignatureChunk();
++	if (!output_chunk) // Compute shaders have no output signature.
++		return parse_dxbc_ir(context, *builder, nullptr);
++	dxbc::Signature signature(output_chunk);
++	return parse_dxbc_ir(context, *builder, &signature);
+ }
+ 
+ }
+--- a/dxil_converter.cpp
++++ b/dxil_converter.cpp
+@@ -4796,14 +4796,15 @@
+ 	return 0;
+ }
+ 
+-static void build_geometry_stream_row_offsets(unsigned offsets[4], const llvm::MDNode *outputs_node)
++static void build_geometry_stream_row_offsets(unsigned offsets[4], const llvm::MDNode *outputs_node, unsigned rasterized_stream, bool normalize)
+ {
+ 	unsigned row_count_for_geometry_stream[4] = {};
+ 	for (unsigned i = 0; i < outputs_node->getNumOperands(); i++)
+ 	{
+ 		auto *output = llvm::cast<llvm::MDNode>(outputs_node->getOperand(i));
+ 		unsigned geometry_stream = get_geometry_shader_stream_index(output);
+-		if (geometry_stream < 4)
++		if (geometry_stream < 4 && (!normalize ||
++		    static_cast<DXIL::Semantic>(get_constant_metadata(output, 3)) == DXIL::Semantic::User))
+ 		{
+ 			auto start_row = get_constant_metadata(output, 8);
+ 			auto rows = get_constant_metadata(output, 6);
+@@ -4813,11 +4814,20 @@
+ 		}
+ 	}
+ 
+-	for (unsigned row = 0; row < 4; row++)
+-		for (unsigned i = 0; i < row; i++)
+-			offsets[row] += row_count_for_geometry_stream[i];
++	// The selected raster stream must retain the register locations expected by
++	// the fragment shader. All other streams still need globally unique locations.
++	unsigned next_row = rasterized_stream < 4 ? row_count_for_geometry_stream[rasterized_stream] : 0;
++	for (unsigned stream = 0; stream < 4; ++stream)
++	{
++		if (stream == rasterized_stream)
++			continue;
++		offsets[stream] = next_row;
++		next_row += row_count_for_geometry_stream[stream];
++	}
+ }
+ 
++#include "dxil_stream_output.inc"
++
+ bool Converter::Impl::emit_stage_output_variables()
+ {
+ 	auto *node = entry_point_meta;
+@@ -4842,11 +4852,18 @@
+ 	if (auto_patch_location)
+ 		patch_location_offset = 0;
+ 
+-	// If we have multiple geometry streams, need to hallucinate locations.
+-	// This is okay since we're not going to support multi-stream rasterization anyways.
+-	unsigned start_row_for_geometry_stream[4] = {};
++	unsigned start_row_for_geometry_stream[4] = {}, rasterized_stream = 0;
++	const bool geometry_mapping = execution_model == spv::ExecutionModelGeometry && resource_mapping_iface &&
++	        resource_mapping_iface->get_geometry_rasterization_stream(rasterized_stream);
+ 	if (execution_model == spv::ExecutionModelGeometry)
+-		build_geometry_stream_row_offsets(start_row_for_geometry_stream, outputs_node);
++		build_geometry_stream_row_offsets(start_row_for_geometry_stream, outputs_node,
++		        geometry_mapping ? rasterized_stream : 0, geometry_mapping);
++
++	const bool component_xfb = resource_mapping_iface && resource_mapping_iface->has_stream_output_component_remapping() &&
++	        (execution_model == spv::ExecutionModelVertex || execution_model == spv::ExecutionModelGeometry ||
++	         execution_model == spv::ExecutionModelTessellationEvaluation);
++	if ((component_xfb || geometry_mapping) && !prepare_stream_output_locations(outputs_node, start_row_for_geometry_stream))
++		return false;
+ 
+ 	for (unsigned i = 0; i < outputs_node->getNumOperands(); i++)
+ 	{
+@@ -4855,7 +4872,7 @@
+ 		auto semantic_name = get_string_metadata(output, 1);
+ 		auto actual_element_type = normalize_component_type(static_cast<DXIL::ComponentType>(get_constant_metadata(output, 2)));
+ 		auto effective_element_type = get_effective_input_output_type(actual_element_type);
+-		auto system_value = static_cast<DXIL::Semantic>(get_constant_metadata(output, 3));
++		auto system_value = get_effective_output_semantic(output);
+ 
+ 		unsigned semantic_index = 0;
+ 		if (output->getOperand(4))
+@@ -4878,6 +4895,16 @@
+ 		if (auto_patch_location)
+ 			patch_location_offset = std::max(patch_location_offset, start_row + rows);
+ 
++		VulkanStreamOutput component_full_output = {};
++		bool component_replaced = false;
++		if (component_xfb && !emit_stream_output_components(output, component_full_output, component_replaced))
++			return false;
++		if (component_replaced)
++		{
++			output_elements_meta[element_id] = { 0, actual_element_type, 0, system_value };
++			continue;
++		}
++
+ 		spv::Id type_id = get_type_id(effective_element_type, rows, cols);
+ 
+ 		if (options.quirks.ignore_primitive_shading_rate && system_value == DXIL::Semantic::ShadingRate)
+@@ -4952,8 +4979,8 @@
+ 		{
+ 			if (resource_mapping_iface)
+ 			{
+-				VulkanStreamOutput vk_output = {};
+-				if (!resource_mapping_iface->remap_stream_output({ semantic_name.c_str(), semantic_index }, vk_output))
++				VulkanStreamOutput vk_output = component_full_output;
++				if (!component_xfb && !resource_mapping_iface->remap_stream_output({ semantic_name.c_str(), semantic_index }, vk_output))
+ 					return false;
+ 
+ 				if (vk_output.enable)
+@@ -4971,10 +4998,11 @@
+ 		if (execution_model == spv::ExecutionModelGeometry)
+ 		{
+ 			geometry_stream = get_geometry_shader_stream_index(output);
+-			if (geometry_stream != 0)
++			unsigned physical_stream = remap_geometry_stream(geometry_stream);
++			if (physical_stream != 0)
+ 			{
+ 				builder.addCapability(spv::CapabilityGeometryStreams);
+-				builder.addDecoration(variable_id, spv::DecorationStream, geometry_stream);
++				builder.addDecoration(variable_id, spv::DecorationStream, physical_stream);
+ 			}
+ 		}
+ 
+@@ -5020,7 +5048,9 @@
+ 			if (execution_model == spv::ExecutionModelGeometry && geometry_stream < 4)
+ 				vk_output.location += start_row_for_geometry_stream[geometry_stream];
+ 
+-			if (resource_mapping_iface)
++			if (component_xfb || geometry_mapping)
++				vk_output = component_output_locations[element_id];
++			else if (resource_mapping_iface)
+ 			{
+ 				D3DStageIO d3d_output = { semantic_name.c_str(), semantic_index, start_row, rows };
+ 				if (!resource_mapping_iface->remap_stage_output(d3d_output, vk_output))
+--- a/dxil_converter.hpp
++++ b/dxil_converter.hpp
+@@ -194,6 +194,14 @@
+ 	unsigned semantic_index;
+ };
+ 
++struct D3DStreamOutputComponent
++{
++	const char *semantic;
++	unsigned semantic_index;
++	unsigned stream_index;
++	unsigned component;
++};
++
+ struct VulkanStreamOutput
+ {
+ 	unsigned offset;
+@@ -217,6 +225,12 @@
+ 	virtual unsigned get_root_constant_word_count() = 0;
+ 	virtual unsigned get_root_descriptor_count() = 0;
+ 	virtual bool has_nontrivial_stage_input_remapping() = 0;
++	// Optional scalar remapping keeps the legacy whole-variable interface intact.
++	// Opt-in stream semantics; legacy users retain their original lowering.
++	virtual bool get_geometry_rasterization_stream(unsigned &) { return false; }
++	virtual bool has_stream_output_component_remapping() { return false; }
++	virtual bool remap_stream_output_component(const D3DStreamOutputComponent &, VulkanStreamOutput &) { return false; }
++
+ };
+ 
+ enum class Option : uint32_t
+--- a/dxil_spirv_c.cpp
++++ b/dxil_spirv_c.cpp
+@@ -261,6 +261,29 @@
+ 		}
+ 	}
+ 
++	bool get_geometry_rasterization_stream(unsigned &stream) override
++	{
++		stream = rasterization_stream;
++		return rasterization_stream_enabled;
++	}
++
++	bool has_stream_output_component_remapping() override
++	{
++		return component_output_remapper != nullptr;
++	}
++
++	bool remap_stream_output_component(const D3DStreamOutputComponent &d3d_output, VulkanStreamOutput &vk_output) override
++	{
++		dxil_spv_d3d_stream_output_component c_output = { d3d_output.semantic, d3d_output.semantic_index,
++		                                               d3d_output.stream_index, d3d_output.component };
++		dxil_spv_vulkan_stream_output c_vk_output = {};
++		if (!component_output_remapper || component_output_remapper(component_output_userdata,
++		        &c_output, &c_vk_output) != DXIL_SPV_TRUE)
++			return false;
++		vk_output = { c_vk_output.offset, c_vk_output.stride, c_vk_output.buffer_index, bool(c_vk_output.enable) };
++		return true;
++	}
++
+ 	bool remap_stage_input(const D3DStageIO &d3d_input, VulkanStageIO &vk_input) override
+ 	{
+ 		dxil_spv_d3d_shader_stage_io c_input = { d3d_input.semantic, d3d_input.semantic_index };
+@@ -340,6 +363,11 @@
+ 	dxil_spv_stream_output_remapper_cb output_remapper = nullptr;
+ 	void *output_userdata = nullptr;
+ 
++	bool rasterization_stream_enabled = false;
++	unsigned rasterization_stream = 0;
++	dxil_spv_stream_output_component_remapper_cb component_output_remapper = nullptr;
++	void *component_output_userdata = nullptr;
++
+ 	dxil_spv_shader_stage_io_remapper_cb stage_input_remapper = nullptr;
+ 	void *stage_input_userdata = nullptr;
+ 
+@@ -933,6 +961,19 @@
+ 	converter->remapper.output_userdata = userdata;
+ }
+ 
++void dxil_spv_converter_set_geometry_rasterization_stream(dxil_spv_converter converter, unsigned stream)
++{
++	converter->remapper.rasterization_stream_enabled = true;
++	converter->remapper.rasterization_stream = stream;
++}
++
++void dxil_spv_converter_set_stream_output_component_remapper(dxil_spv_converter converter,
++        dxil_spv_stream_output_component_remapper_cb remapper, void *userdata)
++{
++	converter->remapper.component_output_remapper = remapper;
++	converter->remapper.component_output_userdata = userdata;
++}
++
+ /* Useful to check if the implementation recognizes a particular capability for ABI compatibility. */
+ dxil_spv_bool dxil_spv_converter_supports_option(dxil_spv_option cap)
+ {
+--- a/dxil_spirv_c.h
++++ b/dxil_spirv_c.h
+@@ -127,6 +127,18 @@
+ typedef dxil_spv_bool (*dxil_spv_stream_output_remapper_cb)(void *userdata, const dxil_spv_d3d_stream_output *d3d_output,
+                                                             dxil_spv_vulkan_stream_output *vulkan_output);
+ 
++/* A component is relative to the semantic, not the packed register column. */
++typedef struct dxil_spv_d3d_stream_output_component
++{
++	const char *semantic;
++	unsigned semantic_index;
++	unsigned stream_index;
++	unsigned component;
++} dxil_spv_d3d_stream_output_component;
++
++typedef dxil_spv_bool (*dxil_spv_stream_output_component_remapper_cb)(void *userdata,
++        const dxil_spv_d3d_stream_output_component *d3d_output, dxil_spv_vulkan_stream_output *vulkan_output);
++
+ typedef struct dxil_spv_d3d_shader_stage_io
+ {
+ 	const char *semantic;
+@@ -990,6 +1002,16 @@
+ 		dxil_spv_stream_output_remapper_cb remapper,
+ 		void *userdata);
+ 
++/* Select which GS stream retains system semantics and unshifted raster locations.
++ * UINT32_MAX disables rasterization semantics. Existing users are unchanged. */
++DXIL_SPV_PUBLIC_API void dxil_spv_converter_set_geometry_rasterization_stream(
++        dxil_spv_converter converter, unsigned stream);
++
++DXIL_SPV_PUBLIC_API void dxil_spv_converter_set_stream_output_component_remapper(
++		dxil_spv_converter converter,
++		dxil_spv_stream_output_component_remapper_cb remapper,
++		void *userdata);
++
+ DXIL_SPV_PUBLIC_API void dxil_spv_converter_set_srv_remapper(
+ 		dxil_spv_converter converter,
+ 		dxil_spv_srv_remapper_cb remapper,
+--- a/opcodes/converter_impl.hpp
++++ b/opcodes/converter_impl.hpp
+@@ -600,6 +600,21 @@
+ 		unsigned row_stride;
+ 		spv::BuiltIn builtin;
+ 	};
++	struct ComponentOutputMeta
++	{
++		spv::Id ids[8] = {};
++		bool replaces_original = false;
++		bool scalar_array = false;
++	};
++	UnorderedMap<uint32_t, ComponentOutputMeta> component_outputs;
++	UnorderedMap<uint32_t, VulkanStageIO> component_output_locations;
++	unsigned component_output_used[32] = {};
++	unsigned remap_geometry_stream(unsigned stream);
++	DXIL::Semantic get_effective_output_semantic(const llvm::MDNode *output);
++	bool prepare_stream_output_locations(const llvm::MDNode *outputs, const unsigned stream_offsets[4]);
++	bool emit_stream_output_components(const llvm::MDNode *output, VulkanStreamOutput &full_output, bool &replaced);
++	bool remap_clip_cull_components(DXIL::Semantic semantic, unsigned stream, unsigned rows, VulkanStreamOutput *mappings);
++
+ 	UnorderedMap<uint32_t, ElementMeta> input_elements_meta;
+ 	UnorderedMap<uint32_t, ElementMeta> output_elements_meta;
+ 	UnorderedMap<uint32_t, ElementPatchMeta> patch_elements_meta;
+--- a/opcodes/dxil/dxil_geometry.cpp
++++ b/opcodes/dxil/dxil_geometry.cpp
+@@ -48,7 +48,7 @@
+ 			LOGE("Argument to emitStream must be a constant.\n");
+ 			return false;
+ 		}
+-		op->add_id(builder.makeUintConstant(constant->getUniqueInteger().getZExtValue()));
++		op->add_id(builder.makeUintConstant(impl.remap_geometry_stream(constant->getUniqueInteger().getZExtValue())));
+ 		builder.addCapability(spv::CapabilityGeometryStreams);
+ 	}
+ 	else
+@@ -73,7 +73,7 @@
+ 			LOGE("Argument to emitStream must be a constant.\n");
+ 			return false;
+ 		}
+-		op->add_id(builder.makeUintConstant(constant->getUniqueInteger().getZExtValue()));
++		op->add_id(builder.makeUintConstant(impl.remap_geometry_stream(constant->getUniqueInteger().getZExtValue())));
+ 		builder.addCapability(spv::CapabilityGeometryStreams);
+ 	}
+ 	else
+--- a/opcodes/dxil/dxil_resources.cpp
++++ b/opcodes/dxil/dxil_resources.cpp
+@@ -424,6 +424,36 @@
+ 	if (!get_constant_operand(instruction, 1, &output_element_index))
+ 		return false;
+ 
++	// Scalarized user outputs keep their original Location/Component interface.
++	// Builtin subsets are mirrored for XFB while the original raster builtin stays intact.
++	auto component_itr = impl.component_outputs.find(output_element_index);
++	if (component_itr != impl.component_outputs.end())
++	{
++		unsigned row, col;
++		const auto &components = component_itr->second;
++		if (!get_constant_operand(instruction, 2, &row) ||
++		    !get_constant_operand(instruction, 3, &col))
++			return false;
++		if (components.scalar_array)
++		{
++			if (col || row >= 8) return false;
++			col = row;
++		}
++		else if (row || col >= 4)
++			return false;
++		if (components.ids[col])
++		{
++			impl.register_externally_visible_write(instruction->getOperand(4));
++			auto value = impl.get_id_for_value(instruction->getOperand(4));
++			auto type = impl.output_elements_meta[output_element_index].component_type;
++			auto *op = impl.allocate(spv::OpStore);
++			op->add_ids({components.ids[col], impl.fixup_store_type_io(type, 1, value)});
++			impl.add(op);
++		}
++		if (components.replaces_original)
++			return true;
++	}
++
+ 	// Need special handling for clip distance.
+ 	auto *clip_cull_meta = output_clip_cull_distance_meta(impl, output_element_index);
+ 	if (clip_cull_meta)
+--- a/opcodes/dxil/dxil_sampling.cpp
++++ b/opcodes/dxil/dxil_sampling.cpp
+@@ -973,6 +973,49 @@
+ 	return true;
+ }
+ 
++static Operation *emit_variable_mip_dimensions(Converter::Impl &impl, Operation *base,
++                                              spv::Id image_type, spv::Id lod, unsigned num_coords)
++{
++	auto &builder = impl.builder();
++	auto uint_type = builder.makeUintType(32);
++	auto dim_type = impl.build_vector_type(uint_type, num_coords);
++	bool arrayed = builder.isArrayedImageType(image_type);
++	if (!impl.glsl_std450_ext)
++		impl.glsl_std450_ext = builder.import("GLSL.std.450");
++
++	// Even an out-of-range query must not cause an undefined >= 32 shift.
++	auto *shift = impl.allocate(spv::OpExtInst, uint_type);
++	shift->add_id(impl.glsl_std450_ext);
++	shift->add_literal(GLSLstd450UMin);
++	shift->add_ids({ lod, builder.makeUintConstant(31) });
++	impl.add(shift);
++
++	spv::Id shifts[4], minimums[4];
++	for (unsigned i = 0; i < num_coords; i++)
++	{
++		bool layer = arrayed && i + 1 == num_coords;
++		shifts[i] = layer ? builder.makeUintConstant(0) : shift->id;
++		minimums[i] = builder.makeUintConstant(layer ? 0 : 1);
++	}
++	auto *size = impl.allocate(spv::OpShiftRightLogical, dim_type);
++	size->add_ids({ base->id, impl.build_vector(uint_type, shifts, num_coords) });
++	impl.add(size);
++	auto *clamp = impl.allocate(spv::OpExtInst, dim_type);
++	clamp->add_id(impl.glsl_std450_ext);
++	clamp->add_literal(GLSLstd450UMax);
++	clamp->add_ids({ size->id, impl.build_vector(uint_type, minimums, num_coords) });
++	impl.add(clamp);
++
++	// A null view has zero base size. Do not turn its dimensions into one.
++	auto *nonzero = impl.allocate(spv::OpINotEqual, impl.build_vector_type(builder.makeBoolType(), num_coords));
++	nonzero->add_ids({ base->id, builder.makeNullConstant(dim_type) });
++	impl.add(nonzero);
++	auto *select = impl.allocate(spv::OpSelect, dim_type);
++	select->add_ids({ nonzero->id, clamp->id, builder.makeNullConstant(dim_type) });
++	impl.add(select);
++	return select;
++}
++
+ bool emit_get_dimensions_instruction(Converter::Impl &impl, const llvm::CallInst *instruction, bool extended)
+ {
+ 	if (!impl.composite_is_accessed(instruction))
+@@ -1043,11 +1086,20 @@
+ 
+ 		if ((access_meta.access_mask & 7) != 0)
+ 		{
++			bool variable_lod = has_lod && builder.getTypeDimensionality(image_type_id) == spv::Dim2D &&
++			                    !llvm::isa<llvm::ConstantInt>(instruction->getOperand(2));
+ 			dimensions_op = impl.allocate(has_lod ? spv::OpImageQuerySizeLod : spv::OpImageQuerySize, dim_type_id);
+ 			dimensions_op->add_id(image_id);
+ 			if (has_lod)
+-				dimensions_op->add_id(impl.get_id_for_value(instruction->getOperand(2)));
++				dimensions_op->add_id(variable_lod ? builder.makeUintConstant(0) :
++				                     impl.get_id_for_value(instruction->getOperand(2)));
+ 			impl.add(dimensions_op);
++			// Use the view's base mip and ordinary per-invocation arithmetic.
++			// Some image-query implementations only consume the first lane's LOD.
++			// D3D compatible 2D views retain mip geometry; array layers never shrink.
++			if (variable_lod)
++				dimensions_op = emit_variable_mip_dimensions(impl, dimensions_op, image_type_id,
++				                                            impl.get_id_for_value(instruction->getOperand(2)), num_coords);
+ 
+ 			if (has_lod)
+ 			{

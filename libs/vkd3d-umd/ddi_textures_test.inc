@@ -47,9 +47,20 @@ static int check_native_textures() {
     auto saved_flags = heap.descriptor_flags; heap.descriptor_flags = 0;
     device.pfnCreateShaderResourceView(h, &srv, target);
     REQUIRE(texture_srv_calls == 1 && reported == E_INVALIDARG); heap.descriptor_flags = saved_flags;
+    for (const auto format : {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+            DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB}) {
+        srv.Format = format; peer(texture.backend)->type = format;
+        const auto prior = texture_srv_calls;
+        device.pfnCreateShaderResourceView(h, &srv, target);
+        REQUIRE(texture_srv_calls == prior + 1 && srv_index == 3 && srv_buffer == texture.backend);
+        srv.Format = DXGI_FORMAT_R32_FLOAT;
+        device.pfnCreateShaderResourceView(h, &srv, target);
+        REQUIRE(texture_srv_calls == prior + 1 && reported == E_INVALIDARG);
+    }
+    srv.Format = DXGI_FORMAT_R32_FLOAT; peer(texture.backend)->type = DXGI_FORMAT_R32_FLOAT;
     texture_slots[0] = &heap; texture_hook = texture_poison; reported = S_OK;
     device.pfnCreateShaderResourceView(h, &srv, target);
-    REQUIRE(texture_locks_free && texture_srv_calls == 2 && peer(texture.backend)->references == 1);
+    REQUIRE(texture_locks_free && texture_srv_calls == 6 && peer(texture.backend)->references == 1);
     texture_hook = nullptr; texture_slots[0] = nullptr;
     REQUIRE(bind(&ctx, &upload, make_peer(ctx.backend, VKDU_BUFFER), VKDU_BUFFER) == S_OK);
     REQUIRE(bind(&ctx, &command, make_peer(ctx.backend, VKDU_COMMAND_LIST), VKDU_COMMAND_LIST) == S_OK);
@@ -76,11 +87,26 @@ static int check_native_textures() {
     box.Left = -1;
     commands.pfnCopyTextureRegion({&command}, &dst, image, 2, 2, 0, &src, buffer, &box);
     REQUIRE(texture_copy_calls == 1 && reported == E_INVALIDARG); box.Left = 1;
+    footprint.Format = DXGI_FORMAT_D32_FLOAT; peer(texture.backend)->type = DXGI_FORMAT_D32_FLOAT;
+    commands.pfnCopyTextureRegion({&command}, &dst, image, 0, 0, 0, &src, buffer, nullptr);
+    REQUIRE(texture_copy_calls == 2 && seen_texture_src.format == DXGI_FORMAT_D32_FLOAT && !texture_x && !texture_y);
+    footprint.Format = DXGI_FORMAT_D16_UNORM; peer(texture.backend)->type = DXGI_FORMAT_D16_UNORM;
+    commands.pfnCopyTextureRegion({&command}, &dst, image, 0, 0, 0, &src, buffer, nullptr);
+    REQUIRE(texture_copy_calls == 3 && seen_texture_src.format == DXGI_FORMAT_D16_UNORM && !texture_x && !texture_y);
+    for (const auto format : {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+            DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB}) {
+        footprint.Format = format; peer(texture.backend)->type = format;
+        const auto prior = texture_copy_calls;
+        commands.pfnCopyTextureRegion({&command}, &dst, image, 2, 2, 0, &src, buffer, &box);
+        REQUIRE(texture_copy_calls == prior + 1 && seen_texture_src.format == format &&
+            seen_texture_src.row_pitch == 256 && seen_texture_src.offset == 512);
+    }
+    footprint.Format = DXGI_FORMAT_R32_FLOAT; peer(texture.backend)->type = DXGI_FORMAT_R32_FLOAT;
     texture_slots[0] = &texture; texture_slots[1] = &upload; texture_slots[2] = &command;
     texture_placement = &src; texture_layout = &footprint; texture_box_input = &box; texture_hook = texture_poison;
     const unsigned before_destroy = destroys; next_result = E_FAIL;
     commands.pfnCopyTextureRegion({&command}, &dst, image, 2, 2, 0, &src, buffer, &box);
-    REQUIRE(texture_locks_free && destroys == before_destroy + 3 && texture_copy_calls == 2 &&
+    REQUIRE(texture_locks_free && destroys == before_destroy + 3 && texture_copy_calls == 8 &&
             seen_texture_src.offset == 512 && seen_texture_src.row_pitch == 256 && seen_texture_box.right == 3 && reported == E_FAIL);
     texture_hook = nullptr; texture_placement = nullptr; texture_layout = nullptr; texture_box_input = nullptr;
     for (auto &slot : texture_slots) slot = nullptr;

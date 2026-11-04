@@ -2,10 +2,13 @@
 #include "../../tests/shaders/command/headers/unaligned_vertex_stride_vs.h"
 #include "../../tests/shaders/command/headers/unaligned_vertex_stride_ps.h"
 
-static void check_vertex_inputs(vkdu_device *device, vkdu_device *foreign)
+static void check_vertex_inputs(vkdu_device *device, vkdu_device *foreign, int cached)
 {
     vkdu_object *root, *pipeline, *target, *rtv, *queue, *allocator, *command, *fence;
     vkdu_object *vertices, *colors, *indices, *readback, *other;
+#ifdef VKDU_ENABLE_TEST_DEVICE
+    vkdu_object *vertex_heap = NULL, *color_heap = NULL, *index_heap = NULL;
+#endif
     const struct vkdu_signature inputs[] = {{0, 0, 15, 3}, {0, 1, 15, 3}};
     const struct vkdu_signature outputs[] = {{1, 0, 15, 3}, {0, 1, 15, 3}};
     const struct vkdu_signature pixel_output = {0, 0, 15, 3};
@@ -38,9 +41,34 @@ static void check_vertex_inputs(vkdu_device *device, vkdu_device *foreign)
     CHECK(vkdu_texture2d_rtv(rtv, 0, target));
     CHECK(vkdu_queue_create(device, 0, &queue)); CHECK(vkdu_allocator_create(device, 0, &allocator));
     CHECK(vkdu_command_create(device, allocator, 0, &command)); CHECK(vkdu_fence_create(device, 0, &fence));
-    CHECK(vkdu_buffer_create(device, 4096, 2, 0, D3D12_RESOURCE_STATE_GENERIC_READ, &vertices));
-    CHECK(vkdu_buffer_create(device, 4096, 2, 0, D3D12_RESOURCE_STATE_GENERIC_READ, &colors));
-    CHECK(vkdu_buffer_create(device, 4096, 2, 0, D3D12_RESOURCE_STATE_GENERIC_READ, &indices));
+#ifdef VKDU_ENABLE_TEST_DEVICE
+    if (cached == 2) {
+        vkdu_object *parent;
+        CHECK(vkdu_test_memory_heap_create(device, 262144, 1, &vertex_heap));
+        CHECK(vkdu_buffer_place(device, vertex_heap, 0, 262144, D3D12_RESOURCE_STATE_GENERIC_READ, &parent));
+        CHECK(vkdu_buffer_place(device, vertex_heap, 65536, 4096, D3D12_RESOURCE_STATE_GENERIC_READ, &vertices));
+        CHECK(vkdu_buffer_place(device, vertex_heap, 131072, 4096, D3D12_RESOURCE_STATE_GENERIC_READ, &colors));
+        CHECK(vkdu_buffer_place(device, vertex_heap, 196608, 4096, D3D12_RESOURCE_STATE_GENERIC_READ, &indices));
+        if (vkdu_buffer_address(vertices) != vkdu_buffer_address(parent) + 65536 ||
+                vkdu_buffer_address(colors) != vkdu_buffer_address(parent) + 131072 ||
+                vkdu_buffer_address(indices) != vkdu_buffer_address(parent) + 196608) {
+            fputs("FAIL actual vertex/index alias GPUVA offsets\n", stderr); exit(1);
+        }
+        vkdu_object_destroy(parent); vkdu_object_destroy(vertex_heap); vertex_heap = NULL;
+    } else if (cached) {
+        CHECK(vkdu_test_memory_heap_create(device, 65536, 1, &vertex_heap));
+        CHECK(vkdu_test_memory_heap_create(device, 65536, 1, &color_heap));
+        CHECK(vkdu_test_memory_heap_create(device, 65536, 1, &index_heap));
+        CHECK(vkdu_buffer_place(device, vertex_heap, 0, 4096, D3D12_RESOURCE_STATE_GENERIC_READ, &vertices));
+        CHECK(vkdu_buffer_place(device, color_heap, 0, 4096, D3D12_RESOURCE_STATE_GENERIC_READ, &colors));
+        CHECK(vkdu_buffer_place(device, index_heap, 0, 4096, D3D12_RESOURCE_STATE_GENERIC_READ, &indices));
+    } else
+#endif
+    {
+        CHECK(vkdu_buffer_create(device, 4096, 2, 0, D3D12_RESOURCE_STATE_GENERIC_READ, &vertices));
+        CHECK(vkdu_buffer_create(device, 4096, 2, 0, D3D12_RESOURCE_STATE_GENERIC_READ, &colors));
+        CHECK(vkdu_buffer_create(device, 4096, 2, 0, D3D12_RESOURCE_STATE_GENERIC_READ, &indices));
+    }
     CHECK(vkdu_buffer_create(foreign, 4096, 2, 0, D3D12_RESOURCE_STATE_GENERIC_READ, &other));
     CHECK(vkdu_buffer_create(device, 4096, 3, 0, D3D12_RESOURCE_STATE_COPY_DEST, &readback));
     CHECK(vkdu_buffer_map(vertices, 0, 0, &mapped));
@@ -115,12 +143,16 @@ static void check_vertex_inputs(vkdu_device *device, vkdu_device *foreign)
             }
         }
         CHECK(vkdu_buffer_unmap(readback, 0, 0));
-        printf("PASS actual vertex fetch round%u: offset, register, sparse slots, start/base, divisor, stride/null and1024 pixel/sentinel words\n", round);
+        printf("PASS actual %s vertex fetch round%u: offset, register, sparse slots, start/base, divisor, stride/null and1024 pixel/sentinel words\n",
+                cached == 2 ? "cached alias after parent/heap retirement" : cached ? "cached placed" : "upload", round);
     }
     vkdu_object_destroy(command); vkdu_object_destroy(allocator); vkdu_object_destroy(queue); vkdu_object_destroy(fence);
     vkdu_object_destroy(vertices); vkdu_object_destroy(colors); vkdu_object_destroy(indices);
     vkdu_object_destroy(readback); vkdu_object_destroy(other); vkdu_object_destroy(rtv);
     vkdu_object_destroy(target); vkdu_object_destroy(pipeline); vkdu_object_destroy(root);
+#ifdef VKDU_ENABLE_TEST_DEVICE
+    vkdu_object_destroy(vertex_heap); vkdu_object_destroy(color_heap); vkdu_object_destroy(index_heap);
+#endif
 }
 
 #ifdef VKDU_ENABLE_TEST_DEVICE

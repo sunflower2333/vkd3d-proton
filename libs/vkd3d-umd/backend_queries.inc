@@ -12,7 +12,7 @@ static HRESULT retain_query_owners(vkdu_object *command, vkdu_object *heap, vkdu
 static int query_matches(vkdu_object *command, vkdu_object *heap, uint32_t type)
 {
     uint32_t expected;
-    if (!RECORDING(command) || !VALID(heap, VKDU_QUERY_HEAP) ||
+    if (!RECORDING(command) || command->command_type == 1 || !VALID(heap, VKDU_QUERY_HEAP) ||
             !vkdu_same_device(command, heap) || type > D3D12_QUERY_TYPE_SO_STATISTICS_STREAM3 ||
             command->command_type == D3D12_COMMAND_LIST_TYPE_COPY ||
             (command->command_type == D3D12_COMMAND_LIST_TYPE_COMPUTE &&

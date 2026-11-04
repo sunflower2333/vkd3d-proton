@@ -20,9 +20,13 @@ struct NativeRenderReference {
     uint64_t offset, length;
     uint32_t patch_offset, reserved;
 };
+struct NativeImportedReference {
+    uint64_t key, address, size, generation;
+    uint32_t access, allocation_index_plus_one;
+};
 #pragma pack(pop)
 static_assert(sizeof(NativeFenceInfo) == 56 && sizeof(NativeRenderInfo) == 64 &&
-    sizeof(NativeRenderReference) == 32, "v0 submit ABI");
+    sizeof(NativeRenderReference) == 32 && sizeof(NativeImportedReference) == 40, "v0 submit ABI");
 
 #include "native_runtime_queue.inc"
 #include "native_completion.inc"
@@ -36,6 +40,7 @@ NativeHeap *native_token(Context *ctx, void *token) {
 void native_export(Context *ctx, NativeHeap *heap, mwd_allocation *out) {
     *out = {heap, heap->address, heap->bytes, ctx->native_adapter->generation, heap->allocation, heap->flags};
 }
+#include "native_surface_provider.inc"
 int32_t MWD_CALL native_runtime_status(void *owner) {
     NativeHeapOperation op(static_cast<Context *>(owner), true);
     if (!op.live()) return DXGI_ERROR_DEVICE_REMOVED;
@@ -98,16 +103,27 @@ int32_t MWD_CALL native_runtime_allocate(void *owner, uint64_t size, uint64_t al
     native_export(op.ctx, heap, out);
     return S_OK;
 }
+int32_t MWD_CALL native_runtime_release(void *owner, void *token);
 int32_t MWD_CALL native_runtime_retain(void *owner, void *token, mwd_allocation *out) {
     if (!out) return E_POINTER;
     *out = {};
     NativeHeapOperation op(static_cast<Context *>(owner));
     if (!op.live()) return DXGI_ERROR_DEVICE_REMOVED;
     auto *heap = native_token(op.ctx, token);
-    if (!heap || !heap->allocation || heap->pending || heap->users == UINT32_MAX) return E_INVALIDARG;
+    if (!heap || !heap->allocation || heap->pending || heap->native_uncertain || heap->users == UINT32_MAX ||
+            ((heap->flags & MWD_ALLOCATION_NATIVE_SURFACE) &&
+            (!heap->native_key || !heap->native_mapping || heap->native_mapping->released))) return E_INVALIDARG;
+    // QueryAdapterInfo may synchronously destroy the last public heap owner.
+    // Pin the registered record before that callback, not after it returns.
+    bool pin_before_query = true;
+#ifdef VKDU_TEST_NATIVE_SURFACE_CONTROLS
+    if (native_surface_negative_active && native_surface_late_pin) pin_before_query = false;
+#endif
+    if (pin_before_query) ++heap->users;
     HRESULT hr = native_heap_generation(op.ctx);
-    if (FAILED(hr)) return hr;
-    ++heap->users; native_export(op.ctx, heap, out);
+    if (FAILED(hr)) { if (pin_before_query) native_runtime_release(op.ctx, heap); return hr; }
+    if (!pin_before_query) ++heap->users;
+    native_export(op.ctx, heap, out);
     return S_OK;
 }
 int32_t MWD_CALL native_runtime_release(void *owner, void *token) {
@@ -134,7 +150,7 @@ int32_t MWD_CALL native_runtime_unmap(void *owner, void *token) {
     NativeHeapOperation op(static_cast<Context *>(owner), true);
     auto *heap = native_token(op.ctx, token);
     if (!heap || heap->pending) return E_INVALIDARG;
-    if (heap->residency_operations) return DXGI_ERROR_WAS_STILL_DRAWING;
+    if (native_heap_residency_busy(heap)) return DXGI_ERROR_WAS_STILL_DRAWING;
     if (!op.live()) return S_OK; // Kernel lock is retired with the device.
     if (!heap->map_count) return E_INVALIDARG;
     if (heap->map_count > 1) { --heap->map_count; return S_OK; }
@@ -181,7 +197,8 @@ int32_t native_runtime_submit_on_queue(void *owner, void *queue_token, uint32_t 
     // Copy the complete command and reference request before the first callback.
     std::unique_ptr<uint8_t[]> owned_stream(new (std::nothrow) uint8_t[size]);
     std::unique_ptr<mwd_reference[]> owned_refs(new (std::nothrow) mwd_reference[count]);
-    if (!owned_stream || !owned_refs) return E_OUTOFMEMORY;
+    std::unique_ptr<uint32_t[]> import_indices(new (std::nothrow) uint32_t[count]);
+    if (!owned_stream || !owned_refs || !import_indices) return E_OUTOFMEMORY;
     std::memcpy(owned_stream.get(), stream, size);
     std::memcpy(owned_refs.get(), refs, sizeof(mwd_reference) * count);
     stream = owned_stream.get(); refs = owned_refs.get();
@@ -191,24 +208,48 @@ int32_t native_runtime_submit_on_queue(void *owner, void *queue_token, uint32_t 
     hr = native_heap_generation(ctx);
     if (FAILED(hr)) return hr;
     if (queue && queue->closing) return DXGI_ERROR_DEVICE_REMOVED;
-    const uint64_t offset = sizeof(NativeRenderInfo) + uint64_t(count) * sizeof(NativeRenderReference);
-    const uint64_t bytes = offset + size;
-    if (bytes > 65536 || bytes > buffers->native_command_capacity || count > buffers->native_allocation_capacity ||
-            count > buffers->native_patch_capacity || !buffers->native_commands || !buffers->native_allocation_list ||
-            !buffers->native_patch_list) return E_INVALIDARG;
+    uint32_t owned_count = 0, imported_count = 0;
     for (uint32_t i = 0; i < count; ++i) {
         auto *heap = native_token(ctx, refs[i].token);
-        if (heap && heap->residency_operations) return DXGI_ERROR_WAS_STILL_DRAWING;
-        if (!heap || heap->pending || !heap->allocation || heap->users == UINT32_MAX ||
+        if (heap && native_heap_residency_busy(heap)) return DXGI_ERROR_WAS_STILL_DRAWING;
+        if (!heap || heap->pending || !heap->allocation || heap->native_uncertain || heap->users == UINT32_MAX ||
                 !refs[i].flags || (refs[i].flags & ~3u) ||
                 ((heap->flags & 8u) && (refs[i].flags & 2u)) || refs[i].offset > UINT32_MAX ||
-                refs[i].offset > heap->bytes || !refs[i].length || refs[i].length > heap->bytes - refs[i].offset ||
-                refs[i].patch_offset % 4 || refs[i].patch_offset > size - 8) return E_INVALIDARG;
+                refs[i].offset > heap->bytes || !refs[i].length || refs[i].length > heap->bytes - refs[i].offset)
+            return E_INVALIDARG;
+        const bool native = heap->flags & MWD_ALLOCATION_NATIVE_SURFACE;
+        if (native) {
+            if (!ctx->native_surfaces || heap->flags != (4u | MWD_ALLOCATION_NATIVE_SURFACE) ||
+                    !heap->native_key || !heap->native_mapping || heap->native_mapping->released ||
+                    !heap->resource_created || refs[i].offset ||
+                    refs[i].length != heap->bytes || refs[i].patch_offset != MWD_NATIVE_SURFACE_REFERENCE)
+                return E_INVALIDARG;
+        } else {
+            if (refs[i].patch_offset % 4 || refs[i].patch_offset > size - 8) return E_INVALIDARG;
+            ++owned_count;
+        }
+        bool first_import = native;
         for (uint32_t j = 0; j < i; ++j) {
             const uint64_t a = refs[i].patch_offset, b = refs[j].patch_offset;
-            if (refs[i].token == refs[j].token || (a < b + 8 && b < a + 8)) return E_INVALIDARG;
+            const auto *other = native_token(ctx, refs[j].token);
+            const bool alias = native && heap->native_mapping == other->native_mapping;
+            if (refs[i].token == refs[j].token || (heap->allocation == other->allocation && !alias) ||
+                    (a != MWD_NATIVE_SURFACE_REFERENCE && b != MWD_NATIVE_SURFACE_REFERENCE &&
+                    a < b + 8 && b < a + 8)) return E_INVALIDARG;
+            if (alias) { first_import = false; import_indices[i] = import_indices[j]; }
+        }
+        if (first_import) {
+            if (imported_count == 256) return E_INVALIDARG;
+            import_indices[i] = imported_count++;
         }
     }
+    const uint64_t import_offset = sizeof(NativeRenderInfo) + uint64_t(owned_count) * sizeof(NativeRenderReference);
+    const uint64_t offset = import_offset + uint64_t(imported_count) * sizeof(NativeImportedReference);
+    const uint64_t bytes = offset + size;
+    const uint32_t allocation_count = owned_count + imported_count;
+    if (!owned_count || bytes > 65536 || bytes > buffers->native_command_capacity || allocation_count > buffers->native_allocation_capacity ||
+            owned_count > buffers->native_patch_capacity || !buffers->native_commands || !buffers->native_allocation_list ||
+            !buffers->native_patch_list) return E_INVALIDARG;
     std::unique_ptr<NativeSubmission> completion(new (std::nothrow) NativeSubmission);
     if (!completion) return E_OUTOFMEMORY;
     completion->heaps.reset(new (std::nothrow) NativeHeap *[count]);
@@ -224,23 +265,44 @@ int32_t native_runtime_submit_on_queue(void *owner, void *queue_token, uint32_t 
     auto *header = reinterpret_cast<NativeRenderInfo *>(packet);
     header->header = native_header(static_cast<uint32_t>(bytes)); header->opcode = 1;
     header->generation = ctx->native_adapter->generation;
-    header->references_offset = sizeof(*header); header->references_count = count;
+    header->references_offset = sizeof(*header); header->references_count = owned_count;
     header->stream_offset = static_cast<uint32_t>(offset); header->stream_size = size;
+    if (imported_count) {
+        header->flags = 1; header->reserved[0] = static_cast<uint32_t>(import_offset);
+        header->reserved[1] = imported_count; header->reserved[2] = 2;
+    }
     std::memcpy(packet + offset, stream, size);
     auto *wire = reinterpret_cast<NativeRenderReference *>(packet + sizeof(*header));
+    auto *imported = reinterpret_cast<NativeImportedReference *>(packet + import_offset);
+    uint32_t owned_index = 0;
     for (uint32_t i = 0; i < count; ++i) {
-        wire[i] = {i, refs[i].flags, refs[i].offset, refs[i].length, refs[i].patch_offset, 0};
-        buffers->native_allocation_list[i] = {};
-        buffers->native_allocation_list[i].hAllocation = native_token(ctx, refs[i].token)->allocation;
-        buffers->native_allocation_list[i].WriteOperation = (refs[i].flags & 2u) != 0;
-        buffers->native_patch_list[i] = {};
-        buffers->native_patch_list[i].AllocationIndex = i;
-        buffers->native_patch_list[i].AllocationOffset = static_cast<UINT>(refs[i].offset);
-        buffers->native_patch_list[i].PatchOffset = static_cast<UINT>(offset + refs[i].patch_offset);
+        auto *heap = native_token(ctx, refs[i].token);
+        const bool native = heap->flags & MWD_ALLOCATION_NATIVE_SURFACE;
+        const uint32_t index = native ? owned_count + import_indices[i] : owned_index;
+        if (native && imported[import_indices[i]].key) {
+            // Multiple Open associations share one GPU mapping. One wire
+            // reference combines access, but completion retains every token.
+            imported[import_indices[i]].access |= refs[i].flags;
+            buffers->native_allocation_list[index].WriteOperation |= (refs[i].flags & 2u) != 0;
+            continue;
+        }
+        buffers->native_allocation_list[index] = {};
+        buffers->native_allocation_list[index].hAllocation = heap->allocation;
+        buffers->native_allocation_list[index].WriteOperation = (refs[i].flags & 2u) != 0;
+        if (native) {
+            imported[import_indices[i]] = {heap->native_key, heap->address, heap->bytes,
+                ctx->native_adapter->generation, refs[i].flags, index + 1};
+        } else {
+            wire[owned_index++] = {index, refs[i].flags, refs[i].offset, refs[i].length, refs[i].patch_offset, 0};
+            buffers->native_patch_list[index] = {};
+            buffers->native_patch_list[index].AllocationIndex = index;
+            buffers->native_patch_list[index].AllocationOffset = static_cast<UINT>(refs[i].offset);
+            buffers->native_patch_list[index].PatchOffset = static_cast<UINT>(offset + refs[i].patch_offset);
+        }
     }
     D3DDDICB_RENDER args{};
     args.hContext = buffers->native_heap_context; args.CommandLength = static_cast<UINT>(bytes);
-    args.NumAllocations = args.NumPatchLocations = count;
+    args.NumAllocations = allocation_count; args.NumPatchLocations = owned_count;
     args.pNewCommandBuffer = buffers->native_commands; args.NewCommandBufferSize = buffers->native_command_capacity;
     args.pNewAllocationList = buffers->native_allocation_list; args.NewAllocationListSize = buffers->native_allocation_capacity;
     args.pNewPatchLocationList = buffers->native_patch_list; args.NewPatchLocationListSize = buffers->native_patch_capacity;
