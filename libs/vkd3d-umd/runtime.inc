@@ -533,7 +533,13 @@ HRESULT native_load_paired_icd(HMODULE *module, PFN_vkGetInstanceProcAddr *loade
     if (!n || n >= MAX_PATH) return E_FAIL;
     wchar_t *slash = wcsrchr(path, L'\\');
     if (!slash || (slash - path) + 32 >= MAX_PATH) return E_FAIL;
+#if defined(__aarch64__) || defined(_M_ARM64)
     wcscpy(slash + 1, L"viogpud3d12_vk_arm64.dll");
+#elif defined(__x86_64__) || defined(_M_X64)
+    wcscpy(slash + 1, L"viogpud3d12_vk_x64.dll");
+#else
+    wcscpy(slash + 1, L"viogpud3d12_vk_x86.dll");
+#endif
     if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
     HMODULE icd = LoadLibraryExW(path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
     if (!icd) return HRESULT_FROM_WIN32(GetLastError());
