@@ -521,7 +521,8 @@ void APIENTRY native_report(void *opaque, HRESULT hr) {
         ctx->runtime_callbacks.pfnSetErrorCb(ctx->runtime_device, hr);
 }
 
-// The packaged UMD ships its paired Turnip ICD (runtime ABI) beside itself.
+// The packaged UMD ships its paired Turnip ICD (runtime ABI) beside itself as
+// viogpud3d12_vk_arm64.dll (distinct from the GL stack's viogpu_gl_vk_arm64.dll).
 // Use it directly: no loader, no process environment, works elevated.
 HRESULT native_load_paired_icd(HMODULE *module, PFN_vkGetInstanceProcAddr *loader) {
     HMODULE self = nullptr;
@@ -532,7 +533,7 @@ HRESULT native_load_paired_icd(HMODULE *module, PFN_vkGetInstanceProcAddr *loade
     if (!n || n >= MAX_PATH) return E_FAIL;
     wchar_t *slash = wcsrchr(path, L'\\');
     if (!slash || (slash - path) + 32 >= MAX_PATH) return E_FAIL;
-    wcscpy(slash + 1, L"viogpu_gl_vk_arm64.dll");
+    wcscpy(slash + 1, L"viogpud3d12_vk_arm64.dll");
     if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
     HMODULE icd = LoadLibraryExW(path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
     if (!icd) return HRESULT_FROM_WIN32(GetLastError());
