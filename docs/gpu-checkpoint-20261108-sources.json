@@ -1,0 +1,213 @@
+[
+  {
+    "path": ".github/workflows/viogpu-native-umd.yml",
+    "mode": "100644",
+    "bytes": 10085,
+    "sha256": "b6a2946f3b004e25768f7fc2bc21bd0b937effb7833dbe23cf0934c2260586e0"
+  },
+  {
+    "path": "cross-x64.ini",
+    "mode": "100644",
+    "bytes": 1599,
+    "sha256": "adb8ca5626ea5ccea6d8239317626cd8e3197127c8cda92428a450f8d92291ae"
+  },
+  {
+    "path": "cross-x86.ini",
+    "mode": "100644",
+    "bytes": 1583,
+    "sha256": "a3b700192697472cb6ba35c6b44bc613281d57e54e5f99a46b3fe9cafa7a3c39"
+  },
+  {
+    "path": "libs/vkd3d-umd/allocator_submission_test.c",
+    "mode": "100644",
+    "bytes": 18570,
+    "sha256": "5dd9b7e0f9ece6d26ec6ceb908e9a77fd78559ca60465d5212909ba5c21d0c59"
+  },
+  {
+    "path": "libs/vkd3d-umd/allocator_submission_test.py",
+    "mode": "100644",
+    "bytes": 3342,
+    "sha256": "6faef8d3e2a2c3227ace69fc7992e8f62b3c35f65f2e0d554f4676cc3abd873d"
+  },
+  {
+    "path": "libs/vkd3d-umd/backend_test.c",
+    "mode": "100644",
+    "bytes": 66860,
+    "sha256": "4c695dce3c51df0a5e3ac1f8c14906332ce0f2532dbe20d56b260912b6249dde"
+  },
+  {
+    "path": "libs/vkd3d-umd/ddi_0108.inc",
+    "mode": "100644",
+    "bytes": 47094,
+    "sha256": "c1006258012371a85bab2264a3c684b2381030fdcec6d567b73ce8e5982e9363"
+  },
+  {
+    "path": "libs/vkd3d-umd/native_heap.inc",
+    "mode": "100644",
+    "bytes": 44295,
+    "sha256": "eff2cb1687a3f02005f9f23af2779976e58c24ecf80862486e45969bb5544121"
+  },
+  {
+    "path": "libs/vkd3d-umd/native_primary.inc",
+    "mode": "100644",
+    "bytes": 10397,
+    "sha256": "85d6873d156ae2d6fb2b5d0d1d159e796d16949bf5f51b68d6532b599c68711e"
+  },
+  {
+    "path": "libs/vkd3d-umd/queue_worker_test.c",
+    "mode": "100644",
+    "bytes": 8122,
+    "sha256": "dddd6951890e9f1517e10c083de181791d4b5d8c9ae157c22537ff337a4bdfc6"
+  },
+  {
+    "path": "libs/vkd3d-umd/queue_worker_test.py",
+    "mode": "100644",
+    "bytes": 3250,
+    "sha256": "3ecda6ee405b5bcdcacfa4f57e7f8309353b31e221e38726cf3527a650ae1efb"
+  },
+  {
+    "path": "libs/vkd3d-umd/runtime.inc",
+    "mode": "100644",
+    "bytes": 57394,
+    "sha256": "9f414e39acc43bf1c03ec0400c8f6dfca53b6753df9bc812af8a1ef389278157"
+  },
+  {
+    "path": "libs/vkd3d-umd/runtime_fences_test.inc",
+    "mode": "100644",
+    "bytes": 10115,
+    "sha256": "d09127fdafb3d8dc6cd57b5428f23750c7a28f3ce855582ce99034ba1f9900fb"
+  },
+  {
+    "path": "libs/vkd3d-umd/runtime_indirect_test.inc",
+    "mode": "100644",
+    "bytes": 9645,
+    "sha256": "81cf4767421ed118ffd4e7d35341b924b057b3f44a6dcd128b036cd7c9533ce6"
+  },
+  {
+    "path": "libs/vkd3d-umd/runtime_memory_caps_test.inc",
+    "mode": "100644",
+    "bytes": 9336,
+    "sha256": "beaf02097d2f1d5313ad45eee2655a4609259c2c6c7c43d7aa4723c3c093f44a"
+  },
+  {
+    "path": "libs/vkd3d-umd/runtime_msaa_test.inc",
+    "mode": "100644",
+    "bytes": 10794,
+    "sha256": "13c12c9df8ab1384233a06a36e4ec8033ba6102e51b8da7e10ca02d2b5e7e5df"
+  },
+  {
+    "path": "libs/vkd3d-umd/runtime_native_present_test.inc",
+    "mode": "100644",
+    "bytes": 11183,
+    "sha256": "49f1312427cec7ebaa50cf83eca14e392facaf1d91a6c75d6b446efe6933395b"
+  },
+  {
+    "path": "libs/vkd3d-umd/runtime_native_surface_test.inc",
+    "mode": "100644",
+    "bytes": 29325,
+    "sha256": "2b5222eba1af49d74bccbd81f2610898983876683963677edcbffda4cac49dcd"
+  },
+  {
+    "path": "libs/vkd3d-umd/runtime_pageable_destroy_test.inc",
+    "mode": "100644",
+    "bytes": 7591,
+    "sha256": "1da9b7d6d8c866d55dab8bca488ab560a8a968e7698fe6d360b025c898de2708"
+  },
+  {
+    "path": "libs/vkd3d-umd/runtime_placement_padding_test.inc",
+    "mode": "100644",
+    "bytes": 7181,
+    "sha256": "17e285df55bd6f7496e8a02d44b89946957f1584cd0409ae34aebbf2d2a2ae32"
+  },
+  {
+    "path": "libs/vkd3d-umd/runtime_proxy_queue_test.inc",
+    "mode": "100644",
+    "bytes": 5577,
+    "sha256": "422be8452dcdf00e76825e473ec4e0ed3a6a912ae213227cd24187db5d479289"
+  },
+  {
+    "path": "libs/vkd3d-umd/runtime_residency_test.inc",
+    "mode": "100644",
+    "bytes": 25434,
+    "sha256": "5df6f96fb1852fc68d989b877bb12e2f1c1d508253ecd039b25c990ccdeb05b9"
+  },
+  {
+    "path": "libs/vkd3d-umd/runtime_test.cpp",
+    "mode": "100644",
+    "bytes": 135624,
+    "sha256": "8d537114c8d98a1876acbdce1a1cacd2371b7f27701218da7442d659b7237285"
+  },
+  {
+    "path": "libs/vkd3d-umd/runtime_textures_test.inc",
+    "mode": "100644",
+    "bytes": 20474,
+    "sha256": "183bc5faeced07c779f52415653cbfdd9000f3f5a158819333f2ee771b0c59c4"
+  },
+  {
+    "path": "libs/vkd3d-umd/system_d3d12_probe.cpp",
+    "mode": "100644",
+    "bytes": 14715,
+    "sha256": "1cab3508dbd9fb38caef36769d3e698f221c863e71f0b46160a7e550f3ff8c41"
+  },
+  {
+    "path": "libs/vkd3d/command.c",
+    "mode": "100644",
+    "bytes": 1187707,
+    "sha256": "5c986be8437db1a492ac4b47986e9ac694ca6ef98278c016fc0f6b87457f91f8"
+  },
+  {
+    "path": "libs/vkd3d/device.c",
+    "mode": "100644",
+    "bytes": 553228,
+    "sha256": "8f9c741a0611cd9de36cf91c3b783f3949d9b0b9c9e88486f6a6db66ce5c986e"
+  },
+  {
+    "path": "tests-system/d3d12-depth.cpp",
+    "mode": "100644",
+    "bytes": 13004,
+    "sha256": "9215e830ca74266f0d8ee3b079be9c64fd7f55fb8241d75a6ecda2b04b117e99"
+  },
+  {
+    "path": "tests-system/d3d12-dxil.cpp",
+    "mode": "100644",
+    "bytes": 12477,
+    "sha256": "b5dd6ce21bd553c63072c14f5974026220f38ad6797d57d066091a9b4df13993"
+  },
+  {
+    "path": "tests-system/d3d12-swapchain.cpp",
+    "mode": "100644",
+    "bytes": 9860,
+    "sha256": "3363a6ce7540126987b802aba129bb189c7a9ff1c0abd18e1e6e66cd640177e5"
+  },
+  {
+    "path": "tests-system/d3d12-triangle.cpp",
+    "mode": "100644",
+    "bytes": 9823,
+    "sha256": "693bd9c71225a14a92b7fb19f159260ea81e3887819f5d375b66203548fbc77e"
+  },
+  {
+    "path": "tests-system/probe_identity.h",
+    "mode": "100644",
+    "bytes": 6235,
+    "sha256": "a616fa55a0eaac8b83c4f6957c5c9d6e5add04451aae5efd7cf8414f3f6d7e39"
+  },
+  {
+    "path": "tests/d3d12_device.c",
+    "mode": "100644",
+    "bytes": 123296,
+    "sha256": "d4b39de5c9c6e61cce36d1bb0ee77f1ae1a5344f6d2c571e66fda58375efe8da"
+  },
+  {
+    "path": "tools/package-windows-umd.py",
+    "mode": "100644",
+    "bytes": 13323,
+    "sha256": "b7039f0fdf51d2822a28ebeb064f4649c05f177c2cda1d8307e86276588302ac"
+  },
+  {
+    "path": "docs/vkd3d-aio56-depth-init-20261107.md",
+    "mode": "100644",
+    "bytes": 6215,
+    "sha256": "098d040cd78e8c96517cd7308b653c846a739e52f4979681e885a4145fd702c6",
+    "publication_metadata": true
+  }
+]

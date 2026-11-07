@@ -1,6 +1,6 @@
 // System D3D12 DXIL (SM6) graphics probe: same clear + draw + copy check as d3d12-triangle,
 // with shaders compiled by DXC (vs_6_0/ps_6_0).
-// Usage: d3d12-dxil.exe <luid-low-hex> [dxcompiler.dll path] [shader model, e.g. 6_0]
+// Usage: d3d12-dxil.exe <luid-low-hex> <absolute-dxcompiler.dll-path> <sha256> [6_0]
 #include <windows.h>
 #include <dxgi1_4.h>
 #include <d3d12.h>
@@ -8,6 +8,7 @@
 #include <dxcapi.h>
 #include <string>
 #include <wrl/client.h>
+#include "probe_identity.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -29,12 +30,8 @@ static const char *kShaders =
     "}\n"
     "float4 ps_main(VSOut i) : SV_Target { return i.color; }\n";
 
-static HRESULT dxc_compile(const wchar_t *dll, const char *source, const wchar_t *entry, const wchar_t *target,
+static HRESULT dxc_compile(DxcCreateInstanceProc create, const char *source, const wchar_t *entry, const wchar_t *target,
         ComPtr<IDxcBlob> &out) {
-    HMODULE module = LoadLibraryW(dll);
-    if (!module) return HRESULT_FROM_WIN32(GetLastError());
-    auto create = reinterpret_cast<DxcCreateInstanceProc>(GetProcAddress(module, "DxcCreateInstance"));
-    if (!create) return E_NOINTERFACE;
     ComPtr<IDxcCompiler3> compiler;
     HRESULT hr = create(CLSID_DxcCompiler, __uuidof(IDxcCompiler3), (void **)&compiler);
     if (FAILED(hr)) return hr;
@@ -43,7 +40,9 @@ static HRESULT dxc_compile(const wchar_t *dll, const char *source, const wchar_t
     ComPtr<IDxcResult> result;
     hr = compiler->Compile(&buffer, args, 4, nullptr, __uuidof(IDxcResult), (void **)&result);
     if (FAILED(hr)) return hr;
-    HRESULT status = S_OK; result->GetStatus(&status);
+    HRESULT status = E_FAIL;
+    hr = result->GetStatus(&status);
+    if (FAILED(hr)) return hr;
     ComPtr<IDxcBlobEncoding> errors;
     if (SUCCEEDED(result->GetErrorBuffer(&errors)) && errors && errors->GetBufferSize())
         std::printf("DXC: %.*s\n", (int)errors->GetBufferSize(), (const char *)errors->GetBufferPointer());
@@ -52,30 +51,52 @@ static HRESULT dxc_compile(const wchar_t *dll, const char *source, const wchar_t
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) { std::puts("usage: d3d12-dxil <luid-low-hex> [dxcompiler.dll] [6_0]"); return 2; }
+    if (argc < 4 || argc > 5) { std::puts("usage: d3d12-dxil <luid-low-hex> <absolute-dxcompiler.dll-path> <sha256> [6_0]"); return 2; }
     setvbuf(stdout, nullptr, _IONBF, 0);
-    const LUID luid{static_cast<DWORD>(std::strtoul(argv[1], nullptr, 16)), 0};
-    std::wstring dll = L"C:\\Program Files (x86)\\Microsoft\\EdgeCore\\156.0.4314.58\\dxcompiler.dll";
-    if (argc > 2) { std::string a = argv[2]; dll.assign(a.begin(), a.end()); }
-    std::wstring model = L"6_0";
-    if (argc > 3) { std::string a = argv[3]; model.assign(a.begin(), a.end()); }
+    unsigned low = 0;
+    CHECK(probe_parse_uint(argv[1], 16, 0, UINT_MAX, &low), "adapter LUID argument");
+    const LUID luid{static_cast<DWORD>(low), 0};
+    CHECK(probe_system_module(L"d3d12.dll", "D3D12"), "System32 d3d12 identity");
+    CHECK(probe_system_module(L"dxgi.dll", "DXGI"), "System32 dxgi identity");
+    std::wstring dll;
+    CHECK(probe_widen(argv[2], dll), "compiler UTF-8 path");
+    HANDLE retained_compiler = INVALID_HANDLE_VALUE;
+    CHECK(probe_open_hashed_compiler(dll.c_str(), argv[3], &retained_compiler), "compiler SHA256 identity");
+    HMODULE module = LoadLibraryExW(dll.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!module) return fail("LoadLibraryEx(dxcompiler)", HRESULT_FROM_WIN32(GetLastError()));
+    std::wstring loaded_compiler;
+    CHECK(probe_module_path(module, loaded_compiler), "loaded compiler path");
+    probe_print_path("DXIL_COMPILER", loaded_compiler);
+    if (_wcsicmp(dll.c_str(), loaded_compiler.c_str())) return fail("loaded compiler path identity", E_ACCESSDENIED);
+    auto create = reinterpret_cast<DxcCreateInstanceProc>(GetProcAddress(module, "DxcCreateInstance"));
+    if (!create) return fail("GetProcAddress(DxcCreateInstance)", E_NOINTERFACE);
+    const std::wstring model = L"6_0";
+    if (argc > 4 && std::strcmp(argv[4], "6_0")) return fail("bounded shader model requires 6_0", E_INVALIDARG);
     const std::wstring vs_target = L"vs_" + model, ps_target = L"ps_" + model;
     ComPtr<IDxcBlob> vs, ps;
     ComPtr<ID3DBlob> errors;
-    CHECK(dxc_compile(dll.c_str(), kShaders, L"vs_main", vs_target.c_str(), vs), "DXC(vs)");
-    CHECK(dxc_compile(dll.c_str(), kShaders, L"ps_main", ps_target.c_str(), ps), "DXC(ps)");
-    std::printf("PASS dxc vs=%zu ps=%zu bytes\n", (size_t)vs->GetBufferSize(), (size_t)ps->GetBufferSize());
+    CHECK(dxc_compile(create, kShaders, L"vs_main", vs_target.c_str(), vs), "DXC(vs)");
+    CHECK(dxc_compile(create, kShaders, L"ps_main", ps_target.c_str(), ps), "DXC(ps)");
+    if (HMODULE validator = GetModuleHandleW(L"dxil.dll")) {
+        std::wstring validator_path;
+        CHECK(probe_module_path(validator, validator_path), "loaded DXIL validator path");
+        probe_print_path("DXIL_VALIDATOR", validator_path);
+    } else std::puts("MODULE DXIL_VALIDATOR not separately loaded");
+    std::printf("PASS dxc model=6_0 vs=%zu ps=%zu bytes\n", (size_t)vs->GetBufferSize(), (size_t)ps->GetBufferSize());
 
     ComPtr<IDXGIFactory4> factory;
     CHECK(CreateDXGIFactory1(IID_PPV_ARGS(&factory)), "CreateDXGIFactory1");
     ComPtr<IDXGIAdapter1> adapter;
     CHECK(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&adapter)), "EnumAdapterByLuid");
+    CHECK(probe_hardware_adapter(adapter.Get(), luid), "hardware adapter identity");
     ComPtr<ID3D12Device> device;
     CHECK(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)), "D3D12CreateDevice");
+    CHECK(probe_driver_modules(), "loaded UMD/ICD identity");
     std::puts("PASS device");
-    D3D12_FEATURE_DATA_SHADER_MODEL sm{D3D_SHADER_MODEL_6_7};
-    const HRESULT smhr = device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm));
-    std::printf("SHADER_MODEL hr=%08lx highest=%x\n", (unsigned long)smhr, (unsigned)sm.HighestShaderModel);
+    D3D12_FEATURE_DATA_SHADER_MODEL sm{D3D_SHADER_MODEL_6_0};
+    CHECK(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm)), "SM6 feature support");
+    std::printf("SHADER_MODEL requested=60 highest=%x\n", static_cast<unsigned>(sm.HighestShaderModel));
+    if (sm.HighestShaderModel < D3D_SHADER_MODEL_6_0) return fail("SM6 feature support", E_NOINTERFACE);
 
     D3D12_COMMAND_QUEUE_DESC qd{}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     ComPtr<ID3D12CommandQueue> queue; CHECK(device->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue)), "CreateCommandQueue");
@@ -147,10 +168,13 @@ int main(int argc, char **argv) {
     queue->ExecuteCommandLists(1, lists);
     ComPtr<ID3D12Fence> fence; CHECK(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "CreateFence");
     HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!event) return fail("CreateEvent", HRESULT_FROM_WIN32(GetLastError()));
     CHECK(queue->Signal(fence.Get(), 1), "Signal");
     CHECK(fence->SetEventOnCompletion(1, event), "SetEventOnCompletion");
     if (WaitForSingleObject(event, 10000) != WAIT_OBJECT_0) return fail("GPU timeout", E_FAIL);
     CHECK(device->GetDeviceRemovedReason(), "GetDeviceRemovedReason");
+    if (fence->GetCompletedValue() != 1) return fail("completed fence value", E_FAIL);
+    CloseHandle(event);
     std::puts("PASS execution");
 
     const unsigned char *pixels = nullptr;
@@ -167,8 +191,10 @@ int main(int argc, char **argv) {
         if (out) { ++outside; if (v != cleared) { if (bad++ < 8) std::printf("MISMATCH out (%u,%u)=%08x\n", x, y, v); } }
     }
     std::printf("PIXELS corner(0,0)=%08x corner(63,63)=%08x inside=%u outside=%u bad=%u\n", px(0, 0), px(63, 63), inside, outside, bad);
-    readback->Unmap(0, nullptr);
+    const D3D12_RANGE no_write{0, 0};
+    readback->Unmap(0, &no_write);
     if (bad) return fail("pixel verification", E_FAIL);
+    CloseHandle(retained_compiler);
     std::puts("PASS D3D12 DXIL TRIANGLE clear+draw+copy");
     return 0;
 }

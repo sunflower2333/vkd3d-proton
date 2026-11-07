@@ -380,16 +380,13 @@ HRESULT native_experimental_caps(const D3D12DDIARG_GETCAPS &request, uint32_t sh
     }
 }
 HRESULT APIENTRY native_caps(D3D12DDI_HADAPTER handle, const D3D12DDIARG_GETCAPS *args) {
+    if (!native_adapter(handle) || !args) return E_INVALIDARG;
+    // Callbacks may release the runtime's request and info storage. Capture
+    // only scalar log fields at entry; opaque pInfo belongs to validation.
+    const auto type = args->Type;
+    const UINT bytes = args->DataSize;
     const HRESULT hr = native_caps_impl(handle, args);
-    if (args) {
-        UINT first = 0;
-        if (args->pInfo) std::memcpy(&first, args->pInfo, sizeof(first));
-        UINT second = 0;
-        if (args->pInfo && args->Type == D3D12DDICAPS_TYPE_TEXTURE_LAYOUT_SETS)
-            std::memcpy(&second, static_cast<const UINT *>(args->pInfo) + 1, sizeof(second));
-        native_trace("GetCaps type=%u info=%u,%u size=%u hr=%08x", (unsigned)args->Type, first, second,
-            (unsigned)args->DataSize, (unsigned)hr);
-    }
+    native_trace("GetCaps type=%u size=%u hr=%08x", (unsigned)type, (unsigned)bytes, (unsigned)hr);
     return hr;
 }
 HRESULT native_caps_impl(D3D12DDI_HADAPTER handle, const D3D12DDIARG_GETCAPS *args) {

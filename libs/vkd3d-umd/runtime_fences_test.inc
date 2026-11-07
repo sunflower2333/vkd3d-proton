@@ -50,7 +50,7 @@ static int test_native_fences() {
     D3D12DDIARG_CREATE_FENCE args{1, &description};
     const auto initial_references = ctx->references.load();
     REQUIRE(table.pfnCalcPrivateFenceSize(create.hDrvDevice, &args) == sizeof(NativeFenceSlot));
-    REQUIRE(!table.pfnCalcPrivateFenceSize(create.hDrvDevice, nullptr));
+    REQUIRE(table.pfnCalcPrivateFenceSize(create.hDrvDevice, nullptr) == sizeof(NativeFenceSlot));
     REQUIRE(table.pfnCreateFence(create.hDrvDevice, handle, nullptr) == E_INVALIDARG);
     args.FenceCount = 0;
     REQUIRE(table.pfnCreateFence(create.hDrvDevice, handle, &args) == E_INVALIDARG);
@@ -60,7 +60,9 @@ static int test_native_fences() {
     REQUIRE(table.pfnCreateFence(create.hDrvDevice, handle, &args) == E_INVALIDARG);
     args.Fences = &description; description.Flags = static_cast<D3D12DDI_FENCE_FLAGS>(2);
     REQUIRE(table.pfnCreateFence(create.hDrvDevice, handle, &args) == DXGI_ERROR_UNSUPPORTED);
-    REQUIRE(!table.pfnCalcPrivateFenceSize(create.hDrvDevice, &args));
+    // Invalid descriptions still need private storage; Create must reject
+    // without publishing ownership or modifying the caller's storage.
+    REQUIRE(table.pfnCalcPrivateFenceSize(create.hDrvDevice, &args) == sizeof(NativeFenceSlot));
     for (auto byte : storage) REQUIRE(byte == 0xa5);
     REQUIRE(ctx->references == initial_references && !ctx->native_fences);
     description = original_description;

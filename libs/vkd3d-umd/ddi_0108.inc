@@ -314,7 +314,19 @@ void d0108_allocation_info(const D3D12DDI_RESOURCE_ALLOCATION_INFO &a, D3D12DDI_
     r.ResourceDataAlignment = a.ResourceDataAlignment > UINT32_MAX ? UINT32_MAX : static_cast<UINT32>(a.ResourceDataAlignment);
     r.AdditionalDataHeaderAlignment = a.AdditionalDataHeaderAlignment1;
     r.AdditionalDataAlignment = a.AdditionalDataAlignment > UINT32_MAX ? UINT32_MAX : static_cast<UINT32>(a.AdditionalDataAlignment);
+    // Empty auxiliary regions have no placement restriction. Publish the
+    // identity alignment, rather than zero, for runtime alignment arithmetic.
+    // Keep every nonempty region and explicit nonzero alignment unchanged.
+    if (!r.AdditionalDataHeaderSize && !r.AdditionalDataHeaderAlignment) r.AdditionalDataHeaderAlignment = 1;
+    if (!r.AdditionalDataSize && !r.AdditionalDataAlignment) r.AdditionalDataAlignment = 1;
     r.Layout = a.Layout; r.MipLevelSwizzleTransition[0] = a.MipLevelSwizzleTransition;
+    native_trace("AllocationInfo0022 data=%llu/%u header=%llu/%u extra=%llu/%u layout=%u mips=%u,%u,%u,%u,%u planes=%u,%u",
+        (unsigned long long)r.ResourceDataSize, r.ResourceDataAlignment,
+        (unsigned long long)r.AdditionalDataHeaderSize, r.AdditionalDataHeaderAlignment,
+        (unsigned long long)r.AdditionalDataSize, r.AdditionalDataAlignment, (unsigned)r.Layout,
+        r.MipLevelSwizzleTransition[0], r.MipLevelSwizzleTransition[1], r.MipLevelSwizzleTransition[2],
+        r.MipLevelSwizzleTransition[3], r.MipLevelSwizzleTransition[4],
+        r.PlaneSliceSwizzleTransition[0], r.PlaneSliceSwizzleTransition[1]);
     *out = r;
 }
 VOID APIENTRY d0108_check_allocation(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREATERESOURCE_0088 *resource,

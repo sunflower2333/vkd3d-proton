@@ -101,6 +101,8 @@ static void wait_backend_worker(const mwd_callbacks *callbacks, void *owner, boo
     worker.join(); CloseHandle(done);
 }
 struct TestDevice { const mwd_callbacks *callbacks; void *owner; };
+static std::set<TestDevice *> test_device_peers;
+static uint32_t test_device_shader_model(vkdu_device *device);
 static HMODULE WINAPI test_load(LPCWSTR name, HANDLE, DWORD flags) {
     if (std::wcscmp(name, L"vulkan-1.dll") || flags != LOAD_LIBRARY_SEARCH_SYSTEM32) fixture_abort(__LINE__);
     ++loads;
@@ -121,7 +123,11 @@ static int32_t test_create(PFN_vkGetInstanceProcAddr loader, const vkdu_memory_e
     if (FAILED(memory_hr)) return memory_hr;
     if (!vkdu_memory_facts_qualified(facts)) return DXGI_ERROR_UNSUPPORTED;
     ++creates; *out = nullptr;
-    if (SUCCEEDED(backend_result)) *out = reinterpret_cast<vkdu_device *>(new TestDevice{callbacks, owner});
+    if (SUCCEEDED(backend_result)) {
+        auto *peer = new TestDevice{callbacks, owner};
+        test_device_peers.insert(peer);
+        *out = reinterpret_cast<vkdu_device *>(peer);
+    }
     if (memory_create_callback) { auto callback = memory_create_callback; callback(); }
     if (reset_during_create) ++generation;
     return backend_result;
@@ -129,8 +135,10 @@ static int32_t test_create(PFN_vkGetInstanceProcAddr loader, const vkdu_memory_e
 static void test_destroy(vkdu_device *device) {
     if (device) {
         auto *peer = reinterpret_cast<TestDevice *>(device);
+        if (!test_device_peers.count(peer)) fixture_abort(__LINE__);
         if (backend_destructor_check) backend_destructor_check(peer->callbacks, peer->owner);
         else wait_backend_worker(peer->callbacks, peer->owner);
+        test_device_peers.erase(peer);
         ++destroys; delete peer;
     }
 }
@@ -247,6 +255,7 @@ static DWORD WINAPI test_event_wait(HANDLE event, DWORD timeout) {
 #define vkdu_query_adapter_memory_facts test_memory_query
 #define vkdu_device_create_shared_native test_create_native
 #define vkdu_device_destroy test_destroy
+#define vkdu_device_shader_model test_device_shader_model
 #define vkdu_device_remove test_device_remove
 #define vkdu_memory_heap_import test_import_heap
 #define vkdu_native_image_import test_native_image_import
@@ -295,6 +304,17 @@ static DWORD WINAPI test_event_wait(HANDLE event, DWORD timeout) {
 #define VKDU_TEST_NATIVE_SURFACE_CONTROLS
 #include "ddi.cpp"
 #undef WaitForSingleObject
+
+static uint32_t test_device_shader_model(vkdu_device *device) {
+    auto *peer = reinterpret_cast<TestDevice *>(device);
+    if (!device || !test_device_peers.count(peer) || !peer->owner ||
+            peer->callbacks != &native_runtime_callbacks || !mwd_callbacks_valid(peer->callbacks))
+        fixture_abort(__LINE__);
+    auto *ctx = static_cast<Context *>(peer->owner);
+    if (ctx->backend != device || !ctx->native_adapter) fixture_abort(__LINE__);
+    // API shader-model encoding, matching the production bridge's 0x51 baseline.
+    return 0x51;
+}
 
 #define REQUIRE(x) do { if (!(x)) { std::fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #x); return 1; } } while (0)
 
@@ -728,6 +748,7 @@ static std::function<void()> nested_render, nested_signal;
 static void valid_kernel_callback(HANDLE runtime) {
     if (runtime != expected_device || heap_callbacks_retired) fixture_abort(__LINE__);
 }
+#include "runtime_proxy_queue_test.inc"
 static HRESULT APIENTRY heap_context_create(HANDLE runtime, D3DDDICB_CREATECONTEXT *args) {
     valid_kernel_callback(runtime);
     auto *data = static_cast<NativeContextCreate *>(args->pPrivateDriverData);
@@ -748,6 +769,17 @@ static HRESULT APIENTRY heap_context_destroy(HANDLE runtime, const D3DDDICB_DEST
     return S_OK;
 }
 static HRESULT APIENTRY queue_context_create(D3D12DDI_HRTCOMMANDQUEUE runtime, D3DDDICB_CREATECONTEXT *args) {
+    if (proxy_queue_fixture && !args->pPrivateDriverData && !args->PrivateDriverDataSize) {
+        D3DDDICB_CREATECONTEXT expected{}; expected.EngineAffinity = 1;
+        if (!runtime.handle || heap_callbacks_retired || proxy_creating_context ||
+                std::memcmp(args, &expected, sizeof(expected))) fixture_abort(__LINE__);
+        args->hContext = reinterpret_cast<HANDLE>(++next_runtime_context);
+        if (!runtime_contexts.emplace(args->hContext, runtime.handle).second) fixture_abort(__LINE__);
+        ProxyQueueFixture owner{}; owner.runtime = runtime.handle;
+        if (!proxy_contexts.emplace(args->hContext, owner).second) fixture_abort(__LINE__);
+        proxy_creating_context = args->hContext; ++runtime_context_creates;
+        return S_OK; // A standard sync-only context publishes no DMA buffers.
+    }
     auto *data = static_cast<NativeContextCreateShared *>(args->pPrivateDriverData);
     if (!runtime.handle || args->PrivateDriverDataSize != sizeof(*data) ||
             !native_header_valid(data->base.header, sizeof(*data)) || data->base.flags != 1 ||
@@ -764,7 +796,16 @@ static HRESULT APIENTRY queue_context_create(D3D12DDI_HRTCOMMANDQUEUE runtime, D
 }
 static HRESULT APIENTRY queue_context_destroy(D3D12DDI_HRTCOMMANDQUEUE runtime, const D3DDDICB_DESTROYCONTEXT *args) {
     auto found = runtime_contexts.find(args->hContext);
-    if (found == runtime_contexts.end() || found->second != runtime.handle) fixture_abort(__LINE__);
+    if (heap_callbacks_retired || found == runtime_contexts.end() || found->second != runtime.handle) fixture_abort(__LINE__);
+    auto proxy = proxy_contexts.find(args->hContext);
+    if (proxy != proxy_contexts.end()) {
+        auto &owner = proxy->second;
+        if (!proxy_queue_fixture || owner.runtime != runtime.handle || owner.context_destroyed || owner.phase)
+            fixture_abort(__LINE__);
+        owner.context_destroyed = true;
+        if (proxy_creating_context == args->hContext) proxy_creating_context = nullptr;
+        if (!owner.created) proxy_contexts.erase(proxy);
+    }
     runtime_contexts.erase(found); ++runtime_context_destroys;
     return S_OK;
 }
@@ -781,7 +822,8 @@ static HRESULT APIENTRY heap_escape(HANDLE adapter, const D3DDDICB_ESCAPE *args)
         return S_OK;
     }
     auto *info = static_cast<NativeContextInfo *>(args->pPrivateDriverData);
-    if (adapter != expected_adapter || (args->hContext != expected_context && !runtime_contexts.count(args->hContext)) ||
+    if (adapter != expected_adapter || proxy_contexts.count(args->hContext) ||
+            (args->hContext != expected_context && !runtime_contexts.count(args->hContext)) ||
             args->PrivateDriverDataSize != sizeof(*info) ||
             !native_header_valid(info->header, sizeof(*info)) || info->opcode != 1 || info->flags ||
             info->expected_generation != generation || info->va_start || info->va_size || info->generation ||
@@ -957,6 +999,7 @@ static void retire_import_with_map(Context *ctx, const mwd_allocation &allocatio
 
 #include "runtime_resource_queries_test.inc"
 #include "runtime_textures_test.inc"
+#include "runtime_placement_padding_test.inc"
 #include "runtime_buffers_test.inc"
 #include "runtime_alias_test.inc"
 #include "runtime_root_clear_test.inc"
@@ -964,7 +1007,7 @@ static void retire_import_with_map(Context *ctx, const mwd_allocation &allocatio
 #include "runtime_uav_clear_test.inc"
 #include "runtime_predication_test.inc"
 
-static int test_native_heaps() {
+static int test_native_heaps(bool textures_only = false) {
     D3DDDI_ADAPTERCALLBACKS adapter_callbacks{};
     adapter_callbacks.pfnQueryAdapterInfoCb = test_query;
     D3D12DDI_ADAPTERFUNCS adapter{};
@@ -989,6 +1032,15 @@ static int test_native_heaps() {
     D3D12DDI_COMMAND_LIST_FUNCS_3D_0003 commands{};
     D3D12DDI_COMMAND_QUEUE_FUNCS_CORE_0001 queue{};
     REQUIRE(VioGpuD3D12BridgeGetTables(&table, &commands, &queue) == S_OK);
+    if (textures_only) {
+        REQUIRE(test_native_textures(ctx, create.hDrvDevice, table) == 0);
+        REQUIRE(!ctx->native_heaps && kernel_heaps.empty() && kernel_resources.empty());
+        adapter.pfnDestroyDevice(create.hDrvDevice);
+        REQUIRE(!context(create.hDrvDevice));
+        REQUIRE(adapter.pfnCloseAdapter(open.hAdapter) == S_OK);
+        std::puts("PASS NATIVE_TEXTURES actual_UMD=1 controlled_callbacks=1 GPU=0 SYSTEM=0");
+        return 0;
+    }
     D3D12DDIARG_CREATEHEAP_0001 desc{};
     desc.ByteSize = 65536; desc.Alignment = 65536; desc.MemoryPool = D3D12DDI_MEMORY_POOL_L0;
     desc.CPUPageProperty = D3D12DDI_CPU_PAGE_PROPERTY_WRITE_BACK; desc.Flags = D3D12DDI_HEAP_FLAG_BUFFERS;
@@ -1005,8 +1057,17 @@ static int test_native_heaps() {
     auto destroy = [&](D3D12DDI_HHEAP heap) { table.pfnDestroyHeapAndResource(create.hDrvDevice, heap, {}); };
     REQUIRE(table.pfnCalcPrivateHeapAndResourceSizes(create.hDrvDevice, &desc, nullptr).Heap == sizeof(NativeHeapSlot));
     D3D12DDIARG_CREATERESOURCE_0003 resource{};
-    REQUIRE(table.pfnCalcPrivateHeapAndResourceSizes(create.hDrvDevice, &desc, &resource).Heap == 0);
-    REQUIRE(table.pfnCreateHeapAndResource(create.hDrvDevice, &desc, ha, {}, &resource, nullptr, {}) == DXGI_ERROR_UNSUPPORTED);
+    // CalcPrivate reports runtime-owned object storage; Create owns descriptor
+    // validation and must reject this empty resource without publishing a slot.
+    const auto empty_sizes = table.pfnCalcPrivateHeapAndResourceSizes(create.hDrvDevice, &desc, &resource);
+    REQUIRE(empty_sizes.Heap == sizeof(NativeHeapSlot) && empty_sizes.Resource == sizeof(Object));
+    alignas(Object) std::array<unsigned char, sizeof(Object) + 16> empty_resource_storage;
+    empty_resource_storage.fill(0xa5);
+    D3D12DDI_HRESOURCE empty_resource{empty_resource_storage.data()};
+    REQUIRE(table.pfnCreateHeapAndResource(create.hDrvDevice, &desc, ha, {}, &resource, nullptr, empty_resource) == DXGI_ERROR_UNSUPPORTED);
+    REQUIRE(!allocations && !heap_context_creates && !ctx->native_heaps && kernel_heaps.empty() && kernel_resources.empty());
+    for (auto byte : a) REQUIRE(byte == 0xa5);
+    for (auto byte : empty_resource_storage) REQUIRE(byte == 0xa5);
     desc.CPUPageProperty = D3D12DDI_CPU_PAGE_PROPERTY_WRITE_COMBINE;
     REQUIRE(allocate(ha) == DXGI_ERROR_UNSUPPORTED && !allocations);
     desc.CPUPageProperty = D3D12DDI_CPU_PAGE_PROPERTY_WRITE_BACK;
@@ -1125,6 +1186,9 @@ static int test_native_heaps() {
     auto sizes = table.pfnCalcPrivateHeapAndResourceSizes(create.hDrvDevice, &desc, &resource);
     REQUIRE(sizes.Heap == sizeof(NativeHeapSlot) && sizes.Resource == sizeof(Object));
     unsigned before_pair = allocations;
+    desc.ByteSize = UINT64_MAX; // Runtime delegates the committed heap size to the driver.
+    sizes = table.pfnCalcPrivateHeapAndResourceSizes(create.hDrvDevice, &desc, &resource);
+    REQUIRE(sizes.Heap == sizeof(NativeHeapSlot) && sizes.Resource == sizeof(Object) && allocations == before_pair);
     desc.ByteSize = 131072; // Resource requirement remains 64 KiB inside a larger heap.
     REQUIRE(paired() == S_OK && allocations == before_pair + 1 && imports == 1 && placements == 1);
     auto *paired_heap = native_heap_find(ctx, ha.pDrvPrivate);
@@ -1157,8 +1221,13 @@ static int test_native_heaps() {
     // UAV-capable backend usage; cached native buffer UAVs are not implemented.
     resource.InitialResourceState = D3D12DDI_RESOURCE_STATE_UNORDERED_ACCESS;
     before_pair = allocations;
-    REQUIRE(table.pfnCalcPrivateHeapAndResourceSizes(create.hDrvDevice, &desc, &resource).Heap == 0);
+    const auto rejected_heap_storage = a;
+    const auto rejected_resource_storage = resource_storage;
+    sizes = table.pfnCalcPrivateHeapAndResourceSizes(create.hDrvDevice, &desc, &resource);
+    REQUIRE(sizes.Heap == sizeof(NativeHeapSlot) && sizes.Resource == sizeof(Object) && allocations == before_pair);
     REQUIRE(paired() == DXGI_ERROR_UNSUPPORTED && allocations == before_pair);
+    REQUIRE(a == rejected_heap_storage && resource_storage == rejected_resource_storage);
+    REQUIRE(kernel_heaps.empty() && kernel_resources.empty() && !ctx->native_heaps);
     desc.CPUPageProperty = D3D12DDI_CPU_PAGE_PROPERTY_NOT_AVAILABLE;
     sizes = table.pfnCalcPrivateHeapAndResourceSizes(create.hDrvDevice, &desc, &resource);
     REQUIRE(sizes.Heap == sizeof(NativeHeapSlot) && sizes.Resource == sizeof(Object));
@@ -1173,6 +1242,7 @@ static int test_native_heaps() {
     REQUIRE(paired() == DXGI_ERROR_UNSUPPORTED && allocations == before_pair);
     resource.Flags = D3D12DDI_RESOURCE_FLAG_0003_NONE;
     REQUIRE(test_native_buffer_read_states(ctx, create.hDrvDevice, table) == 0);
+    REQUIRE(test_native_placement_padding(ctx, create.hDrvDevice, table) == 0);
     REQUIRE(test_native_buffer_children(ctx, create.hDrvDevice, table) == 0);
     REQUIRE(test_native_textures(ctx, create.hDrvDevice, table) == 0);
     desc.CPUPageProperty = D3D12DDI_CPU_PAGE_PROPERTY_WRITE_BACK;
@@ -1596,7 +1666,8 @@ static int test_native_queue_lifetime() {
     D3D12DDI_COMMAND_LIST_FUNCS_3D_0003 commands{};
     D3D12DDI_COMMAND_QUEUE_FUNCS_CORE_0001 queue{};
     REQUIRE(VioGpuD3D12BridgeGetTables(&table, &commands, &queue) == S_OK);
-    alignas(Object) std::array<unsigned char, sizeof(Object)> queue_memory{}, allocator_memory{}, first{}, second{};
+    alignas(Object) std::array<unsigned char, sizeof(Object) + 16> queue_memory{};
+    alignas(Object) std::array<unsigned char, sizeof(Object)> allocator_memory{}, first{}, second{};
     D3D12DDIARG_CREATECOMMANDQUEUE_0001 request{};
     request.hDrvCommandQueue.pDrvPrivate = queue_memory.data();
     request.QueueFlags = D3D12DDI_COMMAND_QUEUE_FLAG_3D; request.NodeMask = 1;
@@ -1605,14 +1676,37 @@ static int test_native_queue_lifetime() {
     REQUIRE(table.pfnCreateCommandQueue(create.hDrvDevice,&request) == E_INVALIDARG && queue_creates == before_creates);
     for (auto byte : queue_memory) REQUIRE(byte == 0xa5);
     request.hRTCommandQueue.handle = reinterpret_cast<HANDLE>(uintptr_t(0x77110));
-    for (UINT invalid : {0u, 3u, 8u, 0x80000000u}) {
+    // QueueFlags describe compatible engine classes, not an exclusive enum.
+    // Reject zero/reserved/unknown bits, including mixtures with a valid class.
+    for (UINT invalid : {0u, 8u, 9u, 0x80000000u, 0x80000001u}) {
         request.QueueFlags = static_cast<D3D12DDI_COMMAND_QUEUE_FLAGS>(invalid);
         REQUIRE(table.pfnCreateCommandQueue(create.hDrvDevice,&request) == E_INVALIDARG && queue_creates == before_creates);
+        for (auto byte : queue_memory) REQUIRE(byte == 0xa5);
     }
     request.QueueFlags = D3D12DDI_COMMAND_QUEUE_FLAG_3D;
     request.NodeMask = 2;
     REQUIRE(table.pfnCreateCommandQueue(create.hDrvDevice,&request) == E_INVALIDARG && queue_creates == before_creates);
     request.NodeMask = 1;
+    // Literal DDI capability masks and API command types are separate oracles:
+    // 3D|COMPUTE and 3D|COMPUTE|COPY select DIRECT; COMPUTE|COPY selects COMPUTE.
+    const std::pair<UINT, UINT> engines[] = {{3, 0}, {7, 0}, {6, 2}, {2, 2}, {4, 3}};
+    for (const auto &engine : engines) {
+        request.QueueFlags = static_cast<D3D12DDI_COMMAND_QUEUE_FLAGS>(engine.first);
+        const auto created = queue_creates, destroyed = queue_destroys;
+        const auto contexts_created = runtime_context_creates, contexts_destroyed = runtime_context_destroys;
+        REQUIRE(table.pfnCreateCommandQueue(create.hDrvDevice, &request) == S_OK);
+        auto *value = object(queue_memory.data());
+        REQUIRE(value && value->kind == VKDU_QUEUE && value->runtime_queue.handle == request.hRTCommandQueue.handle &&
+            reinterpret_cast<ImportPeer *>(value->backend)->address == engine.second &&
+            value->runtime_route && queue_creates == created + 1 && runtime_context_creates == contexts_created + 1);
+        for (size_t i = sizeof(Object); i < queue_memory.size(); ++i) REQUIRE(queue_memory[i] == 0xa5);
+        table.pfnDestroyCommandQueue(create.hDrvDevice, request.hDrvCommandQueue);
+        REQUIRE(!object(queue_memory.data()) && !ctx->native_queue_objects && !ctx->native_runtime_queues &&
+            queue_destroys == destroyed + 1 && runtime_context_destroys == contexts_destroyed + 1);
+        for (size_t i = sizeof(Object); i < queue_memory.size(); ++i) REQUIRE(queue_memory[i] == 0xa5);
+        queue_memory.fill(0xa5);
+    }
+    request.QueueFlags = D3D12DDI_COMMAND_QUEUE_FLAG_3D;
     queue_create_result = E_OUTOFMEMORY;
     REQUIRE(table.pfnCreateCommandQueue(create.hDrvDevice,&request) == E_OUTOFMEMORY);
     for (auto byte : queue_memory) REQUIRE(byte == 0xa5);
@@ -1909,7 +2003,41 @@ static int test_native_completion() {
 #include "runtime_bundles_test.inc"
 #include "runtime_msaa_test.inc"
 
+static int test_allocation_info_conversion() {
+    D3D12DDI_RESOURCE_ALLOCATION_INFO source{};
+    source.ResourceDataSize = source.ResourceDataAlignment = 65536;
+    source.Layout = D3D12DDI_TL_ROW_MAJOR;
+    D3D12DDI_RESOURCE_ALLOCATION_INFO_0022 actual{};
+    d0108_allocation_info(source, &actual);
+    REQUIRE(actual.ResourceDataSize == 65536 && actual.ResourceDataAlignment == 65536 &&
+        actual.Layout == D3D12DDI_TL_ROW_MAJOR && !actual.AdditionalDataHeaderSize && !actual.AdditionalDataSize &&
+        actual.AdditionalDataHeaderAlignment == 1 && actual.AdditionalDataAlignment == 1);
+    // Explicit auxiliary alignments remain meaningful even for empty regions.
+    source.AdditionalDataHeaderAlignment1 = 16; source.AdditionalDataAlignment = 256;
+    d0108_allocation_info(source, &actual);
+    REQUIRE(actual.ResourceDataSize == 65536 && actual.ResourceDataAlignment == 65536 &&
+        actual.AdditionalDataHeaderAlignment == 16 && actual.AdditionalDataAlignment == 256);
+    source.AdditionalDataHeaderSize = 128; source.AdditionalDataSize = 4096;
+    d0108_allocation_info(source, &actual);
+    REQUIRE(actual.AdditionalDataHeaderSize == 128 && actual.AdditionalDataSize == 4096 &&
+        actual.AdditionalDataHeaderAlignment == 16 && actual.AdditionalDataAlignment == 256);
+    // Do not turn a nonempty region's invalid zero alignment into an accepted
+    // region. The conversion only normalizes absent metadata.
+    source.AdditionalDataHeaderAlignment1 = 0; source.AdditionalDataAlignment = 0;
+    d0108_allocation_info(source, &actual);
+    REQUIRE(actual.ResourceDataSize == 65536 && actual.ResourceDataAlignment == 65536 &&
+        actual.AdditionalDataHeaderSize == 128 && actual.AdditionalDataSize == 4096 &&
+        !actual.AdditionalDataHeaderAlignment && !actual.AdditionalDataAlignment);
+    std::puts("PASS ALLOCATION_INFO_CONVERSION actual_UMD=1 empty_aux_alignment=1 explicit_alignment_preserved=1 GPU=0 SYSTEM=0");
+    return 0;
+}
+
 int main(int argc, char **argv) {
+    if (argc == 2 && !std::strcmp(argv[1], "--native-textures-only")) {
+        std::setvbuf(stdout, nullptr, _IONBF, 0);
+        return test_native_heaps(true);
+    }
+    if (argc == 2 && !std::strcmp(argv[1], "--allocation-info-only")) return test_allocation_info_conversion();
     if (argc == 2 && !std::strcmp(argv[1], "--native-alias-residency-only")) {
         const int result = test_native_surface_provider();
         if (!result) std::puts("PASS NATIVE_ALIAS_RESIDENCY actual_UMD=1 injected_surface_fixture=1 GPU=0 SYSTEM=0");
@@ -1926,6 +2054,7 @@ int main(int argc, char **argv) {
     if (argc == 2 && !std::strcmp(argv[1], "--memory-caps-only")) return test_native_memory_caps();
     if (argc == 2 && !std::strcmp(argv[1], "--memory-facts-only")) return test_native_memory_facts();
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    REQUIRE(test_allocation_info_conversion() == 0);
     if (argc == 2 && !std::strcmp(argv[1], "--adapter-facts-only")) return test_native_adapter_facts();
     if (argc == 2 && !std::strcmp(argv[1], "--msaa-only")) return test_native_msaa_admission();
     if (argc == 2 && !std::strcmp(argv[1], "--negative-control-deferred-backend")) force_deferred_cleanup = true;

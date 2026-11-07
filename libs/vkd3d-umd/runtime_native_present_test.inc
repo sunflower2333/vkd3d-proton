@@ -33,7 +33,9 @@ static int test_native_present_ddi(Context *ctx, D3D12DDI_HDEVICE device,
     D3D12DDI_COMMAND_QUEUE_FUNCS_CORE_0001 queues{};
     REQUIRE(VioGpuD3D12BridgeGetTables(&table, &commands, &queues) == S_OK && commands.pfnPresent &&
         table.pfnGetPresentPrivateDriverDataSize && !native_contract_complete());
-    Object queue_memory{}, allocator_memory{}, command_memory{};
+    GuardedProxyQueue guarded_queue{};
+    auto &queue_memory = guarded_queue.object;
+    Object allocator_memory{}, command_memory{};
     D3D12DDIARG_CREATECOMMANDQUEUE_0001 queue{};
     queue.hDrvCommandQueue.pDrvPrivate = &queue_memory; queue.NodeMask = 1;
     queue.QueueFlags = D3D12DDI_COMMAND_QUEUE_FLAG_3D;
@@ -51,7 +53,13 @@ static int test_native_present_ddi(Context *ctx, D3D12DDI_HDEVICE device,
     REQUIRE(table.pfnCreateCommandList(device, &list) == S_OK);
     auto *route = queue_memory.runtime_route;
     const auto context_handle = route->native_heap_context;
-    REQUIRE(context_handle != expected_context && runtime_contexts.at(context_handle) == queue.hRTCommandQueue.handle);
+    REQUIRE(guarded_queue.intact() && route->proxy && context_handle != expected_context &&
+        runtime_contexts.at(context_handle) == queue.hRTCommandQueue.handle &&
+        proxy_contexts.at(context_handle).runtime == queue.hRTCommandQueue.handle &&
+        proxy_fence_contexts.at(route->hop_in) == context_handle &&
+        proxy_fence_contexts.at(route->hop_out) == context_handle);
+    const auto hop_in = route->hop_in, hop_out = route->hop_out;
+    const auto sync_destroys_before = proxy_sync_destroys;
     D3D12DDI_ARG_PRESENTSURFACE surface{source, 0};
     D3D12DDIARG_PRESENT_0001 args{};
     args.phSurfacesToPresent = &surface; args.SurfacesToPresent = 1; args.Flags.Flip = 1;
@@ -73,7 +81,8 @@ static int test_native_present_ddi(Context *ctx, D3D12DDI_HDEVICE device,
     };
     commands.pfnPresent(list.hDrvCommandList, queue.hDrvCommandQueue, &args, &out);
     REQUIRE(native_present_calls == invokes + 1 && out.AddedGpuWork && out.hSrcAllocation == source_heap->allocation &&
-        !out.hDstAllocation && out.hContext == context_handle && !out.BroadcastContextCount && out.BackBufferMultiplicity == 1);
+        !out.hDstAllocation && out.hContext == ctx->native_heap_context && out.hContext == expected_context &&
+        !out.BroadcastContextCount && out.BackBufferMultiplicity == 1 && guarded_queue.intact());
     for (auto handle : out.BroadcastContext) REQUIRE(!handle);
     REQUIRE(!route->preparing_present && !source_heap->native_mapping->residency_operations);
     args = original; surface = {source, 0};
@@ -145,7 +154,10 @@ static int test_native_present_ddi(Context *ctx, D3D12DDI_HDEVICE device,
     REQUIRE(command_errors.back().second == DXGI_ERROR_DEVICE_REMOVED && !ctx->native_queue_objects && !ctx->native_runtime_queues);
     table.pfnDestroyCommandList(device, list.hDrvCommandList);
     table.pfnDestroyCommandAllocator(device, allocator.hDrvCommandAllocator);
-    REQUIRE(!ctx->native_command_objects && !ctx->native_queue_objects && !ctx->native_runtime_queues);
-    std::printf("PASS native Present DDI: runtime-associated context, actual backend recording dispatch, %zu rejects, request snapshots, reentry, failure rollback, alias close, Execute routing and queue destruction with expired output (controlled backend)\n", invalid.size());
+    REQUIRE(!ctx->native_command_objects && !ctx->native_queue_objects && !ctx->native_runtime_queues &&
+        guarded_queue.intact() && !proxy_contexts.count(context_handle) && !runtime_contexts.count(context_handle) &&
+        !proxy_fence_contexts.count(hop_in) && !proxy_fence_contexts.count(hop_out) &&
+        proxy_sync_destroys == sync_destroys_before + 2);
+    std::printf("PASS native Present DDI: proxy queue identity, owner context output, actual backend recording dispatch, %zu rejects, request snapshots, reentry, failure rollback, alias close, Execute routing and queue/fence destruction with expired output and slot canaries (controlled backend)\n", invalid.size());
     return 0;
 }

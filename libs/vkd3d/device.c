@@ -5282,6 +5282,15 @@ static HRESULT d3d12_device_check_multisample_quality_levels(struct d3d12_device
             data->Format == DXGI_FORMAT_SAMPLER_FEEDBACK_MIP_REGION_USED_OPAQUE)
         goto done;
 
+    /* XR_BIAS is a valid DXGI format, but it has no native Vulkan image
+     * representation in this renderer.  A multisample query for an
+     * unsupported format succeeds and reports no quality levels; treating it
+     * as an unknown format makes otherwise valid D3D12 feature probing fail.
+     * Keep the format out of the ordinary resource table until its biased
+     * encoding and scan-out contract are implemented. */
+    if (data->Format == DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM)
+        goto done;
+
     if (!(format = vkd3d_get_format(device, data->Format, false)))
         format = vkd3d_get_format(device, data->Format, true);
 

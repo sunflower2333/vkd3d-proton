@@ -5,6 +5,7 @@
 #include <d3d12.h>
 #include <d3dcompiler.h>
 #include <wrl/client.h>
+#include "probe_identity.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -27,12 +28,18 @@ static const char *kShaders =
     "float4 ps_main(VSOut i) : SV_Target { return i.color; }\n";
 
 int main(int argc, char **argv) {
-    if (argc < 2) { std::puts("usage: d3d12-triangle <luid-low-hex>"); return 2; }
+    if (argc != 2) { std::puts("usage: d3d12-triangle <luid-low-hex>"); return 2; }
     setvbuf(stdout, nullptr, _IONBF, 0);
-    const LUID luid{static_cast<DWORD>(std::strtoul(argv[1], nullptr, 16)), 0};
-    HMODULE compiler = LoadLibraryW(L"d3dcompiler_47.dll");
+    unsigned low = 0;
+    CHECK(probe_parse_uint(argv[1], 16, 0, UINT_MAX, &low), "adapter LUID argument");
+    const LUID luid{static_cast<DWORD>(low), 0};
+    CHECK(probe_system_module(L"d3d12.dll", "D3D12"), "System32 d3d12 identity");
+    CHECK(probe_system_module(L"dxgi.dll", "DXGI"), "System32 dxgi identity");
+    HMODULE compiler = LoadLibraryExW(L"d3dcompiler_47.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!compiler) return fail("LoadLibrary(d3dcompiler_47)", HRESULT_FROM_WIN32(GetLastError()));
     auto compile = reinterpret_cast<pD3DCompile>(GetProcAddress(compiler, "D3DCompile"));
+    if (!compile) return fail("GetProcAddress(D3DCompile)", E_NOINTERFACE);
+    CHECK(probe_system_module(L"d3dcompiler_47.dll", "DXBC_COMPILER"), "System32 compiler identity");
     ComPtr<ID3DBlob> vs, ps, errors;
     CHECK(compile(kShaders, std::strlen(kShaders), "tri.hlsl", nullptr, nullptr, "vs_main", "vs_5_0", 0, 0, &vs, &errors), "D3DCompile(vs)");
     CHECK(compile(kShaders, std::strlen(kShaders), "tri.hlsl", nullptr, nullptr, "ps_main", "ps_5_0", 0, 0, &ps, &errors), "D3DCompile(ps)");
@@ -41,8 +48,10 @@ int main(int argc, char **argv) {
     CHECK(CreateDXGIFactory1(IID_PPV_ARGS(&factory)), "CreateDXGIFactory1");
     ComPtr<IDXGIAdapter1> adapter;
     CHECK(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&adapter)), "EnumAdapterByLuid");
+    CHECK(probe_hardware_adapter(adapter.Get(), luid), "hardware adapter identity");
     ComPtr<ID3D12Device> device;
     CHECK(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)), "D3D12CreateDevice");
+    CHECK(probe_driver_modules(), "loaded UMD/ICD identity");
     std::puts("PASS device");
 
     D3D12_COMMAND_QUEUE_DESC qd{}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
@@ -115,10 +124,13 @@ int main(int argc, char **argv) {
     queue->ExecuteCommandLists(1, lists);
     ComPtr<ID3D12Fence> fence; CHECK(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "CreateFence");
     HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!event) return fail("CreateEvent", HRESULT_FROM_WIN32(GetLastError()));
     CHECK(queue->Signal(fence.Get(), 1), "Signal");
     CHECK(fence->SetEventOnCompletion(1, event), "SetEventOnCompletion");
     if (WaitForSingleObject(event, 10000) != WAIT_OBJECT_0) return fail("GPU timeout", E_FAIL);
     CHECK(device->GetDeviceRemovedReason(), "GetDeviceRemovedReason");
+    if (fence->GetCompletedValue() != 1) return fail("completed fence value", E_FAIL);
+    CloseHandle(event);
     std::puts("PASS execution");
 
     const unsigned char *pixels = nullptr;
@@ -135,7 +147,8 @@ int main(int argc, char **argv) {
         if (out) { ++outside; if (v != cleared) { if (bad++ < 8) std::printf("MISMATCH out (%u,%u)=%08x\n", x, y, v); } }
     }
     std::printf("PIXELS corner(0,0)=%08x corner(63,63)=%08x inside=%u outside=%u bad=%u\n", px(0, 0), px(63, 63), inside, outside, bad);
-    readback->Unmap(0, nullptr);
+    const D3D12_RANGE no_write{0, 0};
+    readback->Unmap(0, &no_write);
     if (bad) return fail("pixel verification", E_FAIL);
     std::puts("PASS D3D12 TRIANGLE clear+draw+copy");
     return 0;

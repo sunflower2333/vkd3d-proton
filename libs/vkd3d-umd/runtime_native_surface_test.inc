@@ -105,6 +105,7 @@ static HRESULT APIENTRY surface_deallocate2(HANDLE runtime, const D3DDDICB_DEALL
 }
 static HRESULT APIENTRY surface_render(HANDLE runtime, D3DDDICB_RENDER *args) {
     valid_kernel_callback(runtime);
+    proxy_fixture_render(args->hContext);
     if (args->hContext != expected_render_context || args->NumAllocations != 2 || args->NumPatchLocations != 1 ||
             args->CommandOffset || args->Flags.Value) fixture_abort(__LINE__);
     auto *header = static_cast<NativeRenderInfo *>(args->pNewCommandBuffer);
@@ -139,7 +140,9 @@ static HRESULT APIENTRY surface_render(HANDLE runtime, D3DDDICB_RENDER *args) {
 
 static int test_native_surface_provider() {
     native_surface_negative_active = true;
-    REQUIRE(kernel_heaps.empty() && kernel_resources.empty() && pending_events.empty());
+    REQUIRE(kernel_heaps.empty() && kernel_resources.empty() && pending_events.empty() &&
+        proxy_contexts.empty() && proxy_fence_contexts.empty() && !proxy_creating_context && !proxy_submitting_context);
+    proxy_queue_fixture = true;
     D3DDDI_ADAPTERCALLBACKS ac{}; ac.pfnQueryAdapterInfoCb = test_query;
     D3D12DDI_ADAPTERFUNCS adapter{};
     D3D12DDIARG_OPENADAPTER open{};
@@ -151,6 +154,10 @@ static int test_native_surface_provider() {
     kt.pfnDeallocate2Cb = surface_deallocate2;
     kt.pfnLockCb = heap_lock; kt.pfnUnlockCb = heap_unlock; kt.pfnRenderCb = surface_render;
     kt.pfnSignalSynchronizationObject2Cb = heap_signal;
+    kt.pfnCreateSynchronizationObject2Cb = proxy_sync_create;
+    kt.pfnDestroySynchronizationObjectCb = proxy_sync_destroy;
+    kt.pfnSignalSynchronizationObjectFromGpuCb = proxy_gpu_signal;
+    kt.pfnWaitForSynchronizationObjectFromGpuCb = proxy_gpu_wait;
     D3D12DDI_CORELAYER_DEVICECALLBACKS_0003 um{}; um.pfnSetErrorCb = test_error;
     um.pfnCreateContextCb = queue_context_create; um.pfnDestroyContextCb = queue_context_destroy;
     um.pfnSetCommandListErrorCb = test_command_error;
@@ -232,10 +239,44 @@ static int test_native_surface_provider() {
     REQUIRE(native_runtime_release(ctx, heap) == S_OK && heap->users == 1);
     mwd_allocation ordinary{};
     REQUIRE(native_runtime_allocate(ctx, 4096, 4096, 0, 6, &ordinary) == S_OK);
+    GuardedProxyQueue guarded_queue{};
+    D3D12DDIARG_CREATECOMMANDQUEUE_0001 proxy_args{};
+    proxy_args.NodeMask = 1; proxy_args.QueueFlags = D3D12DDI_COMMAND_QUEUE_FLAG_3D;
+    proxy_args.hDrvCommandQueue.pDrvPrivate = &guarded_queue.object;
+    proxy_args.hRTCommandQueue.handle = reinterpret_cast<HANDLE>(uintptr_t(0x99330));
+    const auto contexts_before_proxy = runtime_context_creates, destroys_before_proxy = runtime_context_destroys;
+    const auto syncs_before_proxy = proxy_sync_creates, sync_destroys_before_proxy = proxy_sync_destroys;
+    const auto gpu_signals_before = proxy_gpu_signals, gpu_waits_before = proxy_gpu_waits;
+    for (unsigned failure = 1; failure != 3; ++failure) {
+        fail_proxy_sync_create = failure;
+        std::array<unsigned char, sizeof(Object)> unpublished;
+        std::memcpy(unpublished.data(), &guarded_queue.object, unpublished.size());
+        const HRESULT hr = native_queue_create(ctx, &proxy_args);
+        // This is an exact before/after snapshot of runtime-owned bytes, not
+        // equality between separately initialized C++ objects and their padding.
+        const bool unchanged = !std::memcmp(&guarded_queue.object, unpublished.data(), unpublished.size());
+        std::printf("PROXY_ROLLBACK fence=%u hr=%08x slot_unchanged=%u guards=%u routes_empty=%u contexts_empty=%u fences_empty=%u creating_empty=%u\n",
+            failure, static_cast<unsigned>(hr), unchanged, guarded_queue.intact(), !ctx->native_runtime_queues,
+            proxy_contexts.empty(), proxy_fence_contexts.empty(), !proxy_creating_context);
+        REQUIRE(hr == E_OUTOFMEMORY);
+        REQUIRE(guarded_queue.intact() && unchanged);
+        REQUIRE(!ctx->native_runtime_queues && proxy_contexts.empty() && proxy_fence_contexts.empty() && !proxy_creating_context);
+    }
+    REQUIRE(native_queue_create(ctx, &proxy_args) == S_OK && guarded_queue.intact());
+    auto *proxy_route = guarded_queue.object.runtime_route;
+    REQUIRE(proxy_route && proxy_route->proxy && !proxy_route->pending && proxy_route->hop_in && proxy_route->hop_out &&
+        proxy_route->hop_in != proxy_route->hop_out && proxy_route->native_heap_context != expected_context &&
+        !proxy_route->native_commands && !proxy_route->native_allocation_list && !proxy_route->native_patch_list &&
+        proxy_contexts.at(proxy_route->native_heap_context).runtime == proxy_args.hRTCommandQueue.handle);
     std::array<unsigned char, 16> stream{};
     // Caller order differs from runtime allocation-list order: ordinary first.
     mwd_reference refs[2] = {{heap, 0, 65536, 3, MWD_NATIVE_SURFACE_REFERENCE}, {ordinary.token, 0, 4096, 1, 0}};
-    auto submit = [&]() { return native_runtime_submit(ctx, 1, stream.data(), stream.size(), refs, 2); };
+    auto submit = [&]() {
+        proxy_submitting_context = proxy_route->native_heap_context;
+        const auto hr = native_runtime_submit_queue(ctx, proxy_route, 1, stream.data(), stream.size(), refs, 2);
+        proxy_submitting_context = nullptr;
+        return hr;
+    };
     const auto renders_before = renders;
     refs[0].patch_offset = 0;
     REQUIRE(submit() == E_INVALIDARG && renders == renders_before);
@@ -251,6 +292,10 @@ static int test_native_surface_provider() {
         refs[0] = {}; refs[1] = {}; stream.fill(0xa5);
     };
     REQUIRE(submit() == S_OK && ctx->native_submission_count == 1 && surface_closes == closes_before);
+    REQUIRE(proxy_gpu_signals == gpu_signals_before + 2 && proxy_gpu_waits == gpu_waits_before + 2 &&
+        proxy_route->hop_value == 2 && proxy_route->submissions == 1 &&
+        proxy_contexts.at(proxy_route->native_heap_context).value == 2 &&
+        !proxy_contexts.at(proxy_route->native_heap_context).phase && guarded_queue.intact());
     nested_render = {};
     uint32_t completed = 99;
     REQUIRE(native_runtime_completed(ctx, &completed) == S_OK && !completed && kernel_heaps.count(allocation));
@@ -264,6 +309,13 @@ static int test_native_surface_provider() {
     REQUIRE(native_runtime_completed(ctx, &completed) == S_OK && completed == 1 && !ctx->native_heaps &&
         !ctx->native_submissions && kernel_heaps.empty() && kernel_resources.empty());
     REQUIRE(surface_releases == releases_before_retry && surface_closes == closes_before + 2);
+    REQUIRE(!proxy_route->submissions);
+    native_queue_destroy(ctx, &guarded_queue.object);
+    REQUIRE(guarded_queue.intact() && !ctx->native_queue_objects && !ctx->native_runtime_queues &&
+        proxy_contexts.empty() && proxy_fence_contexts.empty() &&
+        runtime_context_creates == contexts_before_proxy + 3 && runtime_context_destroys == destroys_before_proxy + 3 &&
+        proxy_sync_creates == syncs_before_proxy + 3 && proxy_sync_destroys == sync_destroys_before_proxy + 3);
+    std::puts("PASS CPU proxy queue callbacks: standard context, typed monitored-fence ownership, creation rollback, ordered owner Render hops and slot canaries");
     runtime_close(); defer_completion = false;
 
     // The identity callback may synchronously release the original owner. A
@@ -332,6 +384,7 @@ static int test_native_surface_provider() {
     }
     REQUIRE(kernel_heaps.empty() && kernel_resources.empty());
     REQUIRE(test_native_open_ddi(ctx, create.hDrvDevice) == 0);
+    REQUIRE(proxy_contexts.empty() && proxy_fence_contexts.empty() && !proxy_creating_context);
     std::weak_ptr<NativeAdapter> weak = ctx->native_adapter;
     REQUIRE(adapter.pfnCloseAdapter(open.hAdapter) == S_OK && !weak.expired());
     adapter.pfnDestroyDevice(create.hDrvDevice);
@@ -373,6 +426,7 @@ static int test_native_surface_provider() {
             REQUIRE(ctx->native_heaps && native_runtime_release(ctx, ctx->native_heaps) == S_OK && !ctx->native_heaps);
         release(ctx);
         REQUIRE(weak.expired());
+        REQUIRE(proxy_contexts.empty() && proxy_fence_contexts.empty() && !proxy_creating_context);
         native_surfaces.clear(); surface_associations.clear(); kernel_heaps.clear(); kernel_resources.clear();
         heap_callbacks_retired = false;
     }
@@ -380,6 +434,7 @@ static int test_native_surface_provider() {
     std::puts("PASS native surface cancellation at import/release/deallocate/Open backend: exact termination, no late callback, expired adapter owner");
     std::puts("PASS native surface alias opens: same/distinct handles, independent close, recursive close, merged packet and every token retained");
     native_surface_negative_active = false;
+    proxy_queue_fixture = false;
     native_backend_result = DXGI_ERROR_UNSUPPORTED;
     return 0;
 }

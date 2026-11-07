@@ -28,10 +28,14 @@ static int test_native_indirect() {
     REQUIRE(table.pfnCalcPrivateCommandSignatureSize(create.hDrvDevice, &desc) == sizeof(Object));
     auto make_signature = [&]() { return table.pfnCreateCommandSignature(create.hDrvDevice, &desc, signature_handle); };
     const unsigned old_creates = signature_creates;
+    const auto original_signature = signature;
     for (UINT stride : {0u, 8u, 13u}) {
         desc.ByteStride = stride;
-        REQUIRE(table.pfnCalcPrivateCommandSignatureSize(create.hDrvDevice, &desc) == 0);
+        // Sizing reserves driver storage; Create owns descriptor validation.
+        REQUIRE(table.pfnCalcPrivateCommandSignatureSize(create.hDrvDevice, &desc) == sizeof(Object));
         REQUIRE(make_signature() == E_INVALIDARG);
+        REQUIRE(signature_creates == old_creates && !ctx->indirect_signatures &&
+            !std::memcmp(&signature, &original_signature, sizeof(signature)));
     }
     desc.ByteStride = 16; desc.NodeMask = 2; REQUIRE(make_signature() == E_INVALIDARG);
     desc.NodeMask = 1; desc.NumArgumentDescs = 2; REQUIRE(make_signature() == DXGI_ERROR_UNSUPPORTED);

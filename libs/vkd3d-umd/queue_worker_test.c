@@ -117,7 +117,7 @@ int main(void) {
    expected_token = &second;
    CHECK(d3d12_command_queue_submit_wddm(&second, 123, 1, &info, 0) == VK_SUCCESS);
    int before = submissions;
-   CHECK(d3d12_command_queue_submit_split_locked(&second, 123, 1, &info, 0) == VK_SUCCESS);
+   CHECK(d3d12_command_queue_submit_split_locked_tracked(&second, 123, 1, &info, 0, NULL) == VK_SUCCESS);
    CHECK(submissions == before + 3);
    before = submissions; fail_allocation = allocations + 1;
    CHECK(d3d12_command_queue_submit_wddm(&second, 123, 1, &info, 0) == VK_ERROR_OUT_OF_HOST_MEMORY);

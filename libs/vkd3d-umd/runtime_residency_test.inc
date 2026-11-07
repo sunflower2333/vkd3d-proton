@@ -254,9 +254,13 @@ static int test_native_residency() {
     pageable_tokens.clear();
     REQUIRE(!ctx->query_heaps && !ctx->descriptor_heaps);
     Object rejected_query{}; D3D12DDI_HQUERYHEAP rejected_handle{&rejected_query};
+    const auto original_rejected_query = rejected_query;
+    const auto before_rejected_query_peers = query_peers;
     query_desc.Count = 0;
-    REQUIRE(!table.pfnCalcPrivateQueryHeapSize(create.hDrvDevice, &query_desc));
+    REQUIRE(table.pfnCalcPrivateQueryHeapSize(create.hDrvDevice, &query_desc) == sizeof(Object));
     REQUIRE(table.pfnCreateQueryHeap(create.hDrvDevice, &query_desc, rejected_handle) == E_INVALIDARG);
+    REQUIRE(query_peers == before_rejected_query_peers && !ctx->query_heaps &&
+        !std::memcmp(&rejected_query, &original_rejected_query, sizeof(rejected_query)));
     query_desc.Count = 1; query_desc.Type = static_cast<D3D12DDI_QUERY_HEAP_TYPE>(4);
     REQUIRE(table.pfnCreateQueryHeap(create.hDrvDevice, &query_desc, rejected_handle) == DXGI_ERROR_UNSUPPORTED);
     query_desc.Type = D3D12DDI_QUERY_HEAP_TYPE_TIMESTAMP; query_heap_result = E_OUTOFMEMORY;

@@ -95,8 +95,16 @@ static int test_native_msaa_admission()
             std::printf("PASS MSAA R0 count%u shape/query/4MiB RequestedIova/wire4096/import/rollback/heap-resource lifetime (controlled peers)\n", samples);
         }
         auto rejected = [&](const D3D12DDIARG_CREATEHEAP_0001 &h, const D3D12DDIARG_CREATERESOURCE_0003 &r) {
+            // Private sizes reserve objects even for unsupported descriptions.
+            // Require actual Create rejection, no allocation and untouched slots.
+            hs.fill(0xa5); rs.fill(0xa5);
+            const auto before = allocations;
             const auto sizes = table.pfnCalcPrivateHeapAndResourceSizes(create.hDrvDevice, &h, &r);
-            return !sizes.Heap && !sizes.Resource;
+            return sizes.Heap == sizeof(NativeHeapSlot) && sizes.Resource == sizeof(Object) &&
+                FAILED(table.pfnCreateHeapAndResource(create.hDrvDevice, &h, hh, {}, &r, nullptr, rh)) &&
+                allocations == before && kernel_heaps.empty() && kernel_resources.empty() && !ctx->native_heaps &&
+                std::all_of(hs.begin(), hs.end(), [](unsigned char c) { return c == 0xa5; }) &&
+                std::all_of(rs.begin(), rs.end(), [](unsigned char c) { return c == 0xa5; });
         };
         auto bad_heap = heap; bad_heap.Alignment = 65536; REQUIRE(rejected(bad_heap,resource));
         bad_heap = heap; bad_heap.Alignment = 0; REQUIRE(rejected(bad_heap,resource));

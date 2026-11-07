@@ -146,6 +146,13 @@ vkdu_texture2d_shape native_texture_shape(const D3D12DDIARG_CREATERESOURCE_0003 
 bool native_texture_subresources(const D3D12DDIARG_CREATERESOURCE_0003 &r) {
     return r.ResourceType == D3D12DDI_RT_TEXTURE2D && (r.MipLevels != 1 || r.DepthOrArraySize != 1 || r.SampleDesc.Count != 1);
 }
+bool native_buffer_placement_empty(const D3D12DDIARG_BUFFER_PLACEMENT &placement) {
+    // The i386 ABI pads the 32-bit resource handle before the 64-bit offset.
+    // Padding is not part of the DDI request and need not be initialized by
+    // the runtime or by a field-wise copy of the placement structure.
+    const auto &base = placement.BaseAddress.UMD;
+    return !base.hResource.pDrvPrivate && !base.Offset;
+}
 HRESULT native_heap_desc(const D3D12DDIARG_CREATEHEAP_0001 *heap,
         const D3D12DDIARG_CREATERESOURCE_0003 *resource) {
     // Preserve unsupported-shape rejection before applying the MSAA heap contract.
@@ -167,33 +174,33 @@ HRESULT native_heap_desc(const D3D12DDIARG_CREATEHEAP_0001 *heap,
     if (heap->Flags == D3D12DDI_HEAP_FLAG_NON_RT_DS_TEXTURES || heap->Flags == D3D12DDI_HEAP_FLAG_RT_DS_TEXTURES) {
         const bool rt = heap->Flags == D3D12DDI_HEAP_FLAG_RT_DS_TEXTURES;
         if (!resource || heap->CPUPageProperty != D3D12DDI_CPU_PAGE_PROPERTY_NOT_AVAILABLE) return DXGI_ERROR_UNSUPPORTED;
-        const bool depth = rt && resource->Flags == D3D12DDI_RESOURCE_FLAG_0003_DEPTH_STENCIL;
         const UINT resource_flags = static_cast<UINT>(resource->Flags);
-        const UINT color_flags = resource_flags & ~static_cast<UINT>(D3D12DDI_RESOURCE_FLAG_0003_SHADER_RESOURCE);
-        D3D12DDIARG_BUFFER_PLACEMENT no_reuse{};
+        // The runtime includes SHADER_RESOURCE unless the API denies shader reads.
+        // Normalize this independent binding bit for both color and depth resources.
+        const UINT binding_flags = resource_flags & ~static_cast<UINT>(D3D12DDI_RESOURCE_FLAG_0003_SHADER_RESOURCE);
+        const bool depth = rt && binding_flags == D3D12DDI_RESOURCE_FLAG_0003_DEPTH_STENCIL;
         const auto shape = native_texture_shape(*resource);
         if (resource->ResourceType != D3D12DDI_RT_TEXTURE2D || resource->Width > 16384 ||
                 !vkdu_texture2d_shape_valid(&shape) ||
                 (depth ? !vkdu_depth_format(resource->Format) :
                  resource->Format != DXGI_FORMAT_R32_FLOAT && !vkdu_color_resource_format(resource->Format)) ||
                 (depth && resource->SampleDesc.Count != 1) ||
-                (depth ? resource_flags != 2u : color_flags != (rt ? 1u : 0u)) ||
+                (depth ? binding_flags != 2u : binding_flags != (rt ? 1u : 0u)) ||
                 (rt && !depth && !vkdu_color_resource_format(resource->Format)) || resource->pRowMajorLayout ||
                 (resource->Layout != D3D12DDI_TL_UNDEFINED && resource->Layout != D3D12DDI_TL_DEVICE_DEPENDENT_SWIZZLE_0) ||
-                std::memcmp(&resource->ReuseBufferGPUVA, &no_reuse, sizeof(no_reuse))) return DXGI_ERROR_UNSUPPORTED;
+                !native_buffer_placement_empty(resource->ReuseBufferGPUVA)) return DXGI_ERROR_UNSUPPORTED;
         const UINT state = resource->InitialResourceState;
         if (depth) return !state || state == D3D12DDI_RESOURCE_STATE_DEPTH_WRITE ||
             state == D3D12DDI_RESOURCE_STATE_DEPTH_READ || state == 0x400 || state == 0x800 ? S_OK : DXGI_ERROR_UNSUPPORTED;
         return !state || (rt && state == 4) || state == 0x400 || state == 0x800 || state == 0x40 || state == 0x80 || state == 0xc0 || state == 0x1000 || state == 0x2000 ? S_OK : DXGI_ERROR_UNSUPPORTED;
     }
     if (resource) {
-        D3D12DDIARG_BUFFER_PLACEMENT no_reuse{};
         if (resource->ResourceType != D3D12DDI_RT_BUFFER || !resource->Width || resource->Width > heap->ByteSize ||
                 resource->Height != 1 || resource->DepthOrArraySize != 1 || resource->MipLevels != 1 ||
                 resource->Format != DXGI_FORMAT_UNKNOWN || resource->SampleDesc.Count != 1 || resource->SampleDesc.Quality ||
                 resource->Layout != D3D12DDI_TL_ROW_MAJOR ||
                 (static_cast<UINT>(resource->Flags) & ~static_cast<UINT>(D3D12DDI_RESOURCE_FLAG_0003_SHADER_RESOURCE)) || resource->pRowMajorLayout ||
-                std::memcmp(&resource->ReuseBufferGPUVA, &no_reuse, sizeof(no_reuse))) return DXGI_ERROR_UNSUPPORTED;
+                !native_buffer_placement_empty(resource->ReuseBufferGPUVA)) return DXGI_ERROR_UNSUPPORTED;
         const uint32_t state = static_cast<uint32_t>(resource->InitialResourceState);
         if (!vkdu_buffer_read_state(state) && state != 0x400 && state != D3D12DDI_RESOURCE_STATE_UNORDERED_ACCESS &&
                 state != D3D12DDI_RESOURCE_STATE_STREAM_OUT)
@@ -352,9 +359,12 @@ void APIENTRY native_allocation_info(D3D12DDI_HDEVICE h, const D3D12DDIARG_CREAT
         D3D12DDI_RESOURCE_ALLOCATION_INFO *out) {
     NativeHeapOperation op(context(h));
     if (!op.live()) { error(op.ctx, DXGI_ERROR_DEVICE_REMOVED); return; }
+    // CheckResourceAllocationInfo accepts zero as the single-GPU node mask,
+    // equivalent to bit zero (PFND3D12DDI_CHECKRESOURCEALLOCATIONINFO_0088).
+    const UINT visible_mask = visible ? visible : 1;
     const uint64_t required_alignment = resource && resource->ResourceType == D3D12DDI_RT_TEXTURE2D &&
         resource->SampleDesc.Count > 1 ? 4194304 : native_heap_alignment;
-    if (!resource || !out || visible != 1 || (restriction && restriction != required_alignment)) {
+    if (!resource || !out || visible_mask != 1 || (restriction && restriction != required_alignment)) {
         error(op.ctx, E_INVALIDARG); return;
     }
     auto request = *resource;

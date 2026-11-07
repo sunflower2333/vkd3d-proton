@@ -52,6 +52,39 @@ static int test_native_memory_caps() {
     REQUIRE(loads == bad_loads && memory_queries == bad_queries && queue_protocol_queries == bad_wire);
     std::puts("PASS MEMORY_CAPS bad size/node/null/type/adapter rejected before callbacks or loader");
 
+    // Rejected shapes do not authorize a read of opaque pInfo. PAGE_NOACCESS
+    // makes diagnostic payload reads fail deterministically, including when
+    // the returned HRESULT and output bytes would otherwise look correct.
+    void *inaccessible = VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_NOACCESS);
+    REQUIRE(inaccessible);
+    const std::array<unsigned, 8> rejected_counts{
+        loads, unloads, creates, destroys, query_calls, memory_queries, queue_protocol_queries, error_calls};
+    auto rejected_without_callbacks = [&]() {
+        return rejected_counts == std::array<unsigned, 8>{
+            loads, unloads, creates, destroys, query_calls, memory_queries, queue_protocol_queries, error_calls};
+    };
+    auto inaccessible_info = caps;
+    inaccessible_info.pInfo = inaccessible;
+    for (UINT size : {0u, 4u, 11u, 13u, 16u}) {
+        inaccessible_info.DataSize = size;
+        REQUIRE(table.pfnGetCaps(open.hAdapter, &inaccessible_info) == E_INVALIDARG);
+        REQUIRE(untouched() && rejected_without_callbacks());
+    }
+    inaccessible_info.DataSize = sizeof(output.value);
+    inaccessible_info.Type = static_cast<D3D12DDICAPS_TYPE>(0x7fffffff);
+    REQUIRE(table.pfnGetCaps(open.hAdapter, &inaccessible_info) == DXGI_ERROR_UNSUPPORTED);
+    REQUIRE(untouched() && rejected_without_callbacks());
+    // Even the outer request is unreadable here. An unregistered adapter must
+    // be rejected before scalar logging snapshots or any request validation.
+    auto *inaccessible_request = static_cast<const D3D12DDIARG_GETCAPS *>(inaccessible);
+    REQUIRE(table.pfnGetCaps({}, inaccessible_request) == E_INVALIDARG);
+    REQUIRE(untouched() && rejected_without_callbacks());
+    const D3D12DDI_HADAPTER foreign_adapter{reinterpret_cast<void *>(uintptr_t(1))};
+    REQUIRE(table.pfnGetCaps(foreign_adapter, inaccessible_request) == E_INVALIDARG);
+    REQUIRE(untouched() && rejected_without_callbacks());
+    REQUIRE(VirtualFree(inaccessible, 0, MEM_RELEASE));
+    std::puts("PASS MEMORY_CAPS noaccess pInfo bad-size/unknown-type and invalid-adapter outer request: exact rejection, no payload read, callback/load or output change");
+
     for (uint32_t unknown_mask : {0u, 1u, 2u}) {
         memory_known_mask = unknown_mask;
         REQUIRE(table.pfnGetCaps(open.hAdapter, &caps) == DXGI_ERROR_UNSUPPORTED && untouched());

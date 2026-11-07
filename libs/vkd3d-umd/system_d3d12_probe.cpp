@@ -86,7 +86,24 @@ void fence_test(ID3D12Device *device) {
     require(WaitForSingleObject(event, 10000) == WAIT_OBJECT_0, "fences: final fence release unblocks wait");
     std::puts("PASS PUBLIC_FENCE_LIFECYCLE delayed_queue_completion, CPU_rewind, final_release_event");
 }
+D3D12_RESOURCE_DESC allocation_test(ID3D12Device *device) {
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; desc.Width = 4096;
+    desc.Height = desc.DepthOrArraySize = desc.MipLevels = desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    const auto info = device->GetResourceAllocationInfo(0, 1, &desc);
+    std::printf("PUBLIC_ALLOCATION bytes=%llu alignment=%llu\n", static_cast<unsigned long long>(info.SizeInBytes),
+        static_cast<unsigned long long>(info.Alignment));
+    // This probe requests one plain 4 KiB buffer with default placement. Its
+    // allocation is one 64 KiB placement unit. A merely aligned nonzero result
+    // can still be an invalid size such as UINT64_MAX rounded down to 64 KiB.
+    require(info.SizeInBytes == D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT &&
+        info.Alignment == D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT,
+        "GetResourceAllocationInfo(4KiB buffer requires 64KiB allocation/alignment)");
+    return desc;
+}
 void copy_test(ID3D12Device *device) {
+    const auto desc = allocation_test(device);
     ComPtr<ID3D12CommandQueue> queue;
     D3D12_COMMAND_QUEUE_DESC q{}; q.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     check(device->CreateCommandQueue(&q, IID_PPV_ARGS(&queue)), "CreateCommandQueue");
@@ -94,14 +111,6 @@ void copy_test(ID3D12Device *device) {
     check(device->CreateCommandAllocator(q.Type, IID_PPV_ARGS(&allocator)), "CreateCommandAllocator");
     ComPtr<ID3D12GraphicsCommandList> commands;
     check(device->CreateCommandList(0, q.Type, allocator.Get(), nullptr, IID_PPV_ARGS(&commands)), "CreateCommandList");
-    D3D12_RESOURCE_DESC desc{};
-    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; desc.Width = 4096;
-    desc.Height = desc.DepthOrArraySize = desc.MipLevels = desc.SampleDesc.Count = 1;
-    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    const auto info = device->GetResourceAllocationInfo(0, 1, &desc);
-    require(info.SizeInBytes >= desc.Width && info.SizeInBytes != UINT64_MAX && info.Alignment != 0, "GetResourceAllocationInfo");
-    std::printf("PUBLIC_ALLOCATION bytes=%llu alignment=%llu\n", static_cast<unsigned long long>(info.SizeInBytes),
-        static_cast<unsigned long long>(info.Alignment));
     auto make = [&](D3D12_HEAP_TYPE type, D3D12_RESOURCE_STATES state, ComPtr<ID3D12Resource> &out, const char *stage) {
         D3D12_HEAP_PROPERTIES heap{}; heap.Type = type; heap.CreationNodeMask = heap.VisibleNodeMask = 1;
         check(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr, IID_PPV_ARGS(&out)), stage);
@@ -158,18 +167,25 @@ void copy_test(ID3D12Device *device) {
 }
 
 int main(int argc, char **argv) {
+    enum class Mode { Invalid, List, Warp, Device, Allocation, Copy, Fences };
     uint32_t low = 0, high = 0;
-    const bool list = argc == 2 && !std::strcmp(argv[1], "--list");
-    const bool warp = argc == 2 && !std::strcmp(argv[1], "--run-warp-ci");
-    const bool selected = argc == 6 && !std::strcmp(argv[1], "--luid-low") && !std::strcmp(argv[3], "--luid-high") &&
-        hex32(argv[2], low) && hex32(argv[4], high) && (low | high) &&
-        (!std::strcmp(argv[5], "--run-device") || !std::strcmp(argv[5], "--run-copy") || !std::strcmp(argv[5], "--run-fences"));
-    if (!list && !warp && !selected) {
+    Mode mode = Mode::Invalid;
+    if (argc == 2 && !std::strcmp(argv[1], "--list")) mode = Mode::List;
+    else if (argc == 2 && !std::strcmp(argv[1], "--run-warp-ci")) mode = Mode::Warp;
+    else if (argc == 6 && !std::strcmp(argv[1], "--luid-low") && !std::strcmp(argv[3], "--luid-high") &&
+            hex32(argv[2], low) && hex32(argv[4], high) && (low | high)) {
+        if (!std::strcmp(argv[5], "--run-device")) mode = Mode::Device;
+        else if (!std::strcmp(argv[5], "--run-allocation")) mode = Mode::Allocation;
+        else if (!std::strcmp(argv[5], "--run-copy")) mode = Mode::Copy;
+        else if (!std::strcmp(argv[5], "--run-fences")) mode = Mode::Fences;
+    }
+    if (mode == Mode::Invalid) {
         std::fputs("usage: vkd3d-system-d3d12-probe --list\n"
-            "       vkd3d-system-d3d12-probe --luid-low HEX --luid-high HEX --run-device|--run-copy|--run-fences\n"
+            "       vkd3d-system-d3d12-probe --luid-low HEX --luid-high HEX --run-device|--run-allocation|--run-copy|--run-fences\n"
             "       --run-warp-ci is explicit CPU harness validation only; never target GPU acceptance\n", stderr);
         return 2;
     }
+    const bool list = mode == Mode::List, warp = mode == Mode::Warp;
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::printf("BOUNDARY ordinary system D3D12 application APIs, mode=%s, pointer_bits=%zu\n",
         list ? "list" : warp ? "CPU_WARP_HARNESS_ONLY" : argv[5], sizeof(void *) * 8);
@@ -202,8 +218,12 @@ int main(int argc, char **argv) {
         const LUID actual = device->GetAdapterLuid();
         require(actual.LowPart == desc.AdapterLuid.LowPart && actual.HighPart == desc.AdapterLuid.HighPart, "device adapter LUID");
         std::puts("PASS PUBLIC_D3D12_DEVICE requested_feature_level=11_0");
-        if (warp || !std::strcmp(argv[5], "--run-fences")) fence_test(device.Get());
-        if (warp || !std::strcmp(argv[5], "--run-copy")) {
+        if (mode == Mode::Allocation) {
+            allocation_test(device.Get());
+            std::puts("PASS PUBLIC_D3D12_ALLOCATION bytes=65536 alignment=65536 queues=0 submissions=0");
+        }
+        if (warp || mode == Mode::Fences) fence_test(device.Get());
+        if (warp || mode == Mode::Copy) {
             copy_test(device.Get());
             std::puts(warp ? "PASS CPU_WARP_HARNESS_ONLY 4x1024 words; no VIOGPU acceptance" :
                 "PASS PUBLIC_D3D12_COPY 4x1024 words; graphics/Present not tested");

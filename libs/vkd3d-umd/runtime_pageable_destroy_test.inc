@@ -33,9 +33,13 @@ static int test_native_pageable_destroy() {
     D3D12DDI_HHEAP heap{&slot}; D3D12DDI_HRESOURCE buffer{&object};
     const auto initial_allocations = allocations, initial_contexts = heap_context_creates;
     ctx->kernel_callbacks.pfnDeallocate2Cb = nullptr;
-    REQUIRE(!table.pfnCalcPrivateHeapAndResourceSizes(create.hDrvDevice, &desc, nullptr).Heap);
+    // Storage sizing cannot advertise the missing callback as a zero-byte
+    // object; creation must reject it before any kernel allocation or slot write.
+    const auto sizes = table.pfnCalcPrivateHeapAndResourceSizes(create.hDrvDevice, &desc, nullptr);
+    REQUIRE(sizes.Heap == sizeof(NativeHeapSlot) && !sizes.Resource);
     REQUIRE(table.pfnCreateHeapAndResource(create.hDrvDevice, &desc, heap, {}, nullptr, nullptr, {}) == DXGI_ERROR_UNSUPPORTED);
-    REQUIRE(allocations == initial_allocations && heap_context_creates == initial_contexts && !ctx->native_heaps);
+    REQUIRE(allocations == initial_allocations && heap_context_creates == initial_contexts &&
+        !slot.magic && !ctx->native_heaps && kernel_heaps.empty() && kernel_resources.empty());
     ctx->kernel_callbacks.pfnDeallocate2Cb = heap_deallocate2;
     for (unsigned kind = 0; kind < 3; ++kind) {
         D3D12DDI_HRTRESOURCE runtime{};

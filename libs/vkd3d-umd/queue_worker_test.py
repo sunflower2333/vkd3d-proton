@@ -25,7 +25,8 @@ args = parser.parse_args()
 here = Path(__file__).resolve().parent
 root = here.parents[1]
 source = (root / 'libs/vkd3d/command.c').read_text()
-names = ['d3d12_command_queue_submit_wddm', 'd3d12_command_queue_submit_split_locked',
+names = ['d3d12_command_queue_submit_wddm_tracked', 'd3d12_command_queue_submit_wddm',
+         'd3d12_command_queue_submit_split_locked_tracked',
          'd3d12_command_queue_acquire_serialized', 'd3d12_command_queue_release_serialized',
          'vkd3d_wddm_queue_drain_enqueue']
 functions = '\n'.join(definition(source, name) for name in names)

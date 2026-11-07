@@ -664,6 +664,16 @@ void test_multisample_quality_levels(void)
     ok(hr == S_OK, "Got unexpected hr %#x.\n", (int)hr);
     ok(format_support.NumQualityLevels >= 1, "Got unexpected quality levels %u.\n", format_support.NumQualityLevels);
 
+    /* XR_BIAS is a valid query format even though this renderer does not
+     * expose a native resource representation for it. */
+    format_support.Format = DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM;
+    format_support.SampleCount = 4;
+    format_support.NumQualityLevels = 0xdeadbeef;
+    hr = ID3D12Device_CheckFeatureSupport(device, D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
+            &format_support, sizeof(format_support));
+    ok(hr == S_OK, "Got unexpected hr %#x.\n", (int)hr);
+    ok(!format_support.NumQualityLevels, "Got unexpected quality levels %u.\n", format_support.NumQualityLevels);
+
     for (i = 0; i < ARRAY_SIZE(depth_stencil_formats); ++i)
     {
         memset(&format_support, 0, sizeof(format_support));

@@ -41,9 +41,11 @@ static float test_linear_to_srgb(float value)
 #include "backend_format_test.inc"
 #include "backend_depth_test.inc"
 #include "backend_stencil_test.inc"
+#ifdef VKDU_ENABLE_TEST_DEVICE
 #include "backend_stencil_pixels_test.inc"
 #include "backend_msaa_test.inc"
 #include "backend_msaa_copy_test.inc"
+#endif
 #include "backend_msaa_bundle_test.inc"
 #include "backend_msaa_observer_test.inc"
 #include "backend_blend_test.inc"
@@ -1117,7 +1119,9 @@ int main(int argc, char **argv)
     check_graphics_roots(device, wrong);
     check_native_formats(device);
     check_depth(device, wrong);
+#ifdef VKDU_ENABLE_TEST_DEVICE
     check_stencil_pixels(device, wrong);
+#endif
     check_blend(device);
     check_typeless_color(device);
     check_resource_copies(device, wrong);

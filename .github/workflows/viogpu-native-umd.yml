@@ -19,6 +19,12 @@ jobs:
           for control in drop-route shared-token skip-drain skip-execute-drain; do
             python3 libs/vkd3d-umd/queue_worker_test.py --negative-control "$control"
           done
+      - name: Execute production allocator submission failure and delayed retirement ownership
+        run: |
+          python3 libs/vkd3d-umd/allocator_submission_test.py
+          for control in skip-cleanup forget-attempt drop-retirement; do
+            python3 libs/vkd3d-umd/allocator_submission_test.py --negative-control "$control"
+          done
       - name: Execute production descriptor and query pageable enumeration
         run: |
           python3 libs/vkd3d-umd/pageable_backing_test.py --sanitize

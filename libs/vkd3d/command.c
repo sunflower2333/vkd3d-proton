@@ -25098,8 +25098,8 @@ static void d3d12_command_queue_finalize_waits(struct d3d12_command_queue *comma
 
 /* Every logical queue worker passes its own token, even when VkQueue is shared
  * with another D3D12 queue. Caller-thread TLS cannot express that association. */
-static VkResult d3d12_command_queue_submit_wddm(struct d3d12_command_queue *queue,
-        VkQueue vk_queue, uint32_t count, const VkSubmitInfo2 *submits, VkFence fence)
+static VkResult d3d12_command_queue_submit_wddm_tracked(struct d3d12_command_queue *queue,
+        VkQueue vk_queue, uint32_t count, const VkSubmitInfo2 *submits, VkFence fence, bool *attempted)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &queue->device->vk_procs;
     struct mwd_submit_info *routes;
@@ -25108,7 +25108,11 @@ static VkResult d3d12_command_queue_submit_wddm(struct d3d12_command_queue *queu
     uint32_t i;
 
     if (!queue->wddm_queue_token)
+    {
+        if (attempted)
+            *attempted = true;
         return VK_CALL(vkQueueSubmit2(vk_queue, count, submits, fence));
+    }
     if (!count || !submits || count > 64)
         return VK_ERROR_INITIALIZATION_FAILED;
     copies = vkd3d_calloc(count, sizeof(*copies));
@@ -25128,6 +25132,8 @@ static VkResult d3d12_command_queue_submit_wddm(struct d3d12_command_queue *queu
         routes[i].queue = queue->wddm_queue_token;
         copies[i].pNext = &routes[i];
     }
+    if (attempted)
+        *attempted = true;
     vr = VK_CALL(vkQueueSubmit2(vk_queue, count, copies, fence));
     vkd3d_free(routes);
     vkd3d_free(copies);
@@ -25135,6 +25141,12 @@ static VkResult d3d12_command_queue_submit_wddm(struct d3d12_command_queue *queu
         d3d12_device_mark_as_removed(queue->device, DXGI_ERROR_DEVICE_REMOVED,
                 "Runtime-associated queue submission failed (%d).\n", vr);
     return vr;
+}
+
+static VkResult d3d12_command_queue_submit_wddm(struct d3d12_command_queue *queue,
+        VkQueue vk_queue, uint32_t count, const VkSubmitInfo2 *submits, VkFence fence)
+{
+    return d3d12_command_queue_submit_wddm_tracked(queue, vk_queue, count, submits, fence, NULL);
 }
 
 static void d3d12_command_queue_flush_waiters(struct d3d12_command_queue *command_queue, uint32_t wait_flags)
@@ -25720,8 +25732,8 @@ static void d3d12_command_queue_transition_pool_build(struct d3d12_command_queue
     *timeline_value = pool->timeline_value;
 }
 
-static VkResult d3d12_command_queue_submit_split_locked(struct d3d12_command_queue *command_queue,
-        VkQueue vk_queue, uint32_t num_submits, const VkSubmitInfo2 *submits, VkFence vk_fence)
+static VkResult d3d12_command_queue_submit_split_locked_tracked(struct d3d12_command_queue *command_queue,
+        VkQueue vk_queue, uint32_t num_submits, const VkSubmitInfo2 *submits, VkFence vk_fence, bool *attempted)
 {
     /* Ugly workaround when needed. Never submit more than one command buffer at a time. */
     const VkSubmitInfo2 *input_submission;
@@ -25757,16 +25769,16 @@ static VkResult d3d12_command_queue_submit_split_locked(struct d3d12_command_que
                 split_submission.waitSemaphoreInfoCount =
                         cmd_index == 0 ? input_submission->waitSemaphoreInfoCount : 0;
 
-                if ((vr = d3d12_command_queue_submit_wddm(command_queue, vk_queue, 1, &split_submission,
-                        signal_fence && cmd_index + 1 == num_cmds ? vk_fence : VK_NULL_HANDLE)) < 0)
+                if ((vr = d3d12_command_queue_submit_wddm_tracked(command_queue, vk_queue, 1, &split_submission,
+                        signal_fence && cmd_index + 1 == num_cmds ? vk_fence : VK_NULL_HANDLE, attempted)) < 0)
                 {
                     ERR("Failed to submit queue(s), vr %d.\n", vr);
                     return vr;
                 }
             }
         }
-        else if ((vr = d3d12_command_queue_submit_wddm(command_queue, vk_queue, 1, input_submission,
-                signal_fence ? vk_fence : VK_NULL_HANDLE)) < 0)
+        else if ((vr = d3d12_command_queue_submit_wddm_tracked(command_queue, vk_queue, 1, input_submission,
+                signal_fence ? vk_fence : VK_NULL_HANDLE, attempted)) < 0)
         {
             ERR("Failed to submit queue(s), vr %d.\n", vr);
             return vr;
@@ -25882,7 +25894,7 @@ static void d3d12_command_queue_execute(struct d3d12_command_queue *command_queu
     VkFence proxy_fence;
     VkQueue vk_queue;
     unsigned int i;
-    bool fallback;
+    bool fallback, submission_attempted = false;
     VkResult vr;
     HRESULT hr;
 
@@ -26103,18 +26115,18 @@ static void d3d12_command_queue_execute(struct d3d12_command_queue *command_queu
             vr = VK_ERROR_DEVICE_LOST;
             if ((vk_fallback_queue = vkd3d_queue_acquire(command_queue->device->memory_transfers.vkd3d_queue)))
             {
-                vr = d3d12_command_queue_submit_split_locked(command_queue, vk_fallback_queue,
-                        num_submits, submit_desc, proxy_fence);
+                vr = d3d12_command_queue_submit_split_locked_tracked(command_queue, vk_fallback_queue,
+                        num_submits, submit_desc, proxy_fence, &submission_attempted);
                 vkd3d_queue_release(command_queue->device->memory_transfers.vkd3d_queue);
                 WARN("Performing a fallback copy queue submit. Bad perf :(\n");
             }
         }
         else if (exec->split_submission)
         {
-            vr = d3d12_command_queue_submit_split_locked(command_queue, vk_queue,
-                    num_submits, submit_desc, proxy_fence);
+            vr = d3d12_command_queue_submit_split_locked_tracked(command_queue, vk_queue,
+                    num_submits, submit_desc, proxy_fence, &submission_attempted);
         }
-        else if ((vr = d3d12_command_queue_submit_wddm(command_queue, vk_queue, num_submits, submit_desc, proxy_fence)) < 0)
+        else if ((vr = d3d12_command_queue_submit_wddm_tracked(command_queue, vk_queue, num_submits, submit_desc, proxy_fence, &submission_attempted)) < 0)
         {
             ERR("Failed to submit queue(s), vr %d.\n", vr);
         }
@@ -26174,7 +26186,19 @@ static void d3d12_command_queue_execute(struct d3d12_command_queue *command_queu
      *   If there are pending submissions waiting, we are expected to ignore the reset.
      *   We will report a failure in this case. Some games run into this.
      */
-    if (vr == VK_SUCCESS && exec->num_command_allocators)
+    if (vr != VK_SUCCESS && !submission_attempted)
+    {
+        /* WDDM routing allocation can fail before the driver sees any work.
+         * No fence callback will own these references in that case. A failed
+         * split or staggered submit may already have queued command buffers,
+         * so never apply this cleanup once a driver submit was attempted. */
+        for (i = 0; i < exec->num_command_allocators; i++)
+            d3d12_command_allocator_dec_ref(exec->command_allocators[i]);
+        vkd3d_free(exec->command_allocators);
+        vkd3d_queue_timeline_trace_complete_execute(&command_queue->device->queue_timeline_trace,
+                NULL, exec->timeline_cookie);
+    }
+    else if (vr == VK_SUCCESS && exec->num_command_allocators)
     {
         memset(&fence_info, 0, sizeof(fence_info));
         fence_info.vk_semaphore = vkd3d_queue->submission_timeline;
@@ -26862,10 +26886,9 @@ static void *d3d12_command_queue_submission_worker_main(void *userdata)
 
             d3d12_command_queue_execute(queue, &submission.execute, &transition_cmd, &transition_semaphore);
 
-            /* command_queue_execute takes ownership of the
-             * outstanding_submission_counters and queue_timeline_indices allocations.
-             * The atomic counters are decremented when the submission is observed to be freed.
-             * On error, the counters are freed early, so there is no risk of leak. */
+            /* command_queue_execute owns the allocator array and its private references.
+             * Work which never reached a driver submit can release them immediately;
+             * successful submissions release them through the completion worker. */
             vkd3d_free(submission.execute.cmd);
             vkd3d_free(submission.execute.cmd_cost);
             vkd3d_free(submission.execute.transitions);

@@ -1,9 +1,10 @@
 // System D3D12 swapchain probe: flip-model swapchain on a real window, clear + Present N frames.
-// Usage: d3d12-swapchain.exe <luid-low-hex> [frames] [interval] [width] [height]
+// Usage: d3d12-swapchain.exe <luid-low-hex> [frames] [interval] [width] [height] [fixed-red:0|1]
 #include <windows.h>
 #include <dxgi1_6.h>
 #include <d3d12.h>
 #include <wrl/client.h>
+#include "probe_identity.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -24,13 +25,20 @@ static void pump() {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) { std::puts("usage: d3d12-swapchain <luid-low-hex> [frames] [interval] [w] [h]"); return 2; }
+    if (argc < 2 || argc > 7) { std::puts("usage: d3d12-swapchain <luid-low-hex> [frames] [interval] [w] [h] [fixed-red:0|1]"); return 2; }
     setvbuf(stdout, nullptr, _IONBF, 0);
-    const LUID luid{static_cast<DWORD>(std::strtoul(argv[1], nullptr, 16)), 0};
-    const int frames = argc > 2 ? std::atoi(argv[2]) : 300;
-    const UINT interval = argc > 3 ? std::atoi(argv[3]) : 1;
-    const UINT W = argc > 4 ? std::atoi(argv[4]) : 640, H = argc > 5 ? std::atoi(argv[5]) : 480;
-    const bool fixed = argc > 6 && std::atoi(argv[6]) == 1; // pure red background for channel-order checks
+    unsigned low = 0;
+    CHECK(probe_parse_uint(argv[1], 16, 0, UINT_MAX, &low), "adapter LUID argument");
+    const LUID luid{static_cast<DWORD>(low), 0};
+    CHECK(probe_system_module(L"d3d12.dll", "D3D12"), "System32 d3d12 identity");
+    CHECK(probe_system_module(L"dxgi.dll", "DXGI"), "System32 dxgi identity");
+    unsigned frames = 3, interval = 1, W = 640, H = 480, fixed_value = 0;
+    if (argc > 2) CHECK(probe_parse_uint(argv[2], 10, 1, 600, &frames), "frames argument [1,600]");
+    if (argc > 3) CHECK(probe_parse_uint(argv[3], 10, 0, 4, &interval), "interval argument [0,4]");
+    if (argc > 4) CHECK(probe_parse_uint(argv[4], 10, 65, 4096, &W), "width argument [65,4096]");
+    if (argc > 5) CHECK(probe_parse_uint(argv[5], 10, 64, 4096, &H), "height argument [64,4096]");
+    if (argc > 6) CHECK(probe_parse_uint(argv[6], 10, 0, 1, &fixed_value), "fixed-red argument [0,1]");
+    const bool fixed = fixed_value != 0;
 
     WNDCLASSW wc{}; wc.lpfnWndProc = wndproc; wc.hInstance = GetModuleHandleW(nullptr);
     wc.lpszClassName = L"d3d12swapchain"; wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
@@ -45,8 +53,10 @@ int main(int argc, char **argv) {
     CHECK(CreateDXGIFactory1(IID_PPV_ARGS(&factory)), "CreateDXGIFactory1");
     ComPtr<IDXGIAdapter1> adapter;
     CHECK(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&adapter)), "EnumAdapterByLuid");
+    CHECK(probe_hardware_adapter(adapter.Get(), luid), "hardware adapter identity");
     ComPtr<ID3D12Device> device;
     CHECK(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)), "D3D12CreateDevice");
+    CHECK(probe_driver_modules(), "loaded UMD/ICD identity");
     std::puts("PASS device");
 
     D3D12_COMMAND_QUEUE_DESC qd{}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
@@ -80,12 +90,13 @@ int main(int argc, char **argv) {
     CHECK(list->Close(), "Close(initial)");
     ComPtr<ID3D12Fence> fence; CHECK(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "CreateFence");
     HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!event) return fail("CreateEvent", HRESULT_FROM_WIN32(GetLastError()));
     UINT64 values[kBuffers]{}, next = 1;
 
     LARGE_INTEGER freq, t0, t1; QueryPerformanceFrequency(&freq); QueryPerformanceCounter(&t0);
     double worst = 0, wait_ms = 0, record_ms = 0, present_ms = 0; LARGE_INTEGER prev = t0;
     auto now_ms = [&]() { LARGE_INTEGER v; QueryPerformanceCounter(&v); return 1000.0 * v.QuadPart / freq.QuadPart; };
-    for (int f = 0; f < frames; ++f) {
+    for (unsigned f = 0; f < frames; ++f) {
         pump();
         const UINT i = swap->GetCurrentBackBufferIndex();
         const double a = now_ms();
@@ -117,7 +128,7 @@ int main(int argc, char **argv) {
         const HRESULT phr = swap->Present(interval, 0);
         present_ms += now_ms() - c;
         if (FAILED(phr)) {
-            std::printf("frame %d ", f);
+            std::printf("frame %u ", f);
             if (phr == DXGI_ERROR_DEVICE_REMOVED) std::printf("removed reason=%08lx ", (unsigned long)device->GetDeviceRemovedReason());
             return fail("Present", phr);
         }
@@ -130,14 +141,23 @@ int main(int argc, char **argv) {
     }
     CHECK(queue->Signal(fence.Get(), next), "final Signal");
     CHECK(fence->SetEventOnCompletion(next, event), "final SetEventOnCompletion");
-    WaitForSingleObject(event, 5000);
+    const DWORD final_wait = WaitForSingleObject(event, 5000);
+    if (final_wait != WAIT_OBJECT_0) {
+        const DWORD error = final_wait == WAIT_FAILED ? GetLastError() : ERROR_TIMEOUT;
+        CloseHandle(event);
+        std::printf("final wait result=%08lx ", static_cast<unsigned long>(final_wait));
+        return fail("final fence wait", HRESULT_FROM_WIN32(error));
+    }
+    CHECK(device->GetDeviceRemovedReason(), "final GetDeviceRemovedReason");
+    if (fence->GetCompletedValue() != next) return fail("final completed fence value", E_FAIL);
+    CloseHandle(event);
     QueryPerformanceCounter(&t1);
     const double secs = double(t1.QuadPart - t0.QuadPart) / freq.QuadPart;
     DXGI_FRAME_STATISTICS stats{};
     const HRESULT shr = swap->GetFrameStatistics(&stats);
     std::printf("TIMING per frame: fence-wait=%.2fms record+reset+execute=%.2fms present=%.2fms\n",
         wait_ms / frames, record_ms / frames, present_ms / frames);
-    std::printf("PASS D3D12 SWAPCHAIN frames=%d secs=%.3f fps=%.1f worst=%.2fms stats_hr=%08lx PresentCount=%u PresentRefreshCount=%u SyncRefreshCount=%u\n",
+    std::printf("PASS D3D12 SWAPCHAIN gpu_completion=1 frames=%u secs=%.3f fps=%.1f worst=%.2fms stats_hr=%08lx PresentCount=%u PresentRefreshCount=%u SyncRefreshCount=%u\n",
         frames, secs, frames / secs, worst, (unsigned long)shr, stats.PresentCount, stats.PresentRefreshCount, stats.SyncRefreshCount);
     DestroyWindow(hwnd);
     return 0;

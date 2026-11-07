@@ -38,13 +38,12 @@ HRESULT native_primary_create(D3D12DDI_HDEVICE device, const D3D12DDIARG_CREATEH
     const auto request = *resource;
     const UINT flags = static_cast<UINT>(request.Flags);
     uint32_t fourcc = 0, wire = 0;
-    D3D12DDIARG_BUFFER_PLACEMENT no_reuse{};
     if (request.ResourceType != D3D12DDI_RT_TEXTURE2D || !request.Width || request.Width > 16384 ||
             !request.Height || request.Height > 16384 || request.DepthOrArraySize != 1 || request.MipLevels != 1 ||
             request.SampleDesc.Count != 1 || request.SampleDesc.Quality ||
             !(flags & D3D12DDI_RESOURCE_FLAG_0003_RENDER_TARGET) ||
             (flags & ~static_cast<UINT>(D3D12DDI_RESOURCE_FLAG_0003_RENDER_TARGET | D3D12DDI_RESOURCE_FLAG_0003_SHADER_RESOURCE)) ||
-            request.pRowMajorLayout || std::memcmp(&request.ReuseBufferGPUVA, &no_reuse, sizeof(no_reuse)) ||
+            request.pRowMajorLayout || !native_buffer_placement_empty(request.ReuseBufferGPUVA) ||
             !native_primary_format(request.Format, fourcc, wire) ||
             heap_request.MemoryPool != D3D12DDI_MEMORY_POOL_L0 ||
             heap_request.CPUPageProperty != D3D12DDI_CPU_PAGE_PROPERTY_NOT_AVAILABLE ||
